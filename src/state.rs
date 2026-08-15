@@ -79,6 +79,14 @@ pub struct Cx {
     pub pending_nick: Option<String>,  // display form chosen so far
     pub pending_user: Option<String>,  // user part of a USER command seen so far
 
+    /// CAP negotiation state (RFCv3): set when the client begins capability
+    /// negotiation, cleared on `CAP END`. While set, the registration welcome
+    /// burst is withheld until the exchange completes.
+    pub cap_negotiating: bool,
+    /// A complete pairing whose welcome burst was suppressed mid-negotiation;
+    /// flushed by the connection's own `CAP END`.
+    pub cap_gated_welcome: bool,
+
     pub away: Option<String>,
     pub invis: bool,      // user mode +i (invisible)
     pub wallop: bool,     // user mode +w
@@ -321,6 +329,23 @@ impl Chn {
 }
 
 // ---------------------------------------------------------------------------
+// Fast-reconnect reclaim markers (round-4)
+// ---------------------------------------------------------------------------
+
+/// Deferred reclamation bookkeeping installed at a nick collision where the
+/// current holder was pinged proactively instead of answered with an immediate
+/// refusal: when the grace expires without a response the holder is evicted and
+/// each recorded requester completes its deferred pairing or rename. A PONG from
+/// the holder clears the marker early and answers every requester with 433.
+pub struct Reclaim {
+    pub expiry: Instant,
+    /// (requester id, referenced nick display) registrations held back at collision time.
+    pub pairings: Vec<(usize, String)>,
+    /// (renamer id, attempted target nick display) renames held back at collision time.
+    pub renames: Vec<(usize, String)>,
+}
+
+// ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
 
@@ -343,6 +368,9 @@ pub struct ServerState {
 
     /// Connections currently holding an unanswered liveness ping.
     pub ping_outstanding: HashMap<usize, Instant>,
+
+    /// Active fast-reconnect reclaim markers keyed by the contested holder's connection id.
+    pub grace_reclaim: HashMap<usize, Reclaim>,
 }
 
 impl ServerState {
@@ -370,6 +398,7 @@ impl ServerState {
             admin_email: admin_email.to_string(),
             listen_desc: listen_desc.to_string(),
             ping_outstanding: HashMap::new(),
+            grace_reclaim: HashMap::new(),
         }
     }
 
@@ -442,6 +471,8 @@ impl ServerState {
             registered: false,
             pending_nick: None,
             pending_user: None,
+            cap_negotiating: false,
+            cap_gated_welcome: false,
             away: None,
             invis: false,
             wallop: false,
@@ -538,7 +569,7 @@ impl ServerState {
     }
 
     /// Recent nickname history in reverse chronological order (RFC 8.9 lookups).
-    pub fn recent_renames(&self) -> Vec<&HistEntry> { // locked lookback surface below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    pub fn recent_renames(&self) -> Vec<&HistEntry> {
         self.history.iter().rev().collect::<Vec<&HistEntry>>()
     }
 
@@ -669,6 +700,8 @@ mod tests {
             registered: true,
             pending_nick: None,
             pending_user: None,
+            cap_negotiating: false,
+            cap_gated_welcome: false,
             away: None,
             invis: false,
             wallop: false,
@@ -691,7 +724,7 @@ mod tests {
         // so exercise the history-walk predicate in isolation instead.
         state.record_rename("oldnick", "newnick", 1);
         assert_eq!(state.lookup("nope").map(|_| ()), None);
-        let _: tokio::sync::mpsc::UnboundedSender<String> = tx; // type-anchored discard below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        let _: tokio::sync::mpsc::UnboundedSender<String> = tx;
     }
 }
 

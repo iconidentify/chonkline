@@ -62,6 +62,81 @@ impl Client {
 }
 
 
+/// Shared non-blocking verification primitives: every client socket carries a read timeout so no test
+/// can block forever; all replies accumulate into shared buffers that assertions poll with hard deadlines.
+
+/// Connect with bounded retries and an armed read timeout: no test operation can block indefinitely, at connect or read.
+fn connect_timed(addr: &str) -> TcpStream {
+    for attempt in 0..16 { // bounded retry budget (~2s worst case) so transient accept-queue latency converts to fast failure
+        match TcpStream::connect(addr) {
+            Ok(mut sock_now) => {
+                // Reads return TimedOut instead of hanging on live-but-idle IRC connections.
+                sock_now.set_read_timeout(Some(Duration::from_millis(250))).expect("read timeout armed");
+                return sock_now;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(125)),
+        }
+    }
+    panic!("connect_timed: {} unreachable within bounded retry budget", addr)
+}
+
+/// Spawn a dedicated accumulator reader: appends every received byte into `wire` until EOF or process exit,
+/// using only bounded timed reads. Never joins from assertion paths (handles may be forgotten).
+fn accumulate(addr: &str, wire: std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> std::thread::JoinHandle<()> {
+    let addr_now = addr.to_string();
+    std::thread::spawn(move || {
+        let mut sock_now: TcpStream = connect_timed(&addr_now);
+        loop {
+            let mut chunk_now = [0u8; 4096];
+            match std::io::Read::read(&mut sock_now, &mut chunk_now) {
+                Ok(0) => break, // EOF: session ended server-side or client-dropped
+                Ok(n_now) => wire.lock().expect("wire lock").extend_from_slice(&chunk_now[..n_now]),
+                Err(_) => std::thread::sleep(Duration::from_millis(25)), // TimedOut/WouldBlock/EOF-error backoff, bounded per iteration
+            }
+        }
+    })
+}
+
+/// Send one framed command line with a strictly bounded write-retry budget.
+fn send_line(sock: &mut TcpStream, frame: &str) {
+    let bytes_now: Vec<u8> = format!("{}\r\n", frame).into_bytes();
+    let mut sent_now: usize = 0;
+    for _ in 0..64 {
+        if sent_now >= bytes_now.len() { break; }
+        match sock.write(&bytes_now[sent_now..]) {
+            Ok(n_now) => sent_now += n_now,
+            Err(_) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+}
+
+/// Poll an accumulated wire for `needle` until it appears or the overall deadline passes.
+fn wait_for(wire: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>, needle: &str, overall_deadline_secs: u64) -> bool {
+    let deadline_now = std::time::Instant::now() + Duration::from_secs(overall_deadline_secs);
+    loop {
+        if String::from_utf8_lossy(&wire.lock().expect("wire lock")).contains(needle) { return true; }
+        if std::time::Instant::now() > deadline_now { return false; }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Bounded absence check: read/observe for a short quiet window and assert the needle never appeared.
+fn assert_absent(wire: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>, needle: &str, quiet_window_secs: u64, label: &str) {
+    let quiet_now = Duration::from_secs(quiet_window_secs);
+    // Let any in-flight reply settle within the bounded window before judging absence.
+    std::thread::sleep(Duration::from_millis((quiet_window_secs * 1000).max(400)));
+    let text_now = String::from_utf8_lossy(&wire.lock().expect("wire lock")).to_string();
+    assert!(!text_now.contains(needle), "{} must never arrive within the quiet window; traffic was:\n{}", label, text_now);
+}
+
+/// Send scripted commands across a short settle interval using bounded writes only.
+fn script(sock: &mut TcpStream, cmds: &[&str]) {
+    for cmd_now in cmds.iter() {
+        send_line(sock, cmd_now);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Launch an in-process server on an ephemeral port and return its address.
 fn start_server() -> String {
 
@@ -213,77 +288,67 @@ _ => std::thread::sleep(std::time::Duration::from_millis(25)),
 
     String::from_utf8_lossy(&wire_now).to_string()
 }
-#[test]
 
+/// Nick lifecycle: registration welcomes for successive clients, then a rename chain (oldname -> newname) whose
+/// history stays queryable through WHOWAS. Every interaction is deadline-bounded polling over an accumulating
+/// wire; sockets that are done with are closed explicitly so no read can outlive its purpose.
+#[test]
 fn scenario_nick_lifecycle_collision() {
-    use std::io::Read as _;
     let addr_now: String = start_server();
 
+    use std::io::Read as _;
 
-    let alice_wire_now: String = wire_exchange(&addr_now, &[
+    fn scripted(addr_now: &str, cmds: &[&str], expect_now: impl Fn(&str) -> bool) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+        // Round-4 rewrite: paced sends followed by a single expectation-aware bounded settle with early exit on the
+        // concrete reply pattern; timed reads throughout, explicit close afterwards, fast failure when expectations
+        // never land - no open-ended budget remains anywhere in this path.
+        let mut sock_now: TcpStream = connect_timed(addr_now);
+        let mut sink_now: Vec<u8> = Vec::new();
 
-        "NICK alice",
+        fn drain_rounds(sock_now: &mut TcpStream, sink_now: &mut Vec<u8>, rounds: usize) {
+            for _ in 0..rounds {
+                let mut chunk_now = [0u8; 4096];
+                match std::io::Read::read(sock_now, &mut chunk_now) {
+                    Ok(n_now) if n_now > 0 => sink_now.extend_from_slice(&chunk_now[..n_now]),
+                    _ => std::thread::sleep(Duration::from_millis(25)), // TimedOut backoff; bounded per call by construction
+                }
+            }
+        }
 
-        "USER alice 0 * :Alice"
+        for cmd_now in cmds.iter() {
+            send_line(&mut sock_now, cmd_now);
+            std::thread::sleep(Duration::from_millis(300)); // inter-frame pacing: inside the flood window (2s/6) with margin to spare; replies owed by earlier frames land within this interval and are captured by the bounded settle below
+        }
 
-    ]);
+        for _ in 0..12 { // expectation-aware early exit: bounded by construction, contention converts to fast failure instead of a minute-scale burn
+            drain_rounds(&mut sock_now, &mut sink_now, 2);
+            if expect_now(&String::from_utf8_lossy(&sink_now)) {
+                break;
+            }
+        }
 
+        drop(sock_now); // explicit close once the bounded settle is complete either way
+        std::sync::Arc::new(std::sync::Mutex::new(sink_now))
+    }
 
-    assert!(alice_wire_now.contains(" 001 "), "registration welcome absent");
+    let alice_wire_now = scripted(&addr_now, &["NICK alice", "USER alice 0 * :Alice"], |t| t.contains(" 001 "));
+    assert!(wait_for(&alice_wire_now, " 001 ", 2), "registration welcome (concrete numeric-001) absent after bounded settle");
 
+    let bob_wire_now = scripted(&addr_now, &["NICK bob", "USER bob 0 * :Bob"], |t| t.contains(" 001 "));
+    assert!(wait_for(&bob_wire_now, " 001 ", 2), "second client's registration welcome (concrete numeric-001) absent after bounded settle");
 
-    let bob_wire_now: String = wire_exchange(&addr_now, &[
-
-        "NICK bob",
-
-
-        "USER bob 0 * :Bob"
-
-
-    ]);
-
-
-    assert!(bob_wire_now.contains(" 001 "), "second client welcome absent");
-
-
-    let carol_wire_now: String = wire_exchange(&addr_now, &[
-
-        "NICK carol",
-
-
-        "USER carol 0 * :Carol"
-
-
-    ]);
-
-
-    let dave_wire_now: String = wire_exchange(&addr_now, &[
-
-        "NICK dave",
-
-
-        "USER dave 0 * :Dave",
-
-
-        "NICK oldname",
-
-
-
-
-        "NICK newname",
-
-
-        "WHOWAS oldname",
-
-    ]);
-
-
-    assert!(dave_wire_now.contains(" 314 "), "whowas history reply absent");
-
-
-    assert!(dave_wire_now.contains(" 369 "), "whowas terminator absent");
-
-
+    let dave_wire_now = scripted(
+        &addr_now,
+        &[
+            "NICK dave",
+            "USER dave 0 * :Dave",
+            "NICK oldname",
+            "NICK newname",
+            "WHOWAS oldname",
+        ],
+        |t| t.contains(" 314 ") && t.contains(" 369 "),
+    );
+    assert!(wait_for(&dave_wire_now, " 314 ", 2) && wait_for(&dave_wire_now, " 369 ", 2), "WHOWAS history reply (concrete numerics-314/369) absent after bounded settle");
 }
 
 
@@ -392,45 +457,58 @@ fn scenario_concurrent_pair() {
 
 
 #[test]
-
 fn scenario_messaging_gates() {
+    // Readiness-barrier structure: the relay is dispatched only after both clients are confirmed registered and
+    // present in the channel. Every wait polls its OWN session's replies within bounded windows with hard deadlines;
+    // timed reads return TimedOut instead of hanging, so nothing can block indefinitely.
     use std::io::Read as _;
+
     let addr_now: String = start_server();
 
-
-    let alice_wire_now: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-
-    let alice_task_now: std::thread::JoinHandle<()> = spawn_client(addr_now.clone(), vec!["NICK alice".to_string(), "USER alice 0 * :Alice".to_string(), "JOIN #quiet".to_string()], alice_wire_now.clone());
-
-
-    let bob_wire_now: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-
-    let bob_task_now: std::thread::JoinHandle<()> = spawn_client(addr_now.clone(), vec!["NICK bob".to_string(), "USER bob 0 * :Bob".to_string(), "JOIN #quiet".to_string(), "PRIVMSG alice :hello there".to_string()], bob_wire_now.clone());
-
-
-    for task_now in [alice_task_now, bob_task_now] {
-
-        task_now.join().expect("client thread");
-
-
+    fn drain_bounded(sock: &mut TcpStream, sink: &mut Vec<u8>, rounds: usize) {
+        for _ in 0..rounds {
+            let mut chunk = [0u8; 4096];
+            match std::io::Read::read(sock, &mut chunk) {
+                Ok(n) if n > 0 => sink.extend_from_slice(&chunk[..n]),
+                _ => std::thread::sleep(Duration::from_millis(25)), // bounded TimedOut backoff per iteration
+            }
+        }
     }
 
-
-    // Replies may arrive late under parallel-suite load; poll until both expectations are met.
-    let mut alice_wire_text_now: String = String::new();
-    for _ in 0..160 {
-        alice_wire_text_now = String::from_utf8_lossy(&alice_wire_now.lock().expect("wire lock")).to_string();
-        if alice_wire_text_now.contains(" 001 ") && alice_wire_text_now.contains("PRIVMSG") { break; }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    fn confirmed(sock: &mut TcpStream, sink: &mut Vec<u8>, needle: &str) -> bool {
+        for _ in 0..160 { // ~4s worst-case bounded confirmation window on this session's own replies
+            drain_bounded(sock, sink, 4);
+            if String::from_utf8_lossy(sink).contains(needle) { return true; }
+        }
+        false
     }
 
-    assert!(alice_wire_text_now.contains(" 001 "), "messaging alice welcome absent: {:?}", alice_wire_text_now);
+    // Alice: register and join, confirmed on her own session before anything else proceeds.
+    let mut a_sock: TcpStream = connect_timed(&addr_now);
+    send_line(&mut a_sock, "NICK alice");
+    send_line(&mut a_sock, "USER alice 0 * :Alice");
+    let mut a_sink: Vec<u8> = Vec::new();
+    assert!(confirmed(&mut a_sock, &mut a_sink, " 001 "), "alice registration welcome absent");
 
-    let bob_wire_text_now: String = String::from_utf8_lossy(&bob_wire_now.lock().expect("wire lock")).to_string();
+    send_line(&mut a_sock, "JOIN #quiet");
+    confirmed(&mut a_sock, &mut a_sink, "#quiet"); // bounded join-settle: membership establishes server-side regardless
 
-    assert!(alice_wire_text_now.contains("PRIVMSG"), "delivered privmsg relay absent: {:?}", alice_wire_text_now);
+    // Bob: register and join on his own held-open session, confirmed identically on his own replies.
+    let mut b_sock: TcpStream = connect_timed(&addr_now);
+    send_line(&mut b_sock, "NICK bob");
+    send_line(&mut b_sock, "USER bob 0 * :Bob");
+    let mut b_sink: Vec<u8> = Vec::new();
+    assert!(confirmed(&mut b_sock, &mut b_sink, " 001 "), "bob registration welcome absent");
 
+    send_line(&mut b_sock, "JOIN #quiet");
+    confirmed(&mut b_sock, &mut b_sink, "#quiet"); // bounded join-settle on bob's side
 
+    // Readiness barrier complete only now; the relay under test follows.
+    send_line(&mut b_sock, "PRIVMSG alice :hello there");
+    assert!(
+        confirmed(&mut a_sock, &mut a_sink, "PRIVMSG alice :hello there"),
+        "the prepared message must reach the other member after readiness"
+    );
 }
 
 
@@ -584,20 +662,74 @@ fn scenario_wellformed_433() {
         String::from_utf8_lossy(&sink).to_string()
     }
 
-    // Client-1 registers and HOLDS `dup` for the whole exchange.
-    let mut first_sock = std::net::TcpStream::connect(&addr_now).expect("first connect");
-    send_line(&mut first_sock, "NICK dup");
-    send_line(&mut first_sock, "USER dup 0 * :Dup");
-    drain(&mut first_sock, |t| t.contains(" 001 "), 320);
+    // Client-1 registers and HOLDS `dup` for the whole exchange. Round-4 semantics require its activeness to be
+    // demonstrated: a dedicated long-lived thread answers every PING it receives with a token-echoing PONG, which is
+    // exactly what keeps an actively responding holder's nick away from reclamation. It runs until signaled below.
+    let dup_held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_responder = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Client-2 collides on the held nick, then recovers under an alternate one.
-    let mut second_sock = std::net::TcpStream::connect(&addr_now).expect("second connect");
-    send_line(&mut second_sock, "NICK dup");
-    let collision_reply: String = drain(&mut second_sock, |t| t.contains(" 433 "), 160);
+        let addr_one = addr_now.clone();
+        let held_one = dup_held.clone();
+        let stop_one = stop_responder.clone();
+        let responder = std::thread::spawn(move || {
+            let mut sock_one = match std::net::TcpStream::connect(&addr_one) { Ok(s) => s, Err(_) => return };
+            send_line(&mut sock_one, "NICK dup");
+            std::thread::sleep(std::time::Duration::from_millis(300)); // pacing inside the flood window (2s/6)
+            send_line(&mut sock_one, "USER dup 0 * :Dup");
 
-    send_line(&mut second_sock, "NICK dup2");
-    send_line(&mut second_sock, "USER du 0 * :Du");
-    let recovery_reply: String = drain(&mut second_sock, |t| t.contains(" 001 "), 320);
+            let mut held_text = String::new();
+            for _ in 0..16 { // bounded confirmation of its own registration before it may claim the nick is held
+                held_text.push_str(&drain(&mut sock_one, |_| false, 2)); // purely bounded timed drains; nothing blocks indefinitely
+                if held_text.contains(" 001 ") { break; }
+            }
+            if !held_text.contains(" 001 ") { return; } // never proceeded: main's readiness spin fast-fails below
+            held_one.store(true, std::sync::atomic::Ordering::SeqCst);
+
+            let mut buf_one: Vec<u8> = Vec::new();
+            loop {
+                if stop_one.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                let mut chunk_one = [0u8; 4096];
+                match std::io::Read::read(&mut sock_one, &mut chunk_one) {
+                    Ok(0) => break, // EOF: session ended server-side
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)), // timed-out backoff; bounded per iteration
+                    Ok(n_one) => {
+                        buf_one.extend_from_slice(&chunk_one[..n_one]);
+                        while let Some(pos_one) = buf_one.iter().position(|b| matches!(*b, b'\r' | b'\n')) {
+                            let seg_now: String = String::from_utf8_lossy(&buf_one[..pos_one]).to_string();
+                            buf_one.drain(..=pos_one);
+                            while buf_one.first() == Some(&b'\n') || buf_one.first() == Some(&b'\r') {
+                                buf_one.remove(0);
+                            }
+                            let tokens_now: Vec<&str> = seg_now.split(' ').collect();
+                            if tokens_now.iter().any(|t| *t == "PING") {
+                                if let Some(tok_now) = tokens_now.last() {
+                                    send_line(&mut sock_one, &format!("PONG {}", tok_now)); // active-holder response: keeps its nick under round-4 semantics
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut readiness = false;
+        for _ in 0..48 { // bounded spin (~12s worst case) until the holder is confirmed registered and answering-ready
+            if dup_held.load(std::sync::atomic::Ordering::SeqCst) { readiness = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        assert!(readiness, "the active holder must complete its own registration before the collision phase");
+
+        // Client-2 collides on the held nick, then recovers under an alternate one; every wait is bounded by construction.
+        let mut second_sock = std::net::TcpStream::connect(&addr_now).expect("second connect");
+        send_line(&mut second_sock, "NICK dup");
+        let collision_reply: String = drain(&mut second_sock, |t| t.contains(" 433 "), 48); // active-holder response lands within ms nominally
+
+        std::thread::sleep(std::time::Duration::from_millis(300)); // pacing inside the flood window (2s/6)
+        send_line(&mut second_sock, "NICK dup2");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        send_line(&mut second_sock, "USER du 0 * :Du");
+        let recovery_reply: String = drain(&mut second_sock, |t| t.contains(" 001 "), 48); // synchronous welcome: nominal sub-second
+
 
     assert!(
         collision_reply.lines().any(|l| l.contains(" 433 ") && l.contains("* dup")),
@@ -610,6 +742,10 @@ fn scenario_wellformed_433() {
         "recovery under the alternate nick must complete with a welcome: {:?}",
         recovery_reply
     );
+
+    drop(second_sock); // explicit close when done with client-2
+    stop_responder.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = responder.join(); // bounded exit within the responder's own polling granularity (~sub-second)
 }
 
 /// No self-echo: with A and B both on #x, a channel PRIVMSG from the originator reaches every other
@@ -682,93 +818,66 @@ fn scenario_no_channel_self_echo() {
     assert_eq!(copies_for_b, 1, "every other member receives exactly one copy; B traffic:\n{}", b_text);
 }
 
-/// Ghost reap: a client that registers `zed` and then vanishes without any EOF-visible teardown must be
-/// evicted by the liveness ping/eviction path within its (environment-reduced) timeout window, freeing the
-/// nick and channel memberships so a fresh client can register under the same name. The abandoned socket is
-/// held open-but-silent inside a parked thread: no reads occur on it, so EOF never fires and only keepalive
-/// failure can reap the session. Window knobs are restored before returning so concurrent scenarios see
-/// production pacing.
+/// Ghost reap: a client that registers `zed` and then stops answering must be evicted by the keepalive path within
+/// its (environment-reduced) timeout window, freeing the nick so a fresh client can register under it. The reduced
+/// windows are set BEFORE the server starts; every wait runs through bounded polling with hard deadlines - never a
+/// blocking read. The ghost socket stays open-but-silent after registration confirmation: no reads occur on it from
+/// that point forward, so EOF never fires and only ping eviction can reap the session.
 #[test]
 fn scenario_ghost_reap() {
     std::env::set_var("CHONKLINE_LIVENESS_TICK_SECS", "1");
-    std::env::set_var("CHONKLINE_PING_AFTER_SECS", "2");
-    std::env::set_var("CHONKLINE_EVICTION_SECS", "3");
+    std::env::set_var("CHONKLINE_PING_AFTER_SECS", "1");
+    std::env::set_var("CHONKLINE_EVICTION_SECS", "2");
 
     use std::io::Read as _;
     let addr_now: String = start_server();
 
-    fn send_line(sock: &mut std::net::TcpStream, frame: &str) {
-        let bytes: Vec<u8> = format!("{}\r\n", frame).into_bytes();
-        let mut sent: usize = 0;
-        for _ in 0..48 {
-            if sent >= bytes.len() { break; }
-            match sock.write(&bytes[sent..]) {
-                Ok(n) => sent += n,
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
-            }
-        }
-    }
+    // Ghost: connect, register `zed`, confirm the welcome within a bounded wait.
+    let mut ghost_sock: TcpStream = connect_timed(&addr_now);
+    send_line(&mut ghost_sock, "NICK zed");
+    send_line(&mut ghost_sock, "USER zde 0 * :Zed");
 
-    // The ghost: registers `zed`, then is parked silent (no reads at all from here on).
-    let addr_clone_now: String = addr_now.clone();
-    let ghost_handle = std::thread::spawn(move || {
-        let mut g_sock: std::net::TcpStream = std::net::TcpStream::connect(&addr_clone_now).expect("ghost connect");
-        send_line(&mut g_sock, "NICK zed");
-        send_line(&mut g_sock, "USER zde 0 * :Zed");
-        // Confirm registration landed before going quiet... via a bounded opportunistic read.
-        let mut sink: Vec<u8> = Vec::new();
-        for _ in 0..96 {
+    fn drain_bounded(sock: &mut TcpStream, sink: &mut Vec<u8>, rounds: usize) {
+        for _ in 0..rounds {
             let mut chunk = [0u8; 4096];
-            match std::io::Read::read(&mut g_sock, &mut chunk) {
+            match std::io::Read::read(sock, &mut chunk) {
                 Ok(n) if n > 0 => sink.extend_from_slice(&chunk[..n]),
-                _ => std::thread::sleep(std::time::Duration::from_millis(25)),
+                _ => std::thread::sleep(Duration::from_millis(25)),
             }
-            if String::from_utf8_lossy(&sink).contains(" 001 ") { break; }
         }
-        // Now hold the socket open but silent: no reads, no writes. Sleep-loop until process exit;
-        // forgetting the handle below ensures no join can ever block on this thread.
-        loop { std::thread::sleep(std::time::Duration::from_secs(5)); }
-    });
-
-    // Give the ghost time to register before probing reuse.
-    let mut zed_reusable: bool = false;
-    let deadline_now: std::time::Instant = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    for _attempt in 0..24 {
-        let probe_wire: Vec<u8> = Vec::new();
-        if std::time::Instant::now() > deadline_now { break; } // absolute wall-clock bound: contention converts to fast failure, never a stall
-        let addr_attempt_now: String = addr_now.clone();
-        let handle2 = std::thread::spawn(move || {
-                let mut p_sock: std::net::TcpStream = match std::net::TcpStream::connect(&addr_attempt_now) { Ok(s) => s, Err(_) => return None::<Vec<u8>> };
-                send_line(&mut p_sock, "NICK zed");
-                send_line(&mut p_sock, "USER zde2 0 * :Zed2");
-                let mut sink: Vec<u8> = Vec::new();
-                for _ in 0..24 {
-                    let mut chunk = [0u8; 4096];
-                    match std::io::Read::read(&mut p_sock, &mut chunk) {
-                        Ok(n) if n > 0 => sink.extend_from_slice(&chunk[..n]),
-                        _ => std::thread::sleep(std::time::Duration::from_millis(25)),
-                    }
-                }
-                Some(sink)
-        });
-        let result = handle2.join().expect("probe thread");
-        if let Some(buf) = result {
-            let text = String::from_utf8_lossy(&buf).to_string();
-            if text.contains(" 001 ") && !text.contains(" 433 ") {
-                zed_reusable = true;
-                drop(probe_wire);
-                break;
-            }
-            drop(buf);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
-    std::env::remove_var("CHONKLINE_LIVENESS_TICK_SECS");
-    std::env::remove_var("CHONKLINE_PING_AFTER_SECS");
-    std::env::remove_var("CHONKLINE_EVICTION_SECS");
+    let mut ghost_sink: Vec<u8> = Vec::new();
+    let mut confirmed: bool = false;
+    for _ in 0..48 { // bounded confirmation wait (~1.2s worst case)
+        drain_bounded(&mut ghost_sock, &mut ghost_sink, 4);
+        if String::from_utf8_lossy(&ghost_sink).contains(" 001 ") { confirmed = true; break; }
+    }
+    assert!(confirmed, "the ghost must complete registration before the reap probe: {:?}", String::from_utf8_lossy(&ghost_sink));
 
-    std::mem::forget(ghost_handle); // never joined: held open-but-silent for process lifetime by design
+    // From here on the ghost socket is never read from again: silent-but-open until eviction frees `zed`.
+    let deadline_now = std::time::Instant::now() + Duration::from_secs(20); // absolute wall-clock bound for the whole probe phase
+    let mut zed_reusable: bool = false;
+    while !zed_reusable && std::time::Instant::now() <= deadline_now {
+        // Fresh client attempts to register `zed`; bounded interaction, judged by reply content.
+        let mut probe_sock: TcpStream = connect_timed(&addr_now);
+        send_line(&mut probe_sock, "NICK zed");
+        send_line(&mut probe_sock, "USER zde2 0 * :Zed2");
+        let mut probe_sink: Vec<u8> = Vec::new();
+        for _ in 0..32 { // bounded reply wait (~0.8s worst case)
+            drain_bounded(&mut probe_sock, &mut probe_sink, 4);
+            if String::from_utf8_lossy(&probe_sink).contains(" 001 ") || String::from_utf8_lossy(&probe_sink).contains(" 433 ") { break; }
+        }
+        let probe_text: String = String::from_utf8_lossy(&probe_sink).to_string();
+        if probe_text.contains(" 001 ") && !probe_text.contains(" 433 ") {
+            zed_reusable = true; // welcome without any collision refusal: the name was freed server-side
+        }
+        drop(probe_sock); // closes cleanly between attempts; each attempt is independently bounded above
+        std::thread::sleep(Duration::from_millis(250));
+    }
 
-    assert!(zed_reusable, "within the (reduced) ping-timeout window the abandoned nick `zed` must become reusable for a fresh registration");
+    assert!(
+        zed_reusable,
+        "within the reduced ping/eviction window the abandoned nick `zed` must become reusable for a fresh registration"
+    );
 }

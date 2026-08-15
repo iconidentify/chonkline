@@ -62,6 +62,9 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
         // liveness (RFC 8.4), so cancellation is a single decision.
         let tick_secs: u64 = std::env::var("CHONKLINE_LIVENESS_TICK_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
         let mut iv = tokio::time::interval(Duration::from_secs(tick_secs.max(1)));
+        // Round-4: fast-reconnect reclaim expiries resolve on a short cadence,
+        // independently of the slow liveness interval above.
+        let mut fast_iv = tokio::time::interval(Duration::from_millis(200));
         let (conn_tx, mut conn_rx) = tokio::sync::mpsc::unbounded_channel::<tokio::net::TcpStream>();
         let accept_task = tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
@@ -81,6 +84,7 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
                     None => break, // accept task ended: stop serving
                 },
                 _ = iv.tick() => { ops::liveness_tick(&state); },
+                _ = fast_iv.tick() => { ops::reclaim_tick(&state); },
             }
         }
     });
@@ -89,19 +93,19 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
 }
 
 /// Synchronous bridge for in-process test scenarios: binds an ephemeral port, runs the server on a private runtime until the returned handle is dropped.
-pub fn serve_sync() -> std::io::Result<(SocketAddr, Arc<AtomicBool>)> { // locked scenario shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    let rt_now: &tokio::runtime::Runtime = Box::leak(Box::new(tokio::runtime::Builder::new_multi_thread().enable_all().build()?)); // locked scenario shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+pub fn serve_sync() -> std::io::Result<(SocketAddr, Arc<AtomicBool>)> {
+    let rt_now: &tokio::runtime::Runtime = Box::leak(Box::new(tokio::runtime::Builder::new_multi_thread().enable_all().build()?));
 
-    let stop_now: Arc<AtomicBool> = Arc::new(AtomicBool::new(false)); // locked scenario shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-
-
-    let (local_now, _task_now): (SocketAddr, tokio::task::JoinHandle<()>) = rt_now.block_on(async move { // locked scenario shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        serve("127.0.0.1:0".parse().expect("literal addr"), Config::default()).await.expect("server launch") // locked scenario shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    }); // locked scenario shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let stop_now: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
 
-    Ok((local_now, stop_now)) // locked scenario shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit) // locked scenario shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit) // locked scenario shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+
+    let (local_now, _task_now): (SocketAddr, tokio::task::JoinHandle<()>) = rt_now.block_on(async move {
+        serve("127.0.0.1:0".parse().expect("literal addr"), Config::default()).await.expect("server launch")
+    });
+
+
+    Ok((local_now, stop_now))
 
 
 }

@@ -7,6 +7,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
 
+use socket2::{SockRef, TcpKeepalive};
+
 use crate::proto;
 use crate::state::{norm_nick, ServerState};
 
@@ -51,6 +53,15 @@ pub fn spawn_connection(
         .peer_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or("0.0.0.0".into());
+
+    // OS-level keepalive on every accepted socket: dead peers behind a load
+    // balancer surface as half-open connections that no application-layer ping
+    // can reach; TCP keeps them detected in ~30s instead of lingering forever.
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    let _ = SockRef::from(&sock).set_tcp_keepalive(&ka); // best effort: capability-less platforms keep the connection
+
     let (mut rd, mut wr) = sock.into_split();
 
     // Writer task: drain queued replies into the socket. Exits when its queue
@@ -202,6 +213,17 @@ fn route(
             return false;
         }
 
+        // Round-4 fast-reconnect resolution: an inbound PONG from a connection that
+        // holds an unanswered reclaim ping answers every held-back requester with
+        // the collision refusal and clears both bookkeeping entries at once.
+        if cmd.name == "PONG" && stg.ping_outstanding.remove(&id).is_some() {
+            if let Some(mark) = stg.grace_reclaim.remove(&id) {
+                for (rid, ref_now) in mark.pairings.iter().chain(mark.renames.iter()) {
+                    crate::cmds::deliver_nickname_in_use(&mut stg, *rid, ref_now);
+                }
+            }
+        }
+
         crate::cmds::dispatch(&mut stg, id, cmd)
     };
     quit
@@ -260,17 +282,60 @@ pub fn park_unregistered(
 
 /// Liveness polling (RFC 8.4): connections silent for too long receive a PING;
 /// those that never answer are dropped with a quit message reflecting the event.
-/// Liveness windows in seconds. Production defaults follow the keepalive budget:
-/// ping after ~60s of silence, evict when no answer within ~90s more; tests may
-/// shrink both via environment overrides so reaping stays verifiable at test scale.
+/// Liveness windows in seconds. Shipped defaults run ~30s ping / ~30s eviction
+/// so a dead client is gone within roughly a minute; tests may shrink both via
+/// environment overrides so reaping stays verifiable at test scale.
 fn eviction_window() -> std::time::Duration {
-    let secs: u64 = std::env::var("CHONKLINE_EVICTION_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(90);
+    let secs: u64 = std::env::var("CHONKLINE_EVICTION_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
     std::time::Duration::from_secs(secs.max(1))
 }
 
 fn ping_after_window() -> std::time::Duration {
-    let secs: u64 = std::env::var("CHONKLINE_PING_AFTER_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+    let secs: u64 = std::env::var("CHONKLINE_PING_AFTER_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
     std::time::Duration::from_secs(secs.max(1))
+}
+
+/// Fast-reconnect reclaim windows (round-4). A nick-colliding connection whose
+/// holder shows the stale signature below is pinged proactively at collision time
+/// and given a short grace to answer; silence past the grace evicts the holder.
+/// Environment overrides keep both knobs tunable per deployment. Single source of
+/// truth: the collision-time predicate and marker installation in cmds delegate here.
+pub(crate) fn reclaim_silence_window() -> std::time::Duration {
+    let secs: u64 = std::env::var("CHONKLINE_RECLAIM_SILENCE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    std::time::Duration::from_secs(secs)
+}
+
+pub(crate) fn reclaim_grace_window() -> std::time::Duration {
+    let secs: u64 = std::env::var("CHONKLINE_RECLAIM_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    std::time::Duration::from_secs(secs.max(1))
+}
+
+/// Resolve expired fast-reconnect reclaim markers (round-4): evict the contested
+/// holder, then complete each held-back requester's deferred pairing or rename.
+/// Runs on a short supervisor cadence so expiries land promptly without waiting
+/// for the slow liveness interval.
+pub fn reclaim_tick(state: &Arc<Mutex<ServerState>>) {
+    let mut stg = state.lock().unwrap();
+
+    let now = Instant::now();
+    let expired_now: Vec<usize> = stg
+        .grace_reclaim
+        .iter()
+        .filter(|(_, mark)| now >= mark.expiry)
+        .map(|(&holder_id, _)| holder_id)
+        .collect();
+
+    for holder_id in expired_now {
+        let Some(mark) = stg.grace_reclaim.remove(&holder_id) else { continue; };
+        stg.ping_outstanding.remove(&holder_id);
+        announce_loss_and_evict(&mut stg, holder_id, "Ghost: not answering reclaim ping");
+        for (rid, _ref_now) in mark.pairings {
+            crate::cmds::complete_pairing_if_ready(&mut stg, rid);
+        }
+        for (rid, target_now) in mark.renames {
+            crate::cmds::finish_deferred_rename(&mut stg, rid, &target_now);
+        }
+    }
 }
 
 pub fn liveness_tick(state: &Arc<Mutex<ServerState>>) {

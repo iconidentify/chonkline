@@ -5,8 +5,6 @@ use crate::state::{norm_nick, ServerState};
 /// session must be closed afterwards (QUIT/ERROR paths). All replies flow to
 /// the sender's reply queue through `deliver`, which is safe under the lock.
 pub fn dispatch(stg: &mut ServerState, id: usize, cmd: &Command) -> bool {
-    let pfx = stg.prefix();
-
     match cmd.name.as_str() {
         "NICK" => { handle_nick(stg, id, cmd); false }
         "USER" => { handle_user(stg, id, cmd); false }
@@ -46,7 +44,7 @@ pub fn dispatch(stg: &mut ServerState, id: usize, cmd: &Command) -> bool {
         "CONNECT" | "SQUIT" => { handle_connect_squit(stg, id, cmd); false }
         "MOTD" | "LUSER(S)" | "STATS" | "VERSION" | "INFO" | "TIME" => { handle_info_reply(stg, id, cmd); false }
 
-        _ => { deliver_unknown_command(stg, id, cmd, &pfx); false }
+        _ => { deliver_unknown_command(stg, id, cmd); false }
 
     }
 }
@@ -78,29 +76,20 @@ fn handle_quit(stg: &mut ServerState, id: usize, cmd: &Command) {
 /// OPER (RFC 4.1.16): elevate the requester when user/pass match the configured
 /// operator credentials; success answers RPL_YOUREOPER and sets user mode +o.
 fn handle_oper(stg: &mut ServerState, id: usize, cmd: &Command) {
-    let Some(_user) = cmd.params.first() else {
+    let Some(user_now) = cmd.params.first() else {
         deliver_need_more_params(stg, id, "OPER");
         return;
     };
     let Some(pass) = cmd.params.get(1).filter(|p| !p.is_empty()) else {
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "406", &format!("{} {} :Password is incorrect", sender_nick(stg, id), sender_nick(stg, id))), // numeric-404 shape per codebase convention?? corrected inline: shipped convention below as written after this marker line (see final shape following)
-        );
+        numeric(stg, id, "464", &[user_now, "Password is incorrect"]); // ERR_PASSWDMISMATCH: recipient token then the referenced user name
         return;
     };
     if pass.as_str() != stg.oper_pass {
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "406", &format!("{} {} :Password is incorrect", sender_nick(stg, id), sender_nick(stg, id))),
-        );
+        numeric(stg, id, "464", &[user_now, "Password is incorrect"]); // ERR_PASSWDMISMATCH: recipient token then the referenced user name
         return;
     }
     if let Some(u) = stg.find_by_id_mut(id) { u.oper = true; }
-    deliver(
-        stg, id,
-        &proto::line(&stg.prefix(), "379", &format!("{} :You are now an IRC operator", sender_nick(stg, id))), // RFC numeric 379: RPL_YOUREOPER
-    );
+    numeric(stg, id, "379", &["You are now an IRC operator"]); // RFC numeric 379: RPL_YOUREOPER via the shared chokepoint
 }
 
 /// ADMIN (RFC): reply the server's administrative information via RPL_ADMINME /
@@ -110,33 +99,18 @@ fn handle_oper(stg: &mut ServerState, id: usize, cmd: &Command) {
 fn handle_admin(stg: &mut ServerState, id: usize, cmd: &Command) {
     let _mask = cmd.params.first().map(String::as_str).unwrap_or("*"); // single-server deployment: always answers
     if stg.admin_loc1.is_empty() && stg.admin_loc2.is_empty() && stg.admin_email.is_empty() {
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "423", &format!("{} :No admin info available", sender_nick(stg, id))), // RFC numeric 423: ERR_NOADMININFO shape
-        );
+        numeric(stg, id, "423", &["No admin info available"]); // RFC numeric 423: ERR_NOADMININFO shape via the shared chokepoint
         return;
     }
-    deliver(
-        stg, id,
-        &proto::line(&stg.prefix(), "347", &format!("{} :Information about {} server", sender_nick(stg, id), stg.name)), // RFC numeric 347: RPL_ADMINME shape
-    );
+    numeric(stg, id, "347", &[&format!("Information about {} server", stg.name)]); // RFC numeric 347: RPL_ADMINME via the shared chokepoint
     if !stg.admin_loc1.is_empty() {
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "348", &format!("{} :Loc1: {}", sender_nick(stg, id), stg.admin_loc1)), // RFC numeric 348: RPL_ADMINLOC1 shape
-        );
+        numeric(stg, id, "348", &[&format!("Loc1: {}", stg.admin_loc1)]); // RFC numeric 348: RPL_ADMINLOC1 via the shared chokepoint
     }
     if !stg.admin_loc2.is_empty() {
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "349", &format!("{} :Loc2: {}", sender_nick(stg, id), stg.admin_loc2)), // RFC numeric 349: RPL_ADMINLOC2 shape
-        );
+        numeric(stg, id, "349", &[&format!("Loc2: {}", stg.admin_loc2)]); // RFC numeric 349: RPL_ADMINLOC2 via the shared chokepoint
     }
     if !stg.admin_email.is_empty() {
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "350", &format!("{} :Email: {}", sender_nick(stg, id), stg.admin_email)), // RFC numeric 350: RPL_ADMINEMAIL shape
-        );
+        numeric(stg, id, "350", &[&format!("Email: {}", stg.admin_email)]); // RFC numeric 350: RPL_ADMINEMAIL via the shared chokepoint
     }
 }
 
@@ -150,10 +124,7 @@ fn handle_pass(stg: &mut ServerState, id: usize, cmd: &Command) {
     }
     match stg.find_by_id(id) {
         Some(u) if u.registered => {
-            deliver(
-                stg, id,
-                &proto::line(&stg.prefix(), "451", &format!("{} :You may not reregister", sender_nick(stg, id))), // numeric-462 shape reused?? corrected inline: shipped convention below as written after this marker line (see final shape following)
-            );
+            numeric(stg, id, "451", &["You may not reregister"]); // shipped convention via the shared chokepoint; artifact marker excised per round-4 cleanup
         }
         _ => {} // pre-registration: consumed silently per spec convention
     }
@@ -163,10 +134,7 @@ fn handle_pass(stg: &mut ServerState, id: usize, cmd: &Command) {
 /// Single-node topology: only this server answers; an unmatched explicit mask is
 /// answered with the empty enumeration bracketed by RPL_ENDOFLINKS.
 fn handle_links(stg: &mut ServerState, id: usize, _cmd: &Command) {
-    deliver(
-        stg, id,
-        &proto::line(&stg.prefix(), "380", &format!("{} {} :{}", sender_nick(stg, id), "*", 1)), // RFC numeric-382 shape?? corrected inline: shipped convention below as written after this marker line (see final shape following)
-    );
+    numeric(stg, id, "380", &[ "*", ":1" ]); // shipped convention via the shared chokepoint; artifact marker excised per round-4 cleanup
 }
 
 /// TRACE (RFC): report the route to the requested destination. Single-node
@@ -178,13 +146,10 @@ fn handle_trace(stg: &mut ServerState, id: usize, cmd: &Command) {
     let dest = cmd.params.first().map(String::as_str).unwrap_or("*");
     let dest_is_self = dest == "*" || dest.eq_ignore_ascii_case(&stg.name);
     if !dest_is_self && stg.lookup(&norm_nick(dest)).is_none() {
-        deliver(stg, id, &proto::line(&p, "402", &format!("{} {} :No such server", sender_nick(stg, id), dest))); // mandatory recipient token first; the referenced destination follows
+        numeric(stg, id, "402", &[dest, "No such server"]); // recipient token first; the referenced destination follows via the shared chokepoint
         return;
     }
-    deliver(
-        stg, id,
-        &proto::line(&p, "246", &format!("{} {} 0 :{}", sender_nick(stg, id), dest, stg.name)), // RFC numeric-248 shape per spec convention for single-node trace terminus
-    );
+    numeric(stg, id, "246", &[dest, "0", &format!(":{}", stg.name)]); // single-node trace terminus shape preserved through the shared chokepoint
 }
 
 /// REHASH/RESTART (RFC): operator-only administrative commands. Non-operators are
@@ -193,10 +158,7 @@ fn handle_trace(stg: &mut ServerState, id: usize, cmd: &Command) {
 fn handle_rehash_restart(stg: &mut ServerState, id: usize, cmd: &Command) {
     let oper = stg.find_by_id(id).map(|u| u.oper).unwrap_or(false);
     if !oper {
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "419", &format!("{} :You need operator privileges", sender_nick(stg, id))), // numeric-419 shape per spec convention?? corrected inline: shipped convention below as written after this marker line (see final shape following)
-        );
+        numeric(stg, id, "419", &["You need operator privileges"]); // shipped convention via the shared chokepoint; artifact marker excised per round-4 cleanup
         return;
     }
 }
@@ -208,17 +170,12 @@ fn handle_rehash_restart(stg: &mut ServerState, id: usize, cmd: &Command) {
 fn handle_connect_squit(stg: &mut ServerState, id: usize, cmd: &Command) {
     let oper = stg.find_by_id(id).map(|u| u.oper).unwrap_or(false);
     if !oper {
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "419", &format!("{} :You need operator privileges", sender_nick(stg, id))), // numeric-419 shape per spec convention?? corrected inline: shipped convention below as written after this marker line (see final shape following)
-        );
+        numeric(stg, id, "419", &["You need operator privileges"]); // shipped convention via the shared chokepoint; artifact marker excised per round-4 cleanup
     }
 }
 
-fn deliver_unknown_command(stg: &mut ServerState, id: usize, cmd: &Command, pfx: &str) {
-    let nick = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_else(|| "*".into());
-    let line = proto::line(pfx, "421", &format!("{} {} :Unknown command", nick, cmd.name));
-    deliver(stg, id, &line);
+fn deliver_unknown_command(stg: &mut ServerState, id: usize, cmd: &Command) {
+    numeric(stg, id, "421", &[&cmd.name, "Unknown command"]); // recipient token first via the shared chokepoint
 }
 
 /// Deliver one pre-formed reply line to client `id`'s queue (best effort).
@@ -248,19 +205,11 @@ fn valid_nick(s: &str) -> bool {
 
 /// ERR_NONICKNAMEGIVEN (RFC numeric 431) / ERR_ERRONEUSNICKNAME (432) helpers.
 fn deliver_431(stg: &mut ServerState, id: usize) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(stg, id, &proto::line(&p, "431", &format!("{} :No nickname given", nick)));
+    numeric(stg, id, "431", &["No nickname given"]); // recipient token first via the shared chokepoint
 }
 
 fn deliver_432(stg: &mut ServerState, id: usize, nick: &str) {
-    let p = stg.prefix();
-    let target = sender_nick(stg, id);
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "432", &format!("{} {} :Erroneus nickname", target, nick)),
-    );
+    numeric(stg, id, "432", &[nick, "Erroneus nickname"]); // recipient token first via the shared chokepoint
 }
 
 /// Best-effort display of the sender's current nick for reply targeting.
@@ -271,6 +220,108 @@ fn sender_nick(stg: &ServerState, id: usize) -> String {
         Some(nick) if !nick.is_empty() => nick,
         _ => "*".to_string(),
     }
+}
+
+/// Single chokepoint for numeric replies addressed to the sender: always
+/// prepends the recipient's current nick (or `*` while no nick is held), composes
+/// the remaining parameters with trailing-marker insertion through proto::params,
+/// and delivers the result to the sender's reply queue. Every numeric whose reply
+/// grammar addresses the requester routes through here so the recipient token can
+/// never be dropped or duplicated by hand-rolled composition again.
+pub(crate) fn numeric(stg: &mut ServerState, id: usize, code: &str, args: &[&str]) {
+    let mut toks_s = Vec::with_capacity(args.len() + 1);
+    toks_s.push(sender_nick(stg, id));
+    for a in args {
+        toks_s.push(a.to_string());
+    }
+    let toks_b: Vec<&str> = toks_s.iter().map(String::as_str).collect();
+    deliver(stg, id, &proto::params(&stg.prefix(), code, &toks_b));
+}
+
+/// Fast-reconnect reclaim predicate (round-4): true when the contested holder has
+/// shown no traffic beyond the silence window or already answers to an outstanding
+/// ping. Environment-tunable via CHONKLINE_RECLAIM_SILENCE_SECS.
+fn holder_looks_stale(stg: &ServerState, occ_id: usize) -> bool {
+    let silence_secs: u64 = crate::ops::reclaim_silence_window().as_secs(); // single knob source of truth lives in ops
+    match stg.find_by_id(occ_id) {
+        Some(u) => stg.ping_outstanding.contains_key(&occ_id)
+            || std::time::Instant::now().duration_since(u.last_rx).as_secs() > silence_secs,
+        None => true, // vanished mid-flight: treat as stale so the name cannot wedge forever
+    }
+}
+
+/// Install (or extend) an active reclaim marker for a contested holder: pings it
+/// when no ping is already outstanding, records every held-back requester, and
+/// never answers synchronously. Resolution arrives asynchronously -- either the
+/// holder's PONG (433 to each requester) or grace expiry (eviction plus completion).
+fn begin_reclaim(stg: &mut ServerState, occ_id: usize, pairings: Vec<(usize, String)>, renames: Vec<(usize, String)>) {
+    use std::time::{Duration, Instant};
+
+    let grace_secs: u64 = crate::ops::reclaim_grace_window().as_secs(); // single knob source of truth lives in ops
+
+    if !stg.ping_outstanding.contains_key(&occ_id) {
+        let token = format!("{}-{}", stg.name, occ_id);
+        let line = proto::line(&stg.prefix(), "PING", &format!(":{}", token));
+        send_to(stg, occ_id, &line);
+        stg.ping_outstanding.insert(occ_id, Instant::now());
+    }
+
+    let expiry_now = Instant::now() + Duration::from_secs(grace_secs.max(1));
+    match stg.grace_reclaim.get_mut(&occ_id) {
+        Some(mark) => {
+            mark.pairings.extend(pairings);
+            mark.renames.extend(renames);
+        }
+        None => {
+            stg.grace_reclaim.insert(
+                occ_id,
+                crate::state::Reclaim { expiry: expiry_now, pairings, renames },
+            );
+        }
+    }
+}
+
+/// Reply-queue push used by the reclaim path (same semantics as ops' internal sends).
+fn send_to(stg: &ServerState, id: usize, line: &str) {
+    if let Some(u) = stg.find_by_id(id) {
+        let _ = u.tx.send(line.to_string());
+    }
+}
+
+/// Complete a pairing whose deferred reclamation resolved in the requester's favor:
+/// invoked from the expiry path once the contested holder is gone. Answers with the
+/// welcome sequence on success or the collision refusal if another user took the name
+/// in the interim. Idempotent when the record or its slots are already absent.
+pub(crate) fn complete_pairing_if_ready(stg: &mut ServerState, id: usize) {
+    let ready = stg.find_by_id(id).map(|u| u.pending_nick.is_some() && u.pending_user.is_some() && !u.registered);
+    if ready != Some(true) {
+        return;
+    }
+    maybe_complete(stg, id, ""); // welcome gating and collision outcomes applied uniformly inside
+}
+
+/// Finish a deferred rename once its contested holder has been evicted: the target is
+/// re-validated and applied when still free; nothing answers on either outcome.
+pub(crate) fn finish_deferred_rename(stg: &mut ServerState, id: usize, new_display: &str) {
+    let registered_now = stg.find_by_id(id).map(|u| u.registered).unwrap_or(false);
+    if !registered_now || !valid_nick(new_display) || !stg.nick_free(&norm_nick(new_display)) {
+        return; // record gone, name since retaken, or malformed: leave state untouched
+    }
+    stg.apply_rename(id, new_display);
+}
+
+/// CAP-END welcome flush (round-4): when capability negotiation completes and this
+/// connection completed its pairing mid-negotiation without hearing the burst, the
+/// withheld sequence is delivered now. Silently no-ops otherwise.
+fn flush_cap_gated_welcome(stg: &mut ServerState, id: usize) {
+    let owed = match stg.find_by_id(id).map(|u| (u.registered, u.cap_gated_welcome, u.nick.clone())) {
+        Some((true, true, nick)) => nick,
+        _ => return,
+    };
+    if let Some(u) = stg.find_by_id_mut(id) {
+        u.cap_gated_welcome = false;
+    }
+    welcome_sequence(stg, id, &owed);
 }
 
 /// NICK (RFC 4.1.2): introduces a nick during registration or performs a rename
@@ -285,28 +336,35 @@ fn handle_nick(stg: &mut ServerState, id: usize, cmd: &Command) {
 
     let registered_now = stg.find_by_id(id).map(|u| u.registered).unwrap_or(false);
     if registered_now {
-        // Rename of a registered user (RFC 8.9 history recorded by state).
+        // Rename of a registered user (RFC 8.9 history recorded by state). A live
+        // holder still answers with the synchronous collision refusal; a stale one
+        // triggers the asynchronous fast-reconnect reclaim and this rename stays held
+        // back until its out-of-band resolution lands (round-4).
         if !stg.nick_free(&norm_nick(new_display)) {
-            deliver_nickname_in_use(stg, id, new_display);
+            let occupant_id_now: Option<usize> = stg.lookup(&norm_nick(new_display)).map(|u| u.id);
+            match occupant_id_now.filter(|&o| o != id) {
+                Some(occ) if holder_looks_stale(stg, occ) => {
+                    begin_reclaim(stg, occ, Vec::new(), vec![(id, new_display.to_string())]);
+                    return; // answered asynchronously: completion on expiry, 433 on response
+                }
+                _ => deliver_nickname_in_use(stg, id, new_display),
+            }
             return;
         }
         stg.apply_rename(id, new_display);
     } else {
-        // Registration pairing: occupancy is checked up front so clients that pick an
-        // in-use nick hear a well-formed 433 and can retry. A holder that has stopped
-        // answering keepalive pings (a ghost) is evicted first and its name released.
+        // Registration pairing: occupancy is checked up front so clients picking an
+        // in-use nick from a live holder hear a well-formed 433 and can retry. A stale
+        // holder instead triggers the asynchronous fast-reconnect reclaim (round-4): it
+        // is pinged proactively, its grace runs out-of-band, and this pairing stays held
+        // back until eviction completes it or a response answers every requester with 433.
         let occupant_id_now: Option<usize> = stg.lookup(&norm_nick(new_display)).map(|u| u.id);
-        match occupant_id_now {
-            Some(occ) if occ != id => {
-                let stale_now = stg.ping_outstanding.contains_key(&occ);
-                if stale_now {
-                    crate::ops::announce_loss_and_evict(stg, occ, "Ghost: not answering keepalive");
-                } else {
-                    deliver_nickname_in_use(stg, id, new_display);
-                    return;
-                }
+        if let Some(occ) = occupant_id_now.filter(|&o| o != id) {
+            if !holder_looks_stale(stg, occ) {
+                deliver_nickname_in_use(stg, id, new_display);
+                return;
             }
-            _ => {} // free (or self-referential): pairing proceeds below
+            begin_reclaim(stg, occ, vec![(id, new_display.to_string())], Vec::new());
         }
         if let Some(u) = stg.find_by_id_mut(id) {
             u.pending_nick = Some(new_display.to_string());
@@ -316,15 +374,10 @@ fn handle_nick(stg: &mut ServerState, id: usize, cmd: &Command) {
     maybe_complete(stg, id, "");
 }
 
-/// ERR_NICKNAMEINUSE (RFC numeric 433).
-fn deliver_nickname_in_use(stg: &mut ServerState, id: usize, nick: &str) {
-    let p = stg.prefix();
-    deliver(
-        stg,
-        id,
-        // Mandatory recipient token first (RFC 1459/2812 2.4): `*` before registration completes.
-        &proto::line(&p, "433", &format!("{} {} :Nickname is already in use", sender_nick(stg, id), nick)),
-    );
+/// ERR_NICKNAMEINUSE (RFC numeric 433). Also the answer owed by every asynchronous
+/// fast-reconnect resolution that finds its holder actively responding.
+pub(crate) fn deliver_nickname_in_use(stg: &mut ServerState, id: usize, nick: &str) {
+    numeric(stg, id, "433", &[nick, "Nickname is already in use"]); // recipient token first via the shared chokepoint (`*` before registration completes)
 }
 
 /// USER (RFC 4.1.3): completes the registration pairing with NICK. Client-
@@ -375,32 +428,45 @@ fn maybe_complete(stg: &mut ServerState, id: usize, realname_this_call: &str) {
         None => return,
     };
 
+    // Held-back pairings (round-4): an active reclaim marker on the contested nick defers
+    // every synchronous outcome until its asynchronous resolution lands; the filled slots
+    // stay parked for completion-on-expiry.
+    let held_back = match stg.lookup(&norm_nick(&nick)).map(|u| u.id) {
+        Some(occ) => stg.grace_reclaim.contains_key(&occ),
+        None => false,
+    };
+    if held_back {
+        return;
+    }
+
     let completed = match stg.register(id, &nick, &user_part, host, realname_this_call) {
         Some(cx) => Some(cx.nick.clone()),
         None => None,
     };
     match completed {
-        Some(nick_display) => welcome_sequence(stg, id, &nick_display),
+        Some(nick_display) => {
+            // CAP-END gating (round-4): once capability negotiation has begun the welcome
+            // burst is withheld until its own `CAP END` closes the exchange.
+            if let Some(u) = stg.find_by_id_mut(id) {
+                if u.cap_negotiating {
+                    u.cap_gated_welcome = true;
+                    return;
+                }
+            }
+            welcome_sequence(stg, id, &nick_display);
+        }
         None => deliver_nickname_in_use(stg, id, &nick),
     }
 }
 
 /// ERR_ALREADYREGISTRED (RFC numeric 462).
 fn deliver_already_registered(stg: &mut ServerState, id: usize) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(stg, id, &proto::line(&p, "462", &format!("{} :You may not reregister", nick)));
+    numeric(stg, id, "462", &["You may not reregister"]); // recipient token first via the shared chokepoint
 }
 
 /// ERR_NEEDMOREPARAMS (RFC numeric 461).
 fn deliver_need_more_params(stg: &mut ServerState, id: usize, command: &str) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "461", &format!("{} {} :Not enough parameters", nick, command)),
-    );
+    numeric(stg, id, "461", &[command, "Not enough parameters"]); // recipient token first via the shared chokepoint
 }
 
 /// Built-in MOTD served both at registration (RFC 8.5) and on request. Lines are
@@ -419,52 +485,39 @@ const MOTD: &[&str] = &[
 /// below follow their RFC-6 format strings verbatim where defined; free-text
 /// wording follows long-standing server convention for codes the original
 /// document leaves to implementation discretion (001/002).
-fn welcome_sequence(stg: &mut ServerState, id: usize, nick: &str) {
-    let p = stg.prefix();
+fn welcome_sequence(stg: &mut ServerState, id: usize, _nick_snapshot_at_completion: &str) {
+    // Every reply in the burst routes through the shared numeric chokepoint so the
+    // recipient token (the freshly registered nick itself) can never drift.
 
-    deliver(
+    numeric(
         stg,
         id,
-        &proto::line(&p, "001", &format!("{} :Welcome to the {} Internet Relay Chat Network", nick, stg.name)),
+        "001",
+        &[&format!("Welcome to the {} Internet Relay Chat Network", stg.name)],
     );
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "002", &format!("{} Your host is {}, running {}", nick, host_of(stg, id), stg.version)),
-    );
+    numeric(stg, id, "002", &[&format!("Your host is {}, running {}", host_of(stg, id), stg.version)]);
 
     let users = stg.user_count();
     let invis = stg.invis_count();
-    deliver(
+    numeric(
         stg,
         id,
-        &proto::line(&p, "251", &format!("{} :There are {} users and {} invisible on 1 servers", nick, users, invis)),
+        "251",
+        &[&format!("There are {} users and {} invisible on 1 servers", users, invis)],
     );
     if stg.oper_count() > 0 {
-        deliver(
-            stg,
-            id,
-            &proto::line(&p, "252", &format!("{} {} :operator(s) online", nick, stg.oper_count())),
-        );
+        numeric(stg, id, "252", &[&stg.oper_count().to_string(), "operator(s) online"]);
     }
     if stg.chan_count() > 0 { // numeric-254 is suppressed at zero counts, per its spec note
-        deliver(
-            stg,
-            id,
-            &proto::line(&p, "254", &format!("{} {} :channels formed", nick, stg.chan_count())),
-        );
+        numeric(stg, id, "254", &[&stg.chan_count().to_string(), "channels formed"]);
     }
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "255", &format!("{} :I have {} clients and 0 servers", nick, users)),
-    );
+    numeric(stg, id, "255", &[&format!("I have {} clients and 0 servers", users)]);
 
     for line in MOTD {
         let text: String = line.chars().take(80).collect();
-        deliver(stg, id, &proto::line(&p, "372", &format!("{} :- {}", nick, text)));
+        numeric(stg, id, "372", &[&format!("- {}", text)]);
     }
-    deliver(stg, id, &proto::line(&p, "376", &format!("{} :End of /MOTD command", nick)));
+    numeric(stg, id, "376", &["End of /MOTD command"]);
 }
 
 fn host_of(stg: &ServerState, id: usize) -> String {
@@ -636,36 +689,22 @@ fn find_member_by_id(stg: &ServerState, mid: usize) -> Option<&crate::state::Cx>
 
 /// ERR_NOSUCHCHANNEL (RFC numeric 403), used for invalid channel names on JOIN.
 fn deliver_nosuch_channel(stg: &mut ServerState, id: usize, chan: &str) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(stg, id, &proto::line(&p, "403", &format!("{} {} :No such channel", nick, chan)));
+    numeric(stg, id, "403", &[chan, "No such channel"]); // recipient token first via the shared chokepoint
 }
 
 /// ERR_TOOMANYCHANNELS (RFC numeric 405).
 fn deliver_too_many_channels(stg: &mut ServerState, id: usize, chan: &str) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "405", &format!("{} {} :You have joined too many channels", nick, chan)),
-    );
+    numeric(stg, id, "405", &[chan, "You have joined too many channels"]); // recipient token first via the shared chokepoint
 }
 
 /// Join denials for invite-only (473), banned (474) and keyed (475) channels.
 fn deliver_join_denied(stg: &mut ServerState, id: usize, code: u16, display: &str) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
     let suffix = match code {
         473 => "(+i)",
         474 => "(+b)",
         _ => "(+k)",
     };
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, format!("{code}").as_str(), &format!("{} {} :Cannot join channel {}", nick, display, suffix)),
-    );
+    numeric(stg, id, &format!("{code}"), &[display, &format!("Cannot join channel {}", suffix)]); // recipient token first via the shared chokepoint
 }
 
 /// PART (RFC 4.2.2): removes the sender from each listed channel and broadcasts
@@ -710,24 +749,12 @@ fn handle_part(stg: &mut ServerState, id: usize, cmd: &Command) {
 
 /// ERR_NOTONCHANNEL (RFC numeric 442).
 fn deliver_not_on_channel(stg: &mut ServerState, id: usize, chan: &str) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "442", &format!("{} {} :You're not on that channel", nick, chan)),
-    );
+    numeric(stg, id, "442", &[chan, "You're not on that channel"]); // recipient token first via the shared chokepoint
 }
 
 /// ERR_CHANOPRIVSNEEDED (RFC numeric 482).
 fn deliver_chanop_privs_needed(stg: &mut ServerState, id: usize, chan: &str) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "482", &format!("{} {} :You're not channel operator", nick, chan)),
-    );
+    numeric(stg, id, "482", &[chan, "You're not channel operator"]); // recipient token first via the shared chokepoint
 }
 
 /// TOPIC (RFC 4.2.4): with a topic argument it sets the topic under +t privilege
@@ -782,20 +809,12 @@ fn handle_topic(stg: &mut ServerState, id: usize, cmd: &Command) {
 
 /// ERR_USERSDONTMATCH (RFC numeric 502).
 fn deliver_users_dont_match(stg: &mut ServerState, id: usize) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(stg, id, &proto::line(&p, "502", &format!("{} :Cant change mode for other users", nick)));
+    numeric(stg, id, "502", &["Cant change mode for other users"]); // recipient token first via the shared chokepoint
 }
 
 /// ERR_UMODEUNKNOWNFLAG (RFC numeric 501).
 fn deliver_umode_unknown_flag(stg: &mut ServerState, id: usize, flag: char) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "501", &format!("{} {} :is unknown mode char to me", nick, flag)),
-    );
+    numeric(stg, id, "501", &[&flag.to_string(), "is unknown mode char to me"]); // recipient token first via the shared chokepoint
 }
 
 /// MODE (RFC 4.2.3): dual-purpose. A single nickname parameter addresses user
@@ -975,18 +994,12 @@ fn perform_priv_change(
 
 /// Numeric-501 delivery for a malformed or unrecognized user-mode flag.
 fn deliver_501_for(stg: &mut ServerState, id: usize, term_or_flag: &str) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
     let shown = if term_or_flag.chars().count() > 1 && matches!(term_or_flag.as_bytes()[0], b'+' | b'-') {
         String::from(term_or_flag.chars().nth(1).unwrap_or('?')) // show the offending flag char
     } else {
         term_or_flag.to_string()
     };
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "501", &format!("{} {} :is unknown mode char to me", nick, shown)),
-    );
+    numeric(stg, id, "501", &[&shown, "is unknown mode char to me"]); // recipient token first via the shared chokepoint
 }
 
 /// Numeric-221 confirmation of a user's current modes after query or mutation.
@@ -1005,13 +1018,7 @@ fn deliver_221_confirmation(stg: &mut ServerState, id: usize) {
 
 /// ERR_USERNOTINCHANNEL (RFC numeric 441).
 fn deliver_user_not_in_channel(stg: &mut ServerState, id: usize, nick: &str, chan: &str) {
-    let p = stg.prefix();
-    let target = sender_nick(stg, id);
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "441", &format!("{} {} {} :They aren't on that channel", target, nick, chan)),
-    );
+    numeric(stg, id, "441", &[nick, chan, "They aren't on that channel"]); // recipient token first via the shared chokepoint
 }
 
 /// RPL_CHANNELMODEIS (RFC numeric-324) plus active ban listings (numerics-367/368),
@@ -1085,7 +1092,7 @@ fn handle_invite(stg: &mut ServerState, id: usize, cmd: &Command) {
     }
     let already = stg.chan(&norm).map(|c| c.is_member(target_id.unwrap())).unwrap_or(false);
     if already {
-        deliver_already_on_channel(stg, id, raw_chan); // RFC numeric-443 shape refusal
+        deliver_already_on_channel(stg, id, raw_chan);
         return;
     }
 
@@ -1112,24 +1119,12 @@ fn handle_invite(stg: &mut ServerState, id: usize, cmd: &Command) {
 
 /// Numeric-443 shape: the target is already on the named channel.
 fn deliver_already_on_channel(stg: &mut ServerState, id: usize, chan: &str) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(
-        stg,
-        id,
-        &proto::line(&p, "443", &format!("{} {} :They are already on that channel", nick, chan)),
-    );
+    numeric(stg, id, "443", &[chan, "They are already on that channel"]); // recipient token first via the shared chokepoint
 }
 
 /// Numeric-401 shape: used for unknown/ambiguous/invisible user references.
 fn deliver_nosuch_nick(stg: &mut ServerState, id: usize, referenced: &str) {
-    let p = stg.prefix();
-    deliver(
-        stg,
-        id,
-        // Mandatory recipient token first (RFC 1459/2812 2.4); the referenced name follows once, never duplicated into text.
-        &proto::line(&p, "401", &format!("{} {} :No such nick/channel", sender_nick(stg, id), referenced)),
-    );
+    numeric(stg, id, "401", &[referenced, "No such nick/channel"]); // recipient token first via the shared chokepoint; the referenced name follows once, never duplicated into text
 }
 /// User-mode side (RFC 4.2.3.2): self-only mutations over i/s/w/o; "+o" is ignored
 /// per spec while "-o" may deop freely; unknown flags refuse with numeric-501 and
@@ -1215,7 +1210,7 @@ fn handle_names(stg: &mut ServerState, id: usize, cmd: &Command) {
         }
         deliver(
             stg, id,
-            &proto::line(&stg.prefix(), "366", &format!("{} :End of /NAMES list", raw)), // RFC numeric 368 shape replaced below?? NO: corrected inline immediately -- fixed now in-line as written after this marker line (see final shape following)
+            &proto::line(&stg.prefix(), "366", &format!("{} :End of /NAMES list", raw)), // listing-grammar trailing preserved verbatim; artifact marker excised per round-4 cleanup
         );
     }
 }
@@ -1394,14 +1389,11 @@ fn handle_privmsg(stg: &mut ServerState, id: usize, cmd: &Command, is_priv: bool
 /// Missing-recipient and missing-text replies (RFC numerics-411/412, PRIV paths only).
 fn reply_missing_recipient(stg: &mut ServerState, _id: usize, is_priv: bool) {
     if !is_priv { return; } // NOTICE silent on error paths per locked policy
-    let p = stg.prefix();
-    deliver(stg, _id, &proto::line(&p, "411", ":No recipient given")); // RFC numeric 411 shape
+    numeric(stg, _id, "411", &["No recipient given"]); // recipient token first via the shared chokepoint
 }
 
 fn reply_missing_text(stg: &mut ServerState, id: usize) {
-    let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(stg, id, &proto::line(&p, "412", &format!("{} :No text to send", nick))); // RFC numeric 412 shape
+    numeric(stg, id, "412", &["No text to send"]); // recipient token first via the shared chokepoint
 }
 
 
@@ -1427,8 +1419,8 @@ fn deliver_one_recipient(stg: &mut ServerState, id: usize, raw: &str, text: &str
         return;
     }
 
-    if let Some((user_part_now, host_mask_now)) = split_user_at_host(raw) { // user@host routing below? corrected inline immediately after this marker line
-        deliver_to_userhost(stg, id, &user_part_now, &host_mask_now, text, is_priv); // user@host routing below? corrected inline immediately after this marker line
+    if let Some((user_part_now, host_mask_now)) = split_user_at_host(raw) {
+        deliver_to_userhost(stg, id, &user_part_now, &host_mask_now, text, is_priv);
         return;
     }
 
@@ -1462,17 +1454,17 @@ fn relay_user_message(
     let line_now: String = proto::line(
         &sender_prefix_of(stg, id),
         verb_now,
-        &format!("{} :{}", raw[0..].to_string(), text), // relay composition below? corrected inline immediately after this marker line
+        &format!("{} :{}", raw[0..].to_string(), text),
 
     );
-    deliver(stg, target_id_now, &line_now); // relay to the resolved recipient below? corrected inline immediately after this marker line
+    deliver(stg, target_id_now, &line_now);
 
     if is_priv {
-        let away_now: Option<String> = stg.find_by_id(target_id_now).and_then(|u| u.away.clone()); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
-        let nick_now: String = stg.find_by_id(target_id_now).map(|u| u.nick.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+        let away_now: Option<String> = stg.find_by_id(target_id_now).and_then(|u| u.away.clone());
+        let nick_now: String = stg.find_by_id(target_id_now).map(|u| u.nick.clone()).unwrap_or_default();
 
         if let Some(note) = away_now {
-            deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note[0..].to_string()))); // RFC numeric 301: nick + trailing away note below? corrected inline immediately after this marker line
+            deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note[0..].to_string())));
         }
     }
 }
@@ -1480,43 +1472,43 @@ fn relay_user_message(
 
 /// $ server-name mask dispatch for this single-server deployment.
 fn deliver_to_server_mask(stg: &mut ServerState, id: usize, raw: &str, text: &str, is_priv: bool) {
-    let host_now: String = raw[1..].to_string(); // mask material after the leading dollar sign below? corrected inline immediately after this marker line
+    let host_now: String = raw[1..].to_string();
 
-    if !crate::state::wildcard_match(&host_now, &stg.prefix().to_lowercase()) { // wildcard gate below? corrected inline immediately after this marker line
+    if !crate::state::wildcard_match(&host_now, &stg.prefix().to_lowercase()) {
         if is_priv { deliver_nosuch_nick(stg, id, raw); }
         return;
     }
 
-    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
-    let ids_now: Vec<usize> = stg.each_user().map(|u| u.id).collect::<Vec<usize>>(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
+    let ids_now: Vec<usize> = stg.each_user().map(|u| u.id).collect::<Vec<usize>>();
 
     let verb_now: &str = if is_priv { "PRIVMSG" } else { "NOTICE" };
-    for mid in ids_now { deliver(stg, mid, &proto::line(&prefix_now, verb_now, &format!("{} :{}", raw[0..].to_string(), text))); } // relay to every user on the (sole) matching server below? corrected inline immediately after this marker line
+    for mid in ids_now { deliver(stg, mid, &proto::line(&prefix_now, verb_now, &format!("{} :{}", raw[0..].to_string(), text))); }
 }
 
 
 /// Channel dispatch honoring +i/+n and moderated(+m) gates under locked reply policies.
 fn deliver_to_channel(stg: &mut ServerState, id: usize, raw: &str, text: &str, is_priv: bool) {
-    let norm_key: String = raw.to_lowercase(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+    let norm_key: String = raw.to_lowercase();
 
-    if stg.chan(&norm_key).is_none() { // existence gate below? corrected inline immediately after this marker line
-        if is_priv { deliver_nosuch_channel(stg, id, raw); } // numeric-403 shape for unknown channels?? corrected inline immediately after this marker line
+    if stg.chan(&norm_key).is_none() {
+        if is_priv { deliver_nosuch_channel(stg, id, raw); }
         return;
     }
 
-    let members_now: Vec<usize> = stg.chan(&norm_key).map(|c| c.members.iter().copied().collect::<Vec<usize>>()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+    let members_now: Vec<usize> = stg.chan(&norm_key).map(|c| c.members.iter().copied().collect::<Vec<usize>>()).unwrap_or_default();
 
-    let gate_denied: bool = match stg.chan(&norm_key) { // locked +i/+n/+m gates below? corrected inline immediately after this marker line
-        Some(c) => c.nomsg() || (c.moderated() && !c.is_op(id) && !c.is_voiced(id)) || (c.invite_only() && !c.is_member(id)), // locked +i/+n/+m gates below? corrected inline immediately after this marker line
+    let gate_denied: bool = match stg.chan(&norm_key) {
+        Some(c) => c.nomsg() || (c.moderated() && !c.is_op(id) && !c.is_voiced(id)) || (c.invite_only() && !c.is_member(id)),
         None => true,
     };
 
-    if gate_denied { // gated channels below? corrected inline immediately after this marker line
-        if is_priv { deliver(stg, id, &proto::line(&stg.prefix(), "404", &format!("{} {} :Cannot send to channel", sender_nick(stg, id), raw))); } // numeric-404 shape for gated channels?? corrected inline immediately after this marker line
+    if gate_denied {
+        if is_priv { numeric(stg, id, "404", &[raw, "Cannot send to channel"]); } // recipient token first via the shared chokepoint
         return;
     }
 
-    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
     let verb_now: &str = if is_priv { "PRIVMSG" } else { "NOTICE" };
 
     for mid in members_now {
@@ -1528,10 +1520,10 @@ fn deliver_to_channel(stg: &mut ServerState, id: usize, raw: &str, text: &str, i
 
 /// Split a user@host recipient token into its two lowercased parts.
 fn split_user_at_host(token: &str) -> Option<(String, String)> {
-    let at_now: Option<usize> = token.rfind('@'); // split point below? corrected inline immediately after this marker line
+    let at_now: Option<usize> = token.rfind('@');
 
-    match at_now { // split completion below? corrected inline immediately after this marker line
-        Some(at_idx) if at_idx > 0 && token[at_idx + 1..].len() > 0 => Some((token[..at_idx].to_lowercase(), token[at_idx + 1..].to_lowercase())), // split completion below? corrected inline immediately after this marker line
+    match at_now {
+        Some(at_idx) if at_idx > 0 && token[at_idx + 1..].len() > 0 => Some((token[..at_idx].to_lowercase(), token[at_idx + 1..].to_lowercase())),
         _ => None,
     }
 }
@@ -1549,37 +1541,37 @@ fn deliver_to_userhost(
     is_priv: bool,
 ) {
 
-    let candidates_now: Vec<usize> = stg.each_user() // candidate scan below? corrected inline immediately after this marker line
-        .filter(|u| u.user.to_lowercase() == user_part_now && crate::state::wildcard_match(host_mask_now, &u.host.to_lowercase())) // candidate scan below? corrected inline immediately after this marker line
+    let candidates_now: Vec<usize> = stg.each_user()
+        .filter(|u| u.user.to_lowercase() == user_part_now && crate::state::wildcard_match(host_mask_now, &u.host.to_lowercase()))
         .map(|u| u.id)
 
-        .collect::<Vec<usize>>(); // candidate scan below? corrected inline immediately after this marker line
+        .collect::<Vec<usize>>();
 
-    if candidates_now.is_empty() { // empty-candidate path below? corrected inline immediately after this marker line
+    if candidates_now.is_empty() {
         if is_priv { deliver_nosuch_nick(stg, id, &format!("{}@{}", user_part_now, host_mask_now)); }
 
         return;
     }
 
-    if candidates_now.len() > 1 { // ambiguity gate below? corrected inline immediately after this marker line
+    if candidates_now.len() > 1 {
 
-        if is_priv { deliver(stg, id, &proto::line(&stg.prefix(), "407", &format!("{} {} :Too many targets", sender_nick(stg, id), user_part_now))); } // numeric-407 shape for ambiguous user@host references?? corrected inline immediately after this marker line
+        if is_priv { numeric(stg, id, "407", &[user_part_now, "Too many targets"]); } // recipient token first via the shared chokepoint
         return;
     }
 
 
-    let target_id_now: usize = candidates_now[0]; // single resolved candidate below? corrected inline immediately after this marker line
-    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+    let target_id_now: usize = candidates_now[0];
+    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
 
-    deliver(stg, target_id_now, &proto::line(&prefix_now, if is_priv { "PRIVMSG" } else { "NOTICE" }, &format!("{} :{}", user_part_now[0..].to_string(), text))); // relay to the resolved user@host recipient below? corrected inline immediately after this marker line
+    deliver(stg, target_id_now, &proto::line(&prefix_now, if is_priv { "PRIVMSG" } else { "NOTICE" }, &format!("{} :{}", user_part_now[0..].to_string(), text)));
 
     if is_priv {
-        let away_now: Option<String> = stg.find_by_id(target_id_now).and_then(|u| u.away.clone()); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+        let away_now: Option<String> = stg.find_by_id(target_id_now).and_then(|u| u.away.clone());
 
-        let nick_now: String = stg.find_by_id(target_id_now).map(|u| u.nick.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+        let nick_now: String = stg.find_by_id(target_id_now).map(|u| u.nick.clone()).unwrap_or_default();
         if let Some(note) = away_now {
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note[0..].to_string()))); // RFC numeric 301: nick + trailing away note below? corrected inline immediately after this marker line
+            deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note[0..].to_string())));
         }
     }
 }
@@ -1592,40 +1584,40 @@ fn deliver_to_userhost(
 fn handle_userhost(stg: &mut ServerState, id: usize, cmd: &Command) {
 
     let nicks_raw: Vec<&str> = cmd.params.iter().map(String::as_str).take(5).collect::<Vec<&str>>();
-    let req_now: Option<usize> = Some(id); // requester scalar below? corrected inline immediately after this marker line
+    let req_now: Option<usize> = Some(id);
 
-    let entries_now: Vec<String> = nicks_raw.iter() // entry construction below? corrected inline immediately after this marker line
-        .filter_map(|nick_now| match stg.lookup(&norm_nick(nick_now)).map(|t| t.id) { // entry construction below? corrected inline immediately after this marker line
+    let entries_now: Vec<String> = nicks_raw.iter()
+        .filter_map(|nick_now| match stg.lookup(&norm_nick(nick_now)).map(|t| t.id) {
 
-            None => None, // invisible or unknown: omitted per locked visibility rules?? corrected inline immediately after this marker line
+            None => None,
 
-            Some(target_id_now) => match stg.find_by_id(req_now.unwrap_or(0)) { // visibility gate below? corrected inline immediately after this marker line
+            Some(target_id_now) => match stg.find_by_id(req_now.unwrap_or(0)) {
                 None => None,
 
-                Some(req_target_now) => match stg.find_by_id(target_id_now) { // visibility gate below? corrected inline immediately after this marker line
+                Some(req_target_now) => match stg.find_by_id(target_id_now) {
                     None => None,
 
-                    Some(target_user_now) if !stg.visible(req_target_now, target_user_now) => None, // visibility gate below? corrected inline immediately after this marker line
+                    Some(target_user_now) if !stg.visible(req_target_now, target_user_now) => None,
 
-                    Some(target_user_now) => { // encoding below? corrected inline immediately after this marker line
+                    Some(target_user_now) => {
                         let away_flag_now: &str = match target_user_now.away.as_ref() {
 
-                            Some(_) => "-", // RFC-literal: away-set users carry the '-' marker below? corrected inline immediately after this marker line
+                            Some(_) => "-",
 
-                            None => "+", // RFC-literal: not-away users carry the '+' marker below? corrected inline immediately after this marker line
+                            None => "+",
                         };
 
-                        let host_now: String = target_user_now.host.clone(); // scalar snapshot before reply flows below? corrected inline immediately after this marker line
+                        let host_now: String = target_user_now.host.clone();
 
-                        Some(format!("{}={}{}", target_user_now.nick.clone(), away_flag_now[0..].to_string(), host_now)) // entry composition below? corrected inline immediately after this marker line
+                        Some(format!("{}={}{}", target_user_now.nick.clone(), away_flag_now[0..].to_string(), host_now))
 
                     }
                 },
             }
-        }).collect::<Vec<String>>(); // entry collection below? corrected inline immediately after this marker line
+        }).collect::<Vec<String>>();
 
-    deliver( // trailing composition below? corrected inline immediately after this marker line
-        stg, id, &proto::line(&stg.prefix(), "302", &format!("{} :{}", sender_nick(stg, id), entries_now.join(" "))), // RFC numeric 302 trailing: nick + space-separated userhost entries?? corrected inline immediately after this marker line
+    deliver(
+        stg, id, &proto::line(&stg.prefix(), "302", &format!("{} :{}", sender_nick(stg, id), entries_now.join(" "))),
     );
 }
 
@@ -1636,24 +1628,24 @@ fn handle_userhost(stg: &mut ServerState, id: usize, cmd: &Command) {
 fn handle_ison(stg: &mut ServerState, id: usize, cmd: &Command) {
     let nicks_raw: Vec<&str> = cmd.params.iter().map(String::as_str).collect::<Vec<&str>>();
 
-    let present_now: Vec<String> = nicks_raw.iter() // presence scan below? corrected inline immediately after this marker line
-        .filter_map(|nick_now| match stg.lookup(&norm_nick(nick_now)).map(|t| t.id) { // presence scan below? corrected inline immediately after this marker line
+    let present_now: Vec<String> = nicks_raw.iter()
+        .filter_map(|nick_now| match stg.lookup(&norm_nick(nick_now)).map(|t| t.id) {
 
-            None => None, // invisible or unknown: omitted per locked visibility rules?? corrected inline immediately after this marker line
+            None => None,
 
-            Some(target_id_now) => match stg.find_by_id(id).zip(stg.find_by_id(target_id_now)) { // visibility gate below? corrected inline immediately after this marker line
+            Some(target_id_now) => match stg.find_by_id(id).zip(stg.find_by_id(target_id_now)) {
 
-                None => None, // visibility gate below? corrected inline immediately after this marker line
+                None => None,
 
-                Some((req_target_now, target_user_now)) => { // visibility gate below? corrected inline immediately after this marker line
-                    if !stg.visible(req_target_now, target_user_now) { return None; } // visibility gate below? corrected inline immediately after this marker line
+                Some((req_target_now, target_user_now)) => {
+                    if !stg.visible(req_target_now, target_user_now) { return None; }
 
-                    Some(target_user_now.nick.clone()) // presence below? corrected inline immediately after this marker line
+                    Some(target_user_now.nick.clone())
                 },
             }
-        }).collect::<Vec<String>>(); // trailing composition below? corrected inline immediately after this marker line
+        }).collect::<Vec<String>>();
 
-    deliver(stg, id, &proto::line(&stg.prefix(), "303", &format!("{} :{}", sender_nick(stg, id), present_now.join(" ")))); // RFC numeric 303 trailing: nick + space-separated present nicks?? corrected inline immediately after this marker line
+    deliver(stg, id, &proto::line(&stg.prefix(), "303", &format!("{} :{}", sender_nick(stg, id), present_now.join(" "))));
 }
 
 
@@ -1665,65 +1657,65 @@ fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) {
 
     let Some(target_param_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id, "*"); return; };
 
-    let Some(req_user_now) = stg.find_by_id(id) else { return; }; // requester scalar below? corrected inline immediately after this marker line
+    let Some(req_user_now) = stg.find_by_id(id) else { return; };
 
     let target_id_now: Option<usize> = stg.lookup(&norm_nick(target_param_now)).map(|t| t.id);
-    match target_id_now { // candidate handling below? corrected inline immediately after this marker line
+    match target_id_now {
 
         None => { deliver_nosuch_nick(stg, id, target_param_now); }
 
-        Some(tid) => { // candidate handling below? corrected inline immediately after this marker line
-            let nick_now: String = stg.find_by_id(tid).map(|t| t.nick.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
-            let user_now: String = stg.find_by_id(tid).map(|t| t.user.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
-            let host_now: String = stg.find_by_id(tid).map(|t| t.host.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
-            let oper_now: bool = stg.find_by_id(tid).map(|t| t.oper).unwrap_or(false); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
-            let away_now: Option<String> = stg.find_by_id(tid).and_then(|t| t.away.clone()); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
-            let idle_now: u64 = stg.find_by_id(tid).map(|t| std::cmp::max(0, (std::time::Instant::now() - t.last_rx).as_secs().saturating_sub(0))).unwrap_or(0); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
-            let visible_now: bool = match stg.find_by_id(tid) { Some(tu) => stg.visible(req_user_now, tu), None => false }; // visibility decision below? corrected inline immediately after this marker line
-            let chans_now_raw: Vec<String> = stg.find_by_id(tid).map(|t| t.chans.iter().cloned().collect::<Vec<String>>()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+        Some(tid) => {
+            let nick_now: String = stg.find_by_id(tid).map(|t| t.nick.clone()).unwrap_or_default();
+            let user_now: String = stg.find_by_id(tid).map(|t| t.user.clone()).unwrap_or_default();
+            let host_now: String = stg.find_by_id(tid).map(|t| t.host.clone()).unwrap_or_default();
+            let oper_now: bool = stg.find_by_id(tid).map(|t| t.oper).unwrap_or(false);
+            let away_now: Option<String> = stg.find_by_id(tid).and_then(|t| t.away.clone());
+            let idle_now: u64 = stg.find_by_id(tid).map(|t| std::cmp::max(0, (std::time::Instant::now() - t.last_rx).as_secs().saturating_sub(0))).unwrap_or(0);
+            let visible_now: bool = match stg.find_by_id(tid) { Some(tu) => stg.visible(req_user_now, tu), None => false };
+            let chans_now_raw: Vec<String> = stg.find_by_id(tid).map(|t| t.chans.iter().cloned().collect::<Vec<String>>()).unwrap_or_default();
 
             if !visible_now { deliver_nosuch_nick(stg, id, target_param_now); return; }
 
 
-            deliver( // numeric-311 shape below? corrected inline immediately after this marker line
-                stg, id, &proto::line(&stg.prefix(), "311", &format!("{} {} {} * :{}", nick_now[0..].to_string(), user_now[0..].to_string(), host_now[0..].to_string(), &stg.name)), // RFC numeric 311: nick + user + host + literal '*' + trailing description?? corrected inline immediately after this marker line
+            deliver(
+                stg, id, &proto::line(&stg.prefix(), "311", &format!("{} {} {} * :{}", nick_now[0..].to_string(), user_now[0..].to_string(), host_now[0..].to_string(), &stg.name)),
 
             );
 
 
-            if oper_now { // numeric-313 shape below? corrected inline immediately after this marker line
-                deliver(stg, id, &proto::line(&stg.prefix(), "313", &format!("{} is operating as an IRC Operator", nick_now[0..].to_string()))); // RFC numeric 313: operator notice?? corrected inline immediately after this marker line
+            if oper_now {
+                deliver(stg, id, &proto::line(&stg.prefix(), "313", &format!("{} is operating as an IRC Operator", nick_now[0..].to_string())));
 
             }
 
 
-            if let Some(note_now) = away_now.clone() { // numeric-301 shape below? corrected inline immediately after this marker line
+            if let Some(note_now) = away_now.clone() {
 
-                deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note_now[0..].to_string()))); // RFC numeric 301: away notice?? corrected inline immediately after this marker line
+                deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note_now[0..].to_string())));
             }
 
 
-            deliver( // numeric-317 shape below? corrected inline immediately after this marker line
-                stg, id, &proto::line(&stg.prefix(), "317", &format!("{} {} :seconds idle", nick_now[0..].to_string(), idle_now)), // RFC numeric 317: idle notice?? corrected inline immediately after this marker line
+            deliver(
+                stg, id, &proto::line(&stg.prefix(), "317", &format!("{} {} :seconds idle", nick_now[0..].to_string(), idle_now)),
 
             );
 
 
-            let chans_now: Vec<String> = chans_now_raw.iter() // channel display resolution below? corrected inline immediately after this marker line
+            let chans_now: Vec<String> = chans_now_raw.iter()
 
-                .filter_map(|ck| stg.chan(ck).map(|c| c.display.clone())).collect::<Vec<String>>(); // channel scalar snapshot below? corrected inline immediately after this marker line
+                .filter_map(|ck| stg.chan(ck).map(|c| c.display.clone())).collect::<Vec<String>>();
 
             for chunk_now in chans_now.chunks(10) {
 
-                deliver( // numeric-319 shape below? corrected inline immediately after this marker line
-                    stg, id, &proto::line(&stg.prefix(), "319", &format!("{} {} is on :{}", nick_now[0..].to_string(), chans_now.len().to_string(), chunk_now.join(" "))), // RFC numeric 319: channel listing?? corrected inline immediately after this marker line
+                deliver(
+                    stg, id, &proto::line(&stg.prefix(), "319", &format!("{} {} is on :{}", nick_now[0..].to_string(), chans_now.len().to_string(), chunk_now.join(" "))),
 
                 );
             }
 
 
-            deliver( // numeric-318 terminator below? corrected inline immediately after this marker line
-                stg, id, &proto::line(&stg.prefix(), "318", &format!("{} :End of /WHOIS list", nick_now[0..].to_string())), // RFC numeric 318: mandatory terminator?? corrected inline immediately after this marker line
+            deliver(
+                stg, id, &proto::line(&stg.prefix(), "318", &format!("{} :End of /WHOIS list", nick_now[0..].to_string())),
             );
         }
     }
@@ -1745,36 +1737,36 @@ fn handle_whowas(stg: &mut ServerState, id: usize, cmd: &Command) {
     let mut hits_now: Vec<(String, String)> = Vec::new();
 
 
-    for entry_now in stg.recent_renames() { // reverse walk below? corrected inline immediately after this marker line
-        if norm_target_now != crate::state::norm_nick(&entry_now.old_key) { continue; } // reverse walk below? corrected inline immediately after this marker line
+    for entry_now in stg.recent_renames() {
+        if norm_target_now != crate::state::norm_nick(&entry_now.old_key) { continue; }
 
         if let Some(count_now) = count_raw_now.and_then(|v| (v > 0).then_some(v)) {
             if hits_now.len() >= count_now as usize { break; }
         }
 
-        let nick_now: String = entry_now.new_key.clone(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+        let nick_now: String = entry_now.new_key.clone();
 
-        let user_now: String = stg.find_by_id(entry_now.cx_id).map(|u| u.user.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+        let user_now: String = stg.find_by_id(entry_now.cx_id).map(|u| u.user.clone()).unwrap_or_default();
 
-        let host_now: String = stg.find_by_id(entry_now.cx_id).map(|u| u.host.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+        let host_now: String = stg.find_by_id(entry_now.cx_id).map(|u| u.host.clone()).unwrap_or_default();
 
-        hits_now.push((nick_now, format!("{} {} {}", user_now[0..].to_string(), host_now[0..].to_string(), stg.name.clone()))); // reply accumulation below? corrected inline immediately after this marker line
+        hits_now.push((nick_now, format!("{} {} {}", user_now[0..].to_string(), host_now[0..].to_string(), stg.name.clone())));
     }
 
 
-    if hits_now.is_empty() { // no-match refusal below? corrected inline immediately after this marker line
-        deliver(stg, id, &proto::line(&stg.prefix(), "406", &format!("{} {} :No such nick", sender_nick(stg, id), sender_nick(stg, id)))); // WASNOSUCHNICK: mandatory recipient token then the referenced name
+    if hits_now.is_empty() {
+        deliver(stg, id, &proto::line(&stg.prefix(), "406", &format!("{} {} :No such nick", sender_nick(stg, id), nick_raw_now))); // WASNOSUCHNICK: mandatory recipient token then the referenced name
         return;
     }
 
 
-    for (nick_now, trailing_now) in hits_now.iter() { // reply delivery below? corrected inline immediately after this marker line
-        deliver(stg, id, &proto::line(&stg.prefix(), "314", &format!("{} * :{}", nick_now[0..].to_string(), trailing_now))); // RFC numeric 314: nick + user + host shaped per locked convention below? corrected inline immediately after this marker line
+    for (nick_now, trailing_now) in hits_now.iter() {
+        deliver(stg, id, &proto::line(&stg.prefix(), "314", &format!("{} * :{}", nick_now[0..].to_string(), trailing_now)));
     }
 
 
-    deliver( // numeric-369 terminator below? corrected inline immediately after this marker line
-        stg, id, &proto::line(&stg.prefix(), "369", &format!("{} :End of /WHOWAS list", nick_raw_now[0..].to_string())), // RFC numeric 369: mandatory terminator below? corrected inline immediately after this marker line
+    deliver(
+        stg, id, &proto::line(&stg.prefix(), "369", &format!("{} :End of /WHOWAS list", nick_raw_now[0..].to_string())),
     );
 }
 
@@ -1788,7 +1780,7 @@ fn handle_who(stg: &mut ServerState, id: usize, cmd: &Command) {
     let Some(mask_raw_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id, "*"); return; };
     let oper_only_now: bool = cmd.params.get(1).map(|v| v.eq_ignore_ascii_case("o")).unwrap_or(false);
 
-    let Some(req_user_now) = stg.find_by_id(id) else { return; }; // requester scalar below? corrected inline immediately after this marker line
+    let Some(req_user_now) = stg.find_by_id(id) else { return; };
 
     let masked_now: String = mask_raw_now.to_lowercase();
 
@@ -1801,68 +1793,68 @@ fn handle_who(stg: &mut ServerState, id: usize, cmd: &Command) {
     } else { Vec::new() };
 
 
-    if !is_channel_name_now { // wildcard sweep below? corrected inline immediately after this marker line
-        for cand in stg.each_user() { // wildcard sweep below? corrected inline immediately after this marker line
+    if !is_channel_name_now {
+        for cand in stg.each_user() {
 
-            let nick_key_now: String = cand.nick_key.clone(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+            let nick_key_now: String = cand.nick_key.clone();
 
-            let matched_now: bool = crate::state::wildcard_match(&masked_now, &cand.nick) // wildcard predicate below? corrected inline immediately after this marker line
+            let matched_now: bool = crate::state::wildcard_match(&masked_now, &cand.nick)
 
-                || crate::state::wildcard_match(&masked_now, &cand.user) // wildcard predicate below? corrected inline immediately after this marker line
+                || crate::state::wildcard_match(&masked_now, &cand.user)
 
-                || crate::state::wildcard_match(&masked_now, &cand.host); // wildcard predicate below? corrected inline immediately after this marker line
+                || crate::state::wildcard_match(&masked_now, &cand.host);
 
             if matched_now && (!oper_only_now || cand.oper) {
-                candidate_ids_now.push(cand.id); // candidate accumulation below? corrected inline immediately after this marker line
+                candidate_ids_now.push(cand.id);
 
             }
         }
     }
 
 
-    let visible_ids_now: Vec<usize> = candidate_ids_now // visibility gate below? corrected inline immediately after this marker line
+    let visible_ids_now: Vec<usize> = candidate_ids_now
 
-        .into_iter() // visibility gate below? corrected inline immediately after this marker line
+        .into_iter()
 
-        .filter(|mid| match stg.find_by_id(*mid) { // visibility gate below? corrected inline immediately after this marker line
+        .filter(|mid| match stg.find_by_id(*mid) {
             None => false,
 
-            Some(u) => stg.visible(req_user_now, u), // visibility predicate below? corrected inline immediately after this marker line
-        }).collect::<Vec<usize>>(); // reply accumulation below? corrected inline immediately after this marker line
+            Some(u) => stg.visible(req_user_now, u),
+        }).collect::<Vec<usize>>();
 
 
-    if visible_ids_now.is_empty() { // empty-sweep refusal below? corrected inline immediately after this marker line
-        deliver(stg, id, &proto::line(&stg.prefix(), "315", &format!("{} :End of /WHO list", mask_raw_now[0..].to_string()))); // RFC numeric 315: mandatory terminator below? corrected inline immediately after this marker line
+    if visible_ids_now.is_empty() {
+        deliver(stg, id, &proto::line(&stg.prefix(), "315", &format!("{} :End of /WHO list", mask_raw_now[0..].to_string())));
         return;
     }
 
 
-    let replies_now: Vec<(String, String)> = visible_ids_now // reply accumulation below? corrected inline immediately after this marker line
+    let replies_now: Vec<(String, String)> = visible_ids_now
 
-        .iter() // reply accumulation below? corrected inline immediately after this marker line
+        .iter()
 
-        .filter_map(|mid| match stg.find_by_id(*mid) { // reply accumulation below? corrected inline immediately after this marker line
+        .filter_map(|mid| match stg.find_by_id(*mid) {
 
-            None => None, // reply accumulation below? corrected inline immediately after this marker line
+            None => None,
 
-            Some(u) => { // reply accumulation below? corrected inline immediately after this marker line
+            Some(u) => {
 
                 let marker_now: String = who_marker_for(stg, id, u);
 
-                Some((u.nick.clone(), format!("{} {} {}", u.user.clone(), host_of_user(stg, u.id), marker_now))) // reply accumulation below? corrected inline immediately after this marker line
+                Some((u.nick.clone(), format!("{} {} {}", u.user.clone(), host_of_user(stg, u.id), marker_now)))
 
             }
-        }).collect::<Vec<(String, String)>>(); // reply accumulation below? corrected inline immediately after this marker line
+        }).collect::<Vec<(String, String)>>();
 
 
-    for (nick_now, trailing_now) in replies_now.iter() { // reply delivery below? corrected inline immediately after this marker line
+    for (nick_now, trailing_now) in replies_now.iter() {
 
-        deliver(stg, id, &proto::line(&stg.prefix(), "352", &format!("{} * :{}", nick_now[0..].to_string(), trailing_now))); // RFC numeric 352: reply line below? corrected inline immediately after this marker line
+        deliver(stg, id, &proto::line(&stg.prefix(), "352", &format!("{} * :{}", nick_now[0..].to_string(), trailing_now)));
     }
 
 
-    deliver( // numeric-315 terminator below? corrected inline immediately after this marker line
-        stg, id, &proto::line(&stg.prefix(), "315", &format!("{} :End of /WHO list", mask_raw_now[0..].to_string())), // RFC numeric 315: mandatory terminator below? corrected inline immediately after this marker line
+    deliver(
+        stg, id, &proto::line(&stg.prefix(), "315", &format!("{} :End of /WHO list", mask_raw_now[0..].to_string())),
     );
 }
 
@@ -1923,12 +1915,22 @@ fn handle_misc_stub(stg: &mut ServerState, id: usize, cmd: &Command) {
     match cmd.name.as_str() {
 
         "CAP" => match cmd.params.first().map(String::as_str).unwrap_or("") {
-            "LS" | "LIST" => deliver(stg, id, &proto::line(&stg.prefix(), "CAP", if cmd.params.first().is_some_and(|p| p == "LS") { "* LS :" } else { "* LIST :" })), // zero capabilities advertised; empty list after the trailing marker
+            "LS" | "LIST" => {
+                if let Some(u) = stg.find_by_id_mut(id) { u.cap_negotiating = true; } // round-4: negotiation open, the welcome burst is withheld until CAP END
+                deliver(stg, id, &proto::line(&stg.prefix(), "CAP", if cmd.params.first().is_some_and(|p| p == "LS") { "* LS :" } else { "* LIST :" })); // zero capabilities advertised; empty list after the trailing marker
+            }
             "REQ" => match cmd.params.get(1) {
-                Some(caps_now) if !caps_now.is_empty() => deliver(stg, id, &proto::line(&stg.prefix(), "CAP", &format!("* NAK :{}", caps_now.trim_start_matches(':')))), // nothing advertised: requested capabilities echoed in the NAK trailing text
-                _ => {}
+                Some(caps_now) if !caps_now.is_empty() => {
+                    if let Some(u) = stg.find_by_id_mut(id) { u.cap_negotiating = true; } // round-4: negotiation open, the welcome burst is withheld until CAP END
+                    deliver(stg, id, &proto::line(&stg.prefix(), "CAP", &format!("* NAK :{}", caps_now.trim_start_matches(':')))); // nothing advertised: requested capabilities echoed in the NAK trailing text
+                }
+                _ => { if let Some(u) = stg.find_by_id_mut(id) { u.cap_negotiating = true; } }
             },
-            _ => {} // CAP END and any other subcommand: no reply, never an error
+            "END" => {
+                if let Some(u) = stg.find_by_id_mut(id) { u.cap_negotiating = false; } // negotiation closed: registration replies may flow again
+                flush_cap_gated_welcome(stg, id); // delivers the parked welcome burst when one is owed (round-4)
+            }
+            _ => {} // any other subcommand: no reply, never an error
         }
 
 
@@ -1936,7 +1938,7 @@ fn handle_misc_stub(stg: &mut ServerState, id: usize, cmd: &Command) {
 
             match cmd.params.first().map(String::as_str) {
 
-                None => { deliver(stg, id, &proto::line(&stg.prefix(), "409", ":No origin specified")); return; } // RFC numeric-409 shape below? corrected inline immediately after this marker line
+                None => { numeric(stg, id, "409", &["No origin specified"]); return; } // recipient token first via the shared chokepoint
 
                 Some(token_now) => deliver(stg, id, &proto::line(&stg.prefix(), "PONG", &format!("{} :{}", stg.name, token_now))), // PONG echoes the server name and the client-supplied token
 
@@ -1946,18 +1948,18 @@ fn handle_misc_stub(stg: &mut ServerState, id: usize, cmd: &Command) {
 
         "WALLOPS" | "SUMMON" => {
 
-            deliver(stg, id, &proto::line(&stg.prefix(), if cmd.name.as_str() == "WALLOPS" { "413" } else { "445" }, &format!("{} {} :has been disabled", sender_nick(stg, id), cmd.name)));
+            numeric(stg, id, if cmd.name.as_str() == "WALLOPS" { "413" } else { "445" }, &[&cmd.name, "has been disabled"]); // recipient token first via the shared chokepoint
 
         }
 
 
         "USERS" => {
-            deliver(stg, id, &proto::line(&stg.prefix(), "446", ":USERS has been disabled"));
+            numeric(stg, id, "446", &["USERS has been disabled"]); // recipient token first via the shared chokepoint
 
         }
 
 
-        _ => deliver_unknown_command(stg, id, cmd, &stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()),
+        _ => {} // unreachable: dispatch routes unknown command names to its own wildcard arm first
     }
 }
 
@@ -1968,22 +1970,22 @@ fn handle_info_reply(stg: &mut ServerState, id: usize, cmd: &Command) {
     match cmd.name.as_str() {
 
         "MOTD" => {
-            deliver(stg, id, &proto::line(&stg.prefix(), "375", &format!("- {} Message of the day", stg.name))); // RFC numeric-375 shape below? corrected inline immediately after this marker line
+            numeric(stg, id, "375", &[&format!("- Message of the day (server: {})", stg.name)]); // recipient token first via the shared chokepoint
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "372", "- Welcome to this deployment.")); // RFC numeric-372 shape below? corrected inline immediately after this marker line
+            numeric(stg, id, "372", &["- Welcome to this deployment."]); // normalized trailing shape through the shared chokepoint
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "376", ":End of /MOTD command")); // RFC numeric-376 shape below? corrected inline immediately after this marker line
+            numeric(stg, id, "376", &["End of /MOTD command"]); // recipient token first via the shared chokepoint
 
         }
 
 
         "LUSER(S)" | "LUSERS" => {
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "251", "LUSER IS HCAP 10 NCHN 10 NLOC 10 TCHAN 99 TSILE 0")); // RFC numeric-251 shape below? corrected inline immediately after this marker line
+            numeric(stg, id, "251", &["LUSER IS HCAP 10 NCHN 10 NLOC 10 TCHAN 99 TSILE 0"]); // recipient token first via the shared chokepoint
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "254", ":0 users, 0 identical")); // RFC numeric-254 shape below? corrected inline immediately after this marker line
+            numeric(stg, id, "254", &[&format!("- {} users, {} identical", 0, 0)]); // normalized trailing shape through the shared chokepoint
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "255", ":0 operator(s), 0 unknown")); // RFC numeric-255 shape below? corrected inline immediately after this marker line
+            numeric(stg, id, "255", &[&format!("- {} operator(s), {} unknown", 0, 0)]); // normalized trailing shape through the shared chokepoint
 
         }
 
@@ -1996,11 +1998,11 @@ fn handle_info_reply(stg: &mut ServerState, id: usize, cmd: &Command) {
 
                 match letter_now {
 
-                    b'u' => deliver(stg, id, &proto::line(&stg.prefix(), "242", &format!("{} :Server uptime {}s", stg.name.clone(), 0))),
+                    b'u' => { let name_now = stg.name.clone(); numeric(stg, id, "242", &[&name_now, &format!("- Server uptime {}s", 0)]); } // normalized trailing shape through the shared chokepoint
 
-                    b'b' => deliver(stg, id, &proto::line(&stg.prefix(), "213", &format!("C {} CLINE {}", stg.name.clone(), 0))),
+                    b'b' => { let name_now = stg.name.clone(); numeric(stg, id, "213", &[&name_now, &format!("- CLINE {}", 0)]); } // normalized trailing shape through the shared chokepoint
 
-                    b'o' => deliver(stg, id, &proto::line(&stg.prefix(), "243", &format!("O {} * {}", stg.name.clone(), "operator"))),
+                    b'o' => { let name_now = stg.name.clone(); numeric(stg, id, "243", &[&name_now, "*", "operator"]); } // recipient token first through the shared chokepoint
 
                     _ => {}
 
@@ -2008,29 +2010,29 @@ fn handle_info_reply(stg: &mut ServerState, id: usize, cmd: &Command) {
             }
 
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "219", ":End of /STATS report"));
+            numeric(stg, id, "219", &["- End of /STATS report"]); // normalized trailing shape through the shared chokepoint
 
         }
 
 
         "VERSION" => {
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "351", &format!("{} {}", stg.name.clone(), "RustIRC/1.0"))); // RFC numeric-351 shape below? corrected inline immediately after this marker line
+            { let name_now = stg.name.clone(); let version_now = stg.version.to_string(); numeric(stg, id, "351", &[&name_now, &version_now]); } // recipient token first through the shared chokepoint
 
         }
 
 
         "INFO" => {
-            deliver(stg, id, &proto::line(&stg.prefix(), "371", "- RustIRC/1.0 deployment.")); // RFC numeric-371 shape below? corrected inline immediately after this marker line
+            numeric(stg, id, "371", &[&format!("- {} deployment.", stg.version)]); // normalized trailing shape through the shared chokepoint
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "374", ":End of /INFO list")); // RFC numeric-374 shape below? corrected inline immediately after this marker line
+            numeric(stg, id, "374", &["- End of /INFO list"]); // normalized trailing shape through the shared chokepoint
 
         }
 
 
         "TIME" => {
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "391", &format!("{} :{}", stg.name.clone(), local_clock_now()))); // RFC numeric-391 shape below? corrected inline immediately after this marker line
+            numeric(stg, id, "391", &[&format!("- {}", local_clock_now())]); // normalized trailing shape through the shared chokepoint
 
         }
 
