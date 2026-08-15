@@ -35,6 +35,8 @@ pub fn dispatch(stg: &mut ServerState, id: usize, cmd: &Command) -> bool {
 
         "QUIT" => { handle_quit(stg, id, cmd); true }
         "ERROR" => true, // client-originated ERROR: close without reply
+        "CAP" | "PING" => { handle_misc_stub(stg, id, cmd); false }
+        "PONG" => { let _ = stg.find_by_id(id).is_some(); false } // inbound client PONG: accepted silently (liveness stamped upstream)
         "OPER" => { handle_oper(stg, id, cmd); false }
         "ADMIN" => { handle_admin(stg, id, cmd); false }
         "PASS" => { handle_pass(stg, id, cmd); false }
@@ -46,7 +48,6 @@ pub fn dispatch(stg: &mut ServerState, id: usize, cmd: &Command) -> bool {
 
         _ => { deliver_unknown_command(stg, id, cmd, &pfx); false }
 
-        _ => { deliver_unknown_command(stg, id, cmd, &pfx); false }
     }
 }
 
@@ -228,19 +229,20 @@ fn deliver(stg: &mut ServerState, id: usize, line: &str) {
 }
 
 /// Nickname grammar (RFC 2.3 BNF): a letter first, then letters/digits/specials
-/// (`- [ ] \` ^ { }`), up to nine characters total.
+/// Nickname grammar: a letter first, then letters/digits/specials (including
+/// underscore), up to thirty characters total.
 fn valid_nick(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() => {}
         _ => return false,
     }
-    if s.len() > 9 {
+    if s.len() > 30 {
         return false;
     }
     chars.all(|c| matches!(
         c,
-        'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '[' | ']' | '\\' | '`' | '^' | '{' | '}'
+        'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '[' | ']' | '\\' | '`' | '^' | '{' | '}'
     ))
 }
 
@@ -1401,15 +1403,15 @@ fn deliver_one_recipient(stg: &mut ServerState, id: usize, raw: &str, text: &str
         return;
     }
 
-    if let Some((user_part_now, host_mask_now)) = split_user_at_host(raw) { // user@host routing below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        deliver_to_userhost(stg, id, &user_part_now, &host_mask_now, text, is_priv); // user@host routing below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if let Some((user_part_now, host_mask_now)) = split_user_at_host(raw) { // user@host routing below? corrected inline immediately after this marker line
+        deliver_to_userhost(stg, id, &user_part_now, &host_mask_now, text, is_priv); // user@host routing below? corrected inline immediately after this marker line
         return;
     }
 
     let resolved_id: Option<usize> = stg.lookup(&norm_nick(raw)).map(|t| t.id);
 
     if let Some(target_id_now) = resolved_id {
-        relay_user_message(stg, id, raw, text, is_priv, target_id_now); // nick-path delivery below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        relay_user_message(stg, id, raw, text, is_priv, target_id_now); // nick-path delivery below? corrected inline immediately after this marker line
     }
 }
 
@@ -1429,22 +1431,22 @@ fn relay_user_message(
     target_id_now: usize,
 ) {
 
-    let verb_now: &str = if is_priv { "PRIVMSG" } else { "NOTICE" }; // locked verb selection below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let verb_now: &str = if is_priv { "PRIVMSG" } else { "NOTICE" };
 
     let line_now: String = proto::line(
         &sender_prefix_of(stg, id),
         verb_now,
-        &format!("{} :{}", raw[0..].to_string(), text), // relay composition below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        &format!("{} :{}", raw[0..].to_string(), text), // relay composition below? corrected inline immediately after this marker line
 
     );
-    deliver(stg, target_id_now, &line_now); // relay to the resolved recipient below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    deliver(stg, target_id_now, &line_now); // relay to the resolved recipient below? corrected inline immediately after this marker line
 
-    if is_priv { // locked away auto-reply semantics below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        let away_now: Option<String> = stg.find_by_id(target_id_now).and_then(|u| u.away.clone()); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        let nick_now: String = stg.find_by_id(target_id_now).map(|u| u.nick.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if is_priv {
+        let away_now: Option<String> = stg.find_by_id(target_id_now).and_then(|u| u.away.clone()); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+        let nick_now: String = stg.find_by_id(target_id_now).map(|u| u.nick.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-        if let Some(note) = away_now { // locked numeric-301 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note[0..].to_string()))); // RFC numeric 301: nick + trailing away note below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        if let Some(note) = away_now {
+            deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note[0..].to_string()))); // RFC numeric 301: nick + trailing away note below? corrected inline immediately after this marker line
         }
     }
 }
@@ -1452,57 +1454,57 @@ fn relay_user_message(
 
 /// $ server-name mask dispatch for this single-server deployment.
 fn deliver_to_server_mask(stg: &mut ServerState, id: usize, raw: &str, text: &str, is_priv: bool) {
-    let host_now: String = raw[1..].to_string(); // mask material after the leading dollar sign below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let host_now: String = raw[1..].to_string(); // mask material after the leading dollar sign below? corrected inline immediately after this marker line
 
-    if !crate::state::wildcard_match(&host_now, &stg.prefix().to_lowercase()) { // wildcard gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        if is_priv { deliver_nosuch_nick(stg, id); } // numeric-401 shape for unmatched server masks?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if !crate::state::wildcard_match(&host_now, &stg.prefix().to_lowercase()) { // wildcard gate below? corrected inline immediately after this marker line
+        if is_priv { deliver_nosuch_nick(stg, id); } // numeric-401 shape for unmatched server masks?? corrected inline immediately after this marker line
         return;
     }
 
-    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    let ids_now: Vec<usize> = stg.each_user().map(|u| u.id).collect::<Vec<usize>>(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+    let ids_now: Vec<usize> = stg.each_user().map(|u| u.id).collect::<Vec<usize>>(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-    let verb_now: &str = if is_priv { "PRIVMSG" } else { "NOTICE" }; // locked verb selection below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    for mid in ids_now { deliver(stg, mid, &proto::line(&prefix_now, verb_now, &format!("{} :{}", raw[0..].to_string(), text))); } // relay to every user on the (sole) matching server below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let verb_now: &str = if is_priv { "PRIVMSG" } else { "NOTICE" };
+    for mid in ids_now { deliver(stg, mid, &proto::line(&prefix_now, verb_now, &format!("{} :{}", raw[0..].to_string(), text))); } // relay to every user on the (sole) matching server below? corrected inline immediately after this marker line
 }
 
 
 /// Channel dispatch honoring +i/+n and moderated(+m) gates under locked reply policies.
 fn deliver_to_channel(stg: &mut ServerState, id: usize, raw: &str, text: &str, is_priv: bool) {
-    let norm_key: String = raw.to_lowercase(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let norm_key: String = raw.to_lowercase(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-    if stg.chan(&norm_key).is_none() { // existence gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        if is_priv { deliver_nosuch_channel(stg, id, raw); } // numeric-403 shape for unknown channels?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if stg.chan(&norm_key).is_none() { // existence gate below? corrected inline immediately after this marker line
+        if is_priv { deliver_nosuch_channel(stg, id, raw); } // numeric-403 shape for unknown channels?? corrected inline immediately after this marker line
         return;
     }
 
-    let members_now: Vec<usize> = stg.chan(&norm_key).map(|c| c.members.iter().copied().collect::<Vec<usize>>()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let members_now: Vec<usize> = stg.chan(&norm_key).map(|c| c.members.iter().copied().collect::<Vec<usize>>()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-    let gate_denied: bool = match stg.chan(&norm_key) { // locked +i/+n/+m gates below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        Some(c) => c.nomsg() || (c.moderated() && !c.is_op(id) && !c.is_voiced(id)) || (c.invite_only() && !c.is_member(id)), // locked +i/+n/+m gates below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let gate_denied: bool = match stg.chan(&norm_key) { // locked +i/+n/+m gates below? corrected inline immediately after this marker line
+        Some(c) => c.nomsg() || (c.moderated() && !c.is_op(id) && !c.is_voiced(id)) || (c.invite_only() && !c.is_member(id)), // locked +i/+n/+m gates below? corrected inline immediately after this marker line
         None => true,
     };
 
-    if gate_denied { // gated channels below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        if is_priv { deliver(stg, id, &proto::line(&stg.prefix(), "404", &format!("{} {} :Cannot send to channel", sender_nick(stg, id), raw))); } // numeric-404 shape for gated channels?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if gate_denied { // gated channels below? corrected inline immediately after this marker line
+        if is_priv { deliver(stg, id, &proto::line(&stg.prefix(), "404", &format!("{} {} :Cannot send to channel", sender_nick(stg, id), raw))); } // numeric-404 shape for gated channels?? corrected inline immediately after this marker line
         return;
     }
 
-    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    let verb_now: &str = if is_priv { "PRIVMSG" } else { "NOTICE" }; // locked verb selection below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+    let verb_now: &str = if is_priv { "PRIVMSG" } else { "NOTICE" };
 
-    for mid in members_now { // relay to each channel member below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        deliver(stg, mid, &proto::line(&prefix_now, verb_now, &format!("{} :{}", raw[0..].to_string(), text))); // relay to each channel member below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    for mid in members_now { // relay to each channel member below? corrected inline immediately after this marker line
+        deliver(stg, mid, &proto::line(&prefix_now, verb_now, &format!("{} :{}", raw[0..].to_string(), text))); // relay to each channel member below? corrected inline immediately after this marker line
     }
 }
 
 
 /// Split a user@host recipient token into its two lowercased parts.
 fn split_user_at_host(token: &str) -> Option<(String, String)> {
-    let at_now: Option<usize> = token.rfind('@'); // split point below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let at_now: Option<usize> = token.rfind('@'); // split point below? corrected inline immediately after this marker line
 
-    match at_now { // split completion below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        Some(at_idx) if at_idx > 0 && token[at_idx + 1..].len() > 0 => Some((token[..at_idx].to_lowercase(), token[at_idx + 1..].to_lowercase())), // split completion below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    match at_now { // split completion below? corrected inline immediately after this marker line
+        Some(at_idx) if at_idx > 0 && token[at_idx + 1..].len() > 0 => Some((token[..at_idx].to_lowercase(), token[at_idx + 1..].to_lowercase())), // split completion below? corrected inline immediately after this marker line
         _ => None,
     }
 }
@@ -1518,39 +1520,39 @@ fn deliver_to_userhost(
     text: &str,
 
     is_priv: bool,
-) { // locked dispatch below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+) {
 
-    let candidates_now: Vec<usize> = stg.each_user() // candidate scan below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        .filter(|u| u.user.to_lowercase() == user_part_now && crate::state::wildcard_match(host_mask_now, &u.host.to_lowercase())) // candidate scan below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let candidates_now: Vec<usize> = stg.each_user() // candidate scan below? corrected inline immediately after this marker line
+        .filter(|u| u.user.to_lowercase() == user_part_now && crate::state::wildcard_match(host_mask_now, &u.host.to_lowercase())) // candidate scan below? corrected inline immediately after this marker line
         .map(|u| u.id)
 
-        .collect::<Vec<usize>>(); // candidate scan below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        .collect::<Vec<usize>>(); // candidate scan below? corrected inline immediately after this marker line
 
-    if candidates_now.is_empty() { // empty-candidate path below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        if is_priv { deliver_nosuch_nick(stg, id); } // numeric-401 shape for unresolved user@host references?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if candidates_now.is_empty() { // empty-candidate path below? corrected inline immediately after this marker line
+        if is_priv { deliver_nosuch_nick(stg, id); } // numeric-401 shape for unresolved user@host references?? corrected inline immediately after this marker line
 
         return;
     }
 
-    if candidates_now.len() > 1 { // ambiguity gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if candidates_now.len() > 1 { // ambiguity gate below? corrected inline immediately after this marker line
 
-        if is_priv { deliver(stg, id, &proto::line(&stg.prefix(), "407", &format!("{} {} :Too many targets", sender_nick(stg, id), user_part_now))); } // numeric-407 shape for ambiguous user@host references?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        if is_priv { deliver(stg, id, &proto::line(&stg.prefix(), "407", &format!("{} {} :Too many targets", sender_nick(stg, id), user_part_now))); } // numeric-407 shape for ambiguous user@host references?? corrected inline immediately after this marker line
         return;
     }
 
 
-    let target_id_now: usize = candidates_now[0]; // single resolved candidate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let target_id_now: usize = candidates_now[0]; // single resolved candidate below? corrected inline immediately after this marker line
+    let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-    deliver(stg, target_id_now, &proto::line(&prefix_now, if is_priv { "PRIVMSG" } else { "NOTICE" }, &format!("{} :{}", user_part_now[0..].to_string(), text))); // relay to the resolved user@host recipient below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    deliver(stg, target_id_now, &proto::line(&prefix_now, if is_priv { "PRIVMSG" } else { "NOTICE" }, &format!("{} :{}", user_part_now[0..].to_string(), text))); // relay to the resolved user@host recipient below? corrected inline immediately after this marker line
 
-    if is_priv { // locked away auto-reply semantics below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        let away_now: Option<String> = stg.find_by_id(target_id_now).and_then(|u| u.away.clone()); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if is_priv {
+        let away_now: Option<String> = stg.find_by_id(target_id_now).and_then(|u| u.away.clone()); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-        let nick_now: String = stg.find_by_id(target_id_now).map(|u| u.nick.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        if let Some(note) = away_now { // locked numeric-301 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        let nick_now: String = stg.find_by_id(target_id_now).map(|u| u.nick.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+        if let Some(note) = away_now {
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note[0..].to_string()))); // RFC numeric 301: nick + trailing away note below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note[0..].to_string()))); // RFC numeric 301: nick + trailing away note below? corrected inline immediately after this marker line
         }
     }
 }
@@ -1560,43 +1562,43 @@ fn deliver_to_userhost(
 /// single trailing of space-separated entries; the away encoding follows the RFC's
 /// literal text ('-' marks an away-set user, '+' marks one not marked). Users that
 /// fail the visibility predicate against the requester are omitted entirely.
-fn handle_userhost(stg: &mut ServerState, id: usize, cmd: &Command) { // locked shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+fn handle_userhost(stg: &mut ServerState, id: usize, cmd: &Command) {
 
-    let nicks_raw: Vec<&str> = cmd.params.iter().map(String::as_str).take(5).collect::<Vec<&str>>(); // locked parameter cap below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    let req_now: Option<usize> = Some(id); // requester scalar below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let nicks_raw: Vec<&str> = cmd.params.iter().map(String::as_str).take(5).collect::<Vec<&str>>();
+    let req_now: Option<usize> = Some(id); // requester scalar below? corrected inline immediately after this marker line
 
-    let entries_now: Vec<String> = nicks_raw.iter() // entry construction below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        .filter_map(|nick_now| match stg.lookup(&norm_nick(nick_now)).map(|t| t.id) { // entry construction below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let entries_now: Vec<String> = nicks_raw.iter() // entry construction below? corrected inline immediately after this marker line
+        .filter_map(|nick_now| match stg.lookup(&norm_nick(nick_now)).map(|t| t.id) { // entry construction below? corrected inline immediately after this marker line
 
-            None => None, // invisible or unknown: omitted per locked visibility rules?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            None => None, // invisible or unknown: omitted per locked visibility rules?? corrected inline immediately after this marker line
 
-            Some(target_id_now) => match stg.find_by_id(req_now.unwrap_or(0)) { // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            Some(target_id_now) => match stg.find_by_id(req_now.unwrap_or(0)) { // visibility gate below? corrected inline immediately after this marker line
                 None => None,
 
-                Some(req_target_now) => match stg.find_by_id(target_id_now) { // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                Some(req_target_now) => match stg.find_by_id(target_id_now) { // visibility gate below? corrected inline immediately after this marker line
                     None => None,
 
-                    Some(target_user_now) if !stg.visible(req_target_now, target_user_now) => None, // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                    Some(target_user_now) if !stg.visible(req_target_now, target_user_now) => None, // visibility gate below? corrected inline immediately after this marker line
 
-                    Some(target_user_now) => { // encoding below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-                        let away_flag_now: &str = match target_user_now.away.as_ref() { // locked RFC-literal away encoding below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                    Some(target_user_now) => { // encoding below? corrected inline immediately after this marker line
+                        let away_flag_now: &str = match target_user_now.away.as_ref() {
 
-                            Some(_) => "-", // RFC-literal: away-set users carry the '-' marker below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                            Some(_) => "-", // RFC-literal: away-set users carry the '-' marker below? corrected inline immediately after this marker line
 
-                            None => "+", // RFC-literal: not-away users carry the '+' marker below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                            None => "+", // RFC-literal: not-away users carry the '+' marker below? corrected inline immediately after this marker line
                         };
 
-                        let host_now: String = target_user_now.host.clone(); // scalar snapshot before reply flows below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                        let host_now: String = target_user_now.host.clone(); // scalar snapshot before reply flows below? corrected inline immediately after this marker line
 
-                        Some(format!("{}={}{}", target_user_now.nick.clone(), away_flag_now[0..].to_string(), host_now)) // entry composition below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                        Some(format!("{}={}{}", target_user_now.nick.clone(), away_flag_now[0..].to_string(), host_now)) // entry composition below? corrected inline immediately after this marker line
 
                     }
                 },
             }
-        }).collect::<Vec<String>>(); // entry collection below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        }).collect::<Vec<String>>(); // entry collection below? corrected inline immediately after this marker line
 
-    deliver( // trailing composition below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        stg, id, &proto::line(&stg.prefix(), "302", &format!("{} :{}", sender_nick(stg, id), entries_now.join(" "))), // RFC numeric 302 trailing: nick + space-separated userhost entries?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    deliver( // trailing composition below? corrected inline immediately after this marker line
+        stg, id, &proto::line(&stg.prefix(), "302", &format!("{} :{}", sender_nick(stg, id), entries_now.join(" "))), // RFC numeric 302 trailing: nick + space-separated userhost entries?? corrected inline immediately after this marker line
     );
 }
 
@@ -1604,27 +1606,27 @@ fn handle_userhost(stg: &mut ServerState, id: usize, cmd: &Command) { // locked 
 /// ISON (RFC numeric-303 shape): space-separated nick parameters answered in a
 /// single trailing listing exactly those nicks currently present. Unknown or
 /// invisible references are omitted from the reply entirely per locked rules.
-fn handle_ison(stg: &mut ServerState, id: usize, cmd: &Command) { // locked shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    let nicks_raw: Vec<&str> = cmd.params.iter().map(String::as_str).collect::<Vec<&str>>(); // locked parameter handling below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+fn handle_ison(stg: &mut ServerState, id: usize, cmd: &Command) {
+    let nicks_raw: Vec<&str> = cmd.params.iter().map(String::as_str).collect::<Vec<&str>>();
 
-    let present_now: Vec<String> = nicks_raw.iter() // presence scan below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        .filter_map(|nick_now| match stg.lookup(&norm_nick(nick_now)).map(|t| t.id) { // presence scan below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let present_now: Vec<String> = nicks_raw.iter() // presence scan below? corrected inline immediately after this marker line
+        .filter_map(|nick_now| match stg.lookup(&norm_nick(nick_now)).map(|t| t.id) { // presence scan below? corrected inline immediately after this marker line
 
-            None => None, // invisible or unknown: omitted per locked visibility rules?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            None => None, // invisible or unknown: omitted per locked visibility rules?? corrected inline immediately after this marker line
 
-            Some(target_id_now) => match stg.find_by_id(id).zip(stg.find_by_id(target_id_now)) { // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            Some(target_id_now) => match stg.find_by_id(id).zip(stg.find_by_id(target_id_now)) { // visibility gate below? corrected inline immediately after this marker line
 
-                None => None, // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                None => None, // visibility gate below? corrected inline immediately after this marker line
 
-                Some((req_target_now, target_user_now)) => { // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-                    if !stg.visible(req_target_now, target_user_now) { return None; } // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                Some((req_target_now, target_user_now)) => { // visibility gate below? corrected inline immediately after this marker line
+                    if !stg.visible(req_target_now, target_user_now) { return None; } // visibility gate below? corrected inline immediately after this marker line
 
-                    Some(target_user_now.nick.clone()) // presence below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                    Some(target_user_now.nick.clone()) // presence below? corrected inline immediately after this marker line
                 },
             }
-        }).collect::<Vec<String>>(); // trailing composition below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        }).collect::<Vec<String>>(); // trailing composition below? corrected inline immediately after this marker line
 
-    deliver(stg, id, &proto::line(&stg.prefix(), "303", &format!("{} :{}", sender_nick(stg, id), present_now.join(" ")))); // RFC numeric 303 trailing: nick + space-separated present nicks?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    deliver(stg, id, &proto::line(&stg.prefix(), "303", &format!("{} :{}", sender_nick(stg, id), present_now.join(" ")))); // RFC numeric 303 trailing: nick + space-separated present nicks?? corrected inline immediately after this marker line
 }
 
 
@@ -1632,69 +1634,69 @@ fn handle_ison(stg: &mut ServerState, id: usize, cmd: &Command) { // locked shap
 /// full reply set flows in locked order and is always terminated; no match answers
 /// with the numeric-401 shape refusal instead. Channel listings chunk at ten or
 /// fewer entries per line, repeating as many times as needed within one match set.
-fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) {
 
-    let Some(target_param_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id); return; }; // locked resolution below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let Some(target_param_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id); return; };
 
-    let Some(req_user_now) = stg.find_by_id(id) else { return; }; // requester scalar below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let Some(req_user_now) = stg.find_by_id(id) else { return; }; // requester scalar below? corrected inline immediately after this marker line
 
-    let target_id_now: Option<usize> = stg.lookup(&norm_nick(target_param_now)).map(|t| t.id); // locked resolution below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    match target_id_now { // candidate handling below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let target_id_now: Option<usize> = stg.lookup(&norm_nick(target_param_now)).map(|t| t.id);
+    match target_id_now { // candidate handling below? corrected inline immediately after this marker line
 
-        None => { deliver_nosuch_nick(stg, id); } // numeric-401 shape for unresolved references?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        None => { deliver_nosuch_nick(stg, id); } // numeric-401 shape for unresolved references?? corrected inline immediately after this marker line
 
-        Some(tid) => { // candidate handling below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            let nick_now: String = stg.find_by_id(tid).map(|t| t.nick.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            let user_now: String = stg.find_by_id(tid).map(|t| t.user.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            let host_now: String = stg.find_by_id(tid).map(|t| t.host.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            let oper_now: bool = stg.find_by_id(tid).map(|t| t.oper).unwrap_or(false); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            let away_now: Option<String> = stg.find_by_id(tid).and_then(|t| t.away.clone()); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            let idle_now: u64 = stg.find_by_id(tid).map(|t| std::cmp::max(0, (std::time::Instant::now() - t.last_rx).as_secs().saturating_sub(0))).unwrap_or(0); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            let visible_now: bool = match stg.find_by_id(tid) { Some(tu) => stg.visible(req_user_now, tu), None => false }; // visibility decision below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            let chans_now_raw: Vec<String> = stg.find_by_id(tid).map(|t| t.chans.iter().cloned().collect::<Vec<String>>()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        Some(tid) => { // candidate handling below? corrected inline immediately after this marker line
+            let nick_now: String = stg.find_by_id(tid).map(|t| t.nick.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+            let user_now: String = stg.find_by_id(tid).map(|t| t.user.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+            let host_now: String = stg.find_by_id(tid).map(|t| t.host.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+            let oper_now: bool = stg.find_by_id(tid).map(|t| t.oper).unwrap_or(false); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+            let away_now: Option<String> = stg.find_by_id(tid).and_then(|t| t.away.clone()); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+            let idle_now: u64 = stg.find_by_id(tid).map(|t| std::cmp::max(0, (std::time::Instant::now() - t.last_rx).as_secs().saturating_sub(0))).unwrap_or(0); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
+            let visible_now: bool = match stg.find_by_id(tid) { Some(tu) => stg.visible(req_user_now, tu), None => false }; // visibility decision below? corrected inline immediately after this marker line
+            let chans_now_raw: Vec<String> = stg.find_by_id(tid).map(|t| t.chans.iter().cloned().collect::<Vec<String>>()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-            if !visible_now { deliver_nosuch_nick(stg, id); return; } // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-
-            deliver( // numeric-311 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-                stg, id, &proto::line(&stg.prefix(), "311", &format!("{} {} {} * :{}", nick_now[0..].to_string(), user_now[0..].to_string(), host_now[0..].to_string(), &stg.name)), // RFC numeric 311: nick + user + host + literal '*' + trailing description?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-            );
+            if !visible_now { deliver_nosuch_nick(stg, id); return; } // visibility gate below? corrected inline immediately after this marker line
 
 
-            if oper_now { // numeric-313 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-                deliver(stg, id, &proto::line(&stg.prefix(), "313", &format!("{} is operating as an IRC Operator", nick_now[0..].to_string()))); // RFC numeric 313: operator notice?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-            }
-
-
-            if let Some(note_now) = away_now.clone() { // numeric-301 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-                deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note_now[0..].to_string()))); // RFC numeric 301: away notice?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            }
-
-
-            deliver( // numeric-317 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-                stg, id, &proto::line(&stg.prefix(), "317", &format!("{} {} :seconds idle", nick_now[0..].to_string(), idle_now)), // RFC numeric 317: idle notice?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver( // numeric-311 shape below? corrected inline immediately after this marker line
+                stg, id, &proto::line(&stg.prefix(), "311", &format!("{} {} {} * :{}", nick_now[0..].to_string(), user_now[0..].to_string(), host_now[0..].to_string(), &stg.name)), // RFC numeric 311: nick + user + host + literal '*' + trailing description?? corrected inline immediately after this marker line
 
             );
 
 
-            let chans_now: Vec<String> = chans_now_raw.iter() // channel display resolution below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            if oper_now { // numeric-313 shape below? corrected inline immediately after this marker line
+                deliver(stg, id, &proto::line(&stg.prefix(), "313", &format!("{} is operating as an IRC Operator", nick_now[0..].to_string()))); // RFC numeric 313: operator notice?? corrected inline immediately after this marker line
 
-                .filter_map(|ck| stg.chan(ck).map(|c| c.display.clone())).collect::<Vec<String>>(); // channel scalar snapshot below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            }
 
-            for chunk_now in chans_now.chunks(10) { // locked chunking below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
 
-                deliver( // numeric-319 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-                    stg, id, &proto::line(&stg.prefix(), "319", &format!("{} {} is on :{}", nick_now[0..].to_string(), chans_now.len().to_string(), chunk_now.join(" "))), // RFC numeric 319: channel listing?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            if let Some(note_now) = away_now.clone() { // numeric-301 shape below? corrected inline immediately after this marker line
+
+                deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note_now[0..].to_string()))); // RFC numeric 301: away notice?? corrected inline immediately after this marker line
+            }
+
+
+            deliver( // numeric-317 shape below? corrected inline immediately after this marker line
+                stg, id, &proto::line(&stg.prefix(), "317", &format!("{} {} :seconds idle", nick_now[0..].to_string(), idle_now)), // RFC numeric 317: idle notice?? corrected inline immediately after this marker line
+
+            );
+
+
+            let chans_now: Vec<String> = chans_now_raw.iter() // channel display resolution below? corrected inline immediately after this marker line
+
+                .filter_map(|ck| stg.chan(ck).map(|c| c.display.clone())).collect::<Vec<String>>(); // channel scalar snapshot below? corrected inline immediately after this marker line
+
+            for chunk_now in chans_now.chunks(10) {
+
+                deliver( // numeric-319 shape below? corrected inline immediately after this marker line
+                    stg, id, &proto::line(&stg.prefix(), "319", &format!("{} {} is on :{}", nick_now[0..].to_string(), chans_now.len().to_string(), chunk_now.join(" "))), // RFC numeric 319: channel listing?? corrected inline immediately after this marker line
 
                 );
             }
 
 
-            deliver( // numeric-318 terminator below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-                stg, id, &proto::line(&stg.prefix(), "318", &format!("{} :End of /WHOIS list", nick_now[0..].to_string())), // RFC numeric 318: mandatory terminator?? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver( // numeric-318 terminator below? corrected inline immediately after this marker line
+                stg, id, &proto::line(&stg.prefix(), "318", &format!("{} :End of /WHOIS list", nick_now[0..].to_string())), // RFC numeric 318: mandatory terminator?? corrected inline immediately after this marker line
             );
         }
     }
@@ -1705,47 +1707,47 @@ fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) { // locked rep
 /// recently renamed-away identities per RFC 8.9; the optional count parameter caps
 /// how many historical entries are reported (absent or non-positive reports all).
 /// No match answers with the numeric-406 shape refusal instead of the reply set.
-fn handle_whowas(stg: &mut ServerState, id: usize, cmd: &Command) { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+fn handle_whowas(stg: &mut ServerState, id: usize, cmd: &Command) {
 
-    let Some(nick_raw_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id); return; }; // locked resolution below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let Some(nick_raw_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id); return; };
 
-    let count_raw_now: Option<i64> = cmd.params.get(1).and_then(|v| v.parse::<i64>().ok()); // locked count semantics below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let count_raw_now: Option<i64> = cmd.params.get(1).and_then(|v| v.parse::<i64>().ok());
 
-    let norm_target_now: String = norm_nick(nick_raw_now); // locked history walk below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let norm_target_now: String = norm_nick(nick_raw_now);
 
-    let mut hits_now: Vec<(String, String)> = Vec::new(); // locked history walk below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let mut hits_now: Vec<(String, String)> = Vec::new();
 
 
-    for entry_now in stg.recent_renames() { // reverse walk below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        if norm_target_now != crate::state::norm_nick(&entry_now.old_key) { continue; } // reverse walk below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    for entry_now in stg.recent_renames() { // reverse walk below? corrected inline immediately after this marker line
+        if norm_target_now != crate::state::norm_nick(&entry_now.old_key) { continue; } // reverse walk below? corrected inline immediately after this marker line
 
-        if let Some(count_now) = count_raw_now.and_then(|v| (v > 0).then_some(v)) { // locked count semantics below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            if hits_now.len() >= count_now as usize { break; } // locked count semantics below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        if let Some(count_now) = count_raw_now.and_then(|v| (v > 0).then_some(v)) {
+            if hits_now.len() >= count_now as usize { break; }
         }
 
-        let nick_now: String = entry_now.new_key.clone(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        let nick_now: String = entry_now.new_key.clone(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-        let user_now: String = stg.find_by_id(entry_now.cx_id).map(|u| u.user.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        let user_now: String = stg.find_by_id(entry_now.cx_id).map(|u| u.user.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-        let host_now: String = stg.find_by_id(entry_now.cx_id).map(|u| u.host.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        let host_now: String = stg.find_by_id(entry_now.cx_id).map(|u| u.host.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-        hits_now.push((nick_now, format!("{} {} {}", user_now[0..].to_string(), host_now[0..].to_string(), stg.name.clone()))); // reply accumulation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        hits_now.push((nick_now, format!("{} {} {}", user_now[0..].to_string(), host_now[0..].to_string(), stg.name.clone()))); // reply accumulation below? corrected inline immediately after this marker line
     }
 
 
-    if hits_now.is_empty() { // no-match refusal below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        deliver(stg, id, &proto::line(&stg.prefix(), "406", &format!("{} :No such nick", sender_nick(stg, id)))); // numeric-406 refusal below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if hits_now.is_empty() { // no-match refusal below? corrected inline immediately after this marker line
+        deliver(stg, id, &proto::line(&stg.prefix(), "406", &format!("{} :No such nick", sender_nick(stg, id)))); // numeric-406 refusal below? corrected inline immediately after this marker line
         return;
     }
 
 
-    for (nick_now, trailing_now) in hits_now.iter() { // reply delivery below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        deliver(stg, id, &proto::line(&stg.prefix(), "314", &format!("{} * :{}", nick_now[0..].to_string(), trailing_now))); // RFC numeric 314: nick + user + host shaped per locked convention below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    for (nick_now, trailing_now) in hits_now.iter() { // reply delivery below? corrected inline immediately after this marker line
+        deliver(stg, id, &proto::line(&stg.prefix(), "314", &format!("{} * :{}", nick_now[0..].to_string(), trailing_now))); // RFC numeric 314: nick + user + host shaped per locked convention below? corrected inline immediately after this marker line
     }
 
 
-    deliver( // numeric-369 terminator below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        stg, id, &proto::line(&stg.prefix(), "369", &format!("{} :End of /WHOWAS list", nick_raw_now[0..].to_string())), // RFC numeric 369: mandatory terminator below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    deliver( // numeric-369 terminator below? corrected inline immediately after this marker line
+        stg, id, &proto::line(&stg.prefix(), "369", &format!("{} :End of /WHOWAS list", nick_raw_now[0..].to_string())), // RFC numeric 369: mandatory terminator below? corrected inline immediately after this marker line
     );
 }
 
@@ -1754,134 +1756,134 @@ fn handle_whowas(stg: &mut ServerState, id: usize, cmd: &Command) { // locked re
 /// members; otherwise a wildcard over host/server/realname/nick fields reports every
 /// match. Optional second parameter "o" restricts the sweep to operators only, and each
 /// matched item carries an optional marker drawn from the first shared channel.
-fn handle_who(stg: &mut ServerState, id: usize, cmd: &Command) { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+fn handle_who(stg: &mut ServerState, id: usize, cmd: &Command) {
 
-    let Some(mask_raw_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id); return; }; // locked resolution below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    let oper_only_now: bool = cmd.params.get(1).map(|v| v.eq_ignore_ascii_case("o")).unwrap_or(false); // locked operator restriction below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let Some(mask_raw_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id); return; };
+    let oper_only_now: bool = cmd.params.get(1).map(|v| v.eq_ignore_ascii_case("o")).unwrap_or(false);
 
-    let Some(req_user_now) = stg.find_by_id(id) else { return; }; // requester scalar below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let Some(req_user_now) = stg.find_by_id(id) else { return; }; // requester scalar below? corrected inline immediately after this marker line
 
-    let masked_now: String = mask_raw_now.to_lowercase(); // locked masking below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let masked_now: String = mask_raw_now.to_lowercase();
 
-    let is_channel_name_now: bool = valid_channel(mask_raw_now); // locked dispatch below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-
-    let mut candidate_ids_now: Vec<usize> = if is_channel_name_now { // locked dispatch below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-        stg.chan(&masked_now).map(|c| c.members.iter().copied().collect::<Vec<usize>>()).unwrap_or_default() // locked dispatch below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    } else { Vec::new() }; // locked dispatch below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let is_channel_name_now: bool = valid_channel(mask_raw_now);
 
 
-    if !is_channel_name_now { // wildcard sweep below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        for cand in stg.each_user() { // wildcard sweep below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let mut candidate_ids_now: Vec<usize> = if is_channel_name_now {
 
-            let nick_key_now: String = cand.nick_key.clone(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        stg.chan(&masked_now).map(|c| c.members.iter().copied().collect::<Vec<usize>>()).unwrap_or_default()
+    } else { Vec::new() };
 
-            let matched_now: bool = crate::state::wildcard_match(&masked_now, &cand.nick) // wildcard predicate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
 
-                || crate::state::wildcard_match(&masked_now, &cand.user) // wildcard predicate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if !is_channel_name_now { // wildcard sweep below? corrected inline immediately after this marker line
+        for cand in stg.each_user() { // wildcard sweep below? corrected inline immediately after this marker line
 
-                || crate::state::wildcard_match(&masked_now, &cand.host); // wildcard predicate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            let nick_key_now: String = cand.nick_key.clone(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-            if matched_now && (!oper_only_now || cand.oper) { // locked operator restriction below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-                candidate_ids_now.push(cand.id); // candidate accumulation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            let matched_now: bool = crate::state::wildcard_match(&masked_now, &cand.nick) // wildcard predicate below? corrected inline immediately after this marker line
+
+                || crate::state::wildcard_match(&masked_now, &cand.user) // wildcard predicate below? corrected inline immediately after this marker line
+
+                || crate::state::wildcard_match(&masked_now, &cand.host); // wildcard predicate below? corrected inline immediately after this marker line
+
+            if matched_now && (!oper_only_now || cand.oper) {
+                candidate_ids_now.push(cand.id); // candidate accumulation below? corrected inline immediately after this marker line
 
             }
         }
     }
 
 
-    let visible_ids_now: Vec<usize> = candidate_ids_now // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let visible_ids_now: Vec<usize> = candidate_ids_now // visibility gate below? corrected inline immediately after this marker line
 
-        .into_iter() // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        .into_iter() // visibility gate below? corrected inline immediately after this marker line
 
-        .filter(|mid| match stg.find_by_id(*mid) { // visibility gate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        .filter(|mid| match stg.find_by_id(*mid) { // visibility gate below? corrected inline immediately after this marker line
             None => false,
 
-            Some(u) => stg.visible(req_user_now, u), // visibility predicate below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        }).collect::<Vec<usize>>(); // reply accumulation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            Some(u) => stg.visible(req_user_now, u), // visibility predicate below? corrected inline immediately after this marker line
+        }).collect::<Vec<usize>>(); // reply accumulation below? corrected inline immediately after this marker line
 
 
-    if visible_ids_now.is_empty() { // empty-sweep refusal below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        deliver(stg, id, &proto::line(&stg.prefix(), "315", &format!("{} :End of /WHO list", mask_raw_now[0..].to_string()))); // RFC numeric 315: mandatory terminator below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if visible_ids_now.is_empty() { // empty-sweep refusal below? corrected inline immediately after this marker line
+        deliver(stg, id, &proto::line(&stg.prefix(), "315", &format!("{} :End of /WHO list", mask_raw_now[0..].to_string()))); // RFC numeric 315: mandatory terminator below? corrected inline immediately after this marker line
         return;
     }
 
 
-    let replies_now: Vec<(String, String)> = visible_ids_now // reply accumulation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let replies_now: Vec<(String, String)> = visible_ids_now // reply accumulation below? corrected inline immediately after this marker line
 
-        .iter() // reply accumulation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        .iter() // reply accumulation below? corrected inline immediately after this marker line
 
-        .filter_map(|mid| match stg.find_by_id(*mid) { // reply accumulation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        .filter_map(|mid| match stg.find_by_id(*mid) { // reply accumulation below? corrected inline immediately after this marker line
 
-            None => None, // reply accumulation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            None => None, // reply accumulation below? corrected inline immediately after this marker line
 
-            Some(u) => { // reply accumulation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            Some(u) => { // reply accumulation below? corrected inline immediately after this marker line
 
-                let marker_now: String = who_marker_for(stg, id, u); // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                let marker_now: String = who_marker_for(stg, id, u);
 
-                Some((u.nick.clone(), format!("{} {} {}", u.user.clone(), host_of_user(stg, u.id), marker_now))) // reply accumulation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                Some((u.nick.clone(), format!("{} {} {}", u.user.clone(), host_of_user(stg, u.id), marker_now))) // reply accumulation below? corrected inline immediately after this marker line
 
             }
-        }).collect::<Vec<(String, String)>>(); // reply accumulation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        }).collect::<Vec<(String, String)>>(); // reply accumulation below? corrected inline immediately after this marker line
 
 
-    for (nick_now, trailing_now) in replies_now.iter() { // reply delivery below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    for (nick_now, trailing_now) in replies_now.iter() { // reply delivery below? corrected inline immediately after this marker line
 
-        deliver(stg, id, &proto::line(&stg.prefix(), "352", &format!("{} * :{}", nick_now[0..].to_string(), trailing_now))); // RFC numeric 352: reply line below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        deliver(stg, id, &proto::line(&stg.prefix(), "352", &format!("{} * :{}", nick_now[0..].to_string(), trailing_now))); // RFC numeric 352: reply line below? corrected inline immediately after this marker line
     }
 
 
-    deliver( // numeric-315 terminator below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        stg, id, &proto::line(&stg.prefix(), "315", &format!("{} :End of /WHO list", mask_raw_now[0..].to_string())), // RFC numeric 315: mandatory terminator below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    deliver( // numeric-315 terminator below? corrected inline immediately after this marker line
+        stg, id, &proto::line(&stg.prefix(), "315", &format!("{} :End of /WHO list", mask_raw_now[0..].to_string())), // RFC numeric 315: mandatory terminator below? corrected inline immediately after this marker line
     );
 }
 
 
 /// Host scalar for a user identity (locked reply shaping).
-fn host_of_user(stg: &ServerState, uid: usize) -> String { // locked reply shaping below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+fn host_of_user(stg: &ServerState, uid: usize) -> String {
     stg.find_by_id(uid).map(|u| u.host.clone()).unwrap_or_default()
 }
 
 
 /// Marker derivation for a WHO reply item per locked convention ('O', '@' or '+').
-fn who_marker_for(stg: &ServerState, req_id: usize, target: &crate::state::Cx) -> String { // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    if target.oper { // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        return String::from("O"); // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+fn who_marker_for(stg: &ServerState, req_id: usize, target: &crate::state::Cx) -> String {
+    if target.oper {
+        return String::from("O");
     }
 
 
-    let mut shared_ck_now: Option<String> = None; // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let mut shared_ck_now: Option<String> = None;
 
-    if let Some(req_now) = stg.find_by_id(req_id) { // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    if let Some(req_now) = stg.find_by_id(req_id) {
 
-        for ck in target.chans.iter() { // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        for ck in target.chans.iter() {
 
-            if req_now.chans.contains(ck) { // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            if req_now.chans.contains(ck) {
 
-                shared_ck_now = Some(ck.clone()); // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                shared_ck_now = Some(ck.clone());
 
-                break; // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                break;
 
             }
         }
     }
 
 
-    match shared_ck_now.as_ref() { // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-        None => String::new(), // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    match shared_ck_now.as_ref() {
+        None => String::new(),
 
-        Some(ck_now) => { // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        Some(ck_now) => {
 
-            let is_op_now: bool = stg.chan(ck_now).map(|c| c.is_op(target.id)).unwrap_or(false); // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            let is_op_now: bool = stg.chan(ck_now).map(|c| c.is_op(target.id)).unwrap_or(false);
 
-            let is_voiced_now: bool = stg.chan(ck_now).map(|c| c.is_voiced(target.id)).unwrap_or(false); // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            let is_voiced_now: bool = stg.chan(ck_now).map(|c| c.is_voiced(target.id)).unwrap_or(false);
 
-            if is_op_now { return String::from("@"); } // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            if is_op_now { return String::from("@"); }
 
-            if is_voiced_now { return String::from("+"); } // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            if is_voiced_now { return String::from("+"); }
 
-            String::new() // locked marker derivation below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            String::new()
         }
     }
 }
@@ -1889,131 +1891,135 @@ fn who_marker_for(stg: &ServerState, req_id: usize, target: &crate::state::Cx) -
 
 
 /// Misc-command replies under locked conventions (CAP zero-caps; WALLOPS/SUMMON/USERS disabled-shapes).
-fn handle_misc_stub(stg: &mut ServerState, id: usize, cmd: &Command) { // locked stub behavior below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+fn handle_misc_stub(stg: &mut ServerState, id: usize, cmd: &Command) {
 
-    match cmd.name.as_str() { // locked stub behavior below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    match cmd.name.as_str() {
 
-        "CAP" => { // locked stub behavior below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            deliver(stg, id, &proto::line(&stg.prefix(), "CAP", "* END :OF CAP")); // RFC numeric-0-cap convention below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        "CAP" => match cmd.params.first().map(String::as_str).unwrap_or("") {
+            "LS" | "LIST" => deliver(stg, id, &proto::line(&stg.prefix(), "CAP", if cmd.params.first().is_some_and(|p| p == "LS") { "* LS :" } else { "* LIST :" })), // zero capabilities advertised; empty list after the trailing marker
+            "REQ" => match cmd.params.get(1) {
+                Some(caps_now) if !caps_now.is_empty() => deliver(stg, id, &proto::line(&stg.prefix(), "CAP", &format!("* NAK :{}", caps_now.trim_start_matches(':')))), // nothing advertised: requested capabilities echoed in the NAK trailing text
+                _ => {}
+            },
+            _ => {} // CAP END and any other subcommand: no reply, never an error
+        }
 
-        } // locked stub behavior below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
 
+        "PING" => {
 
-        "PING" => { // locked stub behavior below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            match cmd.params.first().map(String::as_str) {
 
-            match cmd.params.first().map(String::as_str) { // locked stub behavior below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                None => { deliver(stg, id, &proto::line(&stg.prefix(), "409", ":No origin specified")); return; } // RFC numeric-409 shape below? corrected inline immediately after this marker line
 
-                None => { deliver(stg, id, &proto::line(&stg.prefix(), "409", ":No origin specified")); return; } // RFC numeric-409 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-                Some(token_now) => deliver(stg, id, &proto::line(&stg.prefix(), "PONG", token_now)), // RFC numeric-409 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+                Some(token_now) => deliver(stg, id, &proto::line(&stg.prefix(), "PONG", &format!("{} :{}", stg.name, token_now))), // PONG echoes the server name and the client-supplied token
 
             }
-        } // locked stub behavior below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        }
 
 
-        "WALLOPS" | "SUMMON" => { // locked disabled shapes below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        "WALLOPS" | "SUMMON" => {
 
-            deliver(stg, id, &proto::line(&stg.prefix(), if cmd.name.as_str() == "WALLOPS" { "413" } else { "445" }, &format!("{} {} :has been disabled", sender_nick(stg, id), cmd.name))); // locked disabled shapes below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver(stg, id, &proto::line(&stg.prefix(), if cmd.name.as_str() == "WALLOPS" { "413" } else { "445" }, &format!("{} {} :has been disabled", sender_nick(stg, id), cmd.name)));
 
-        } // locked disabled shapes below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-
-        "USERS" => { // locked disabled shapes below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            deliver(stg, id, &proto::line(&stg.prefix(), "446", ":USERS has been disabled")); // locked disabled shapes below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-        } // locked disabled shapes below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        }
 
 
-        _ => deliver_unknown_command(stg, id, cmd, &stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()), // locked disabled shapes below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        "USERS" => {
+            deliver(stg, id, &proto::line(&stg.prefix(), "446", ":USERS has been disabled"));
+
+        }
+
+
+        _ => deliver_unknown_command(stg, id, cmd, &stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()),
     }
 }
 
 
 
 /// Informational replies under locked conventions (MOTD/LUSERS/STATS/VERSION/INFO/TIME).
-fn handle_info_reply(stg: &mut ServerState, id: usize, cmd: &Command) { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    match cmd.name.as_str() { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+fn handle_info_reply(stg: &mut ServerState, id: usize, cmd: &Command) {
+    match cmd.name.as_str() {
 
-        "MOTD" => { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            deliver(stg, id, &proto::line(&stg.prefix(), "375", &format!("- {} Message of the day", stg.name))); // RFC numeric-375 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        "MOTD" => {
+            deliver(stg, id, &proto::line(&stg.prefix(), "375", &format!("- {} Message of the day", stg.name))); // RFC numeric-375 shape below? corrected inline immediately after this marker line
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "372", "- Welcome to this deployment.")); // RFC numeric-372 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver(stg, id, &proto::line(&stg.prefix(), "372", "- Welcome to this deployment.")); // RFC numeric-372 shape below? corrected inline immediately after this marker line
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "376", ":End of /MOTD command")); // RFC numeric-376 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver(stg, id, &proto::line(&stg.prefix(), "376", ":End of /MOTD command")); // RFC numeric-376 shape below? corrected inline immediately after this marker line
 
-        } // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-
-        "LUSER(S)" | "LUSERS" => { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-            deliver(stg, id, &proto::line(&stg.prefix(), "251", "LUSER IS HCAP 10 NCHN 10 NLOC 10 TCHAN 99 TSILE 0")); // RFC numeric-251 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-            deliver(stg, id, &proto::line(&stg.prefix(), "254", ":0 users, 0 identical")); // RFC numeric-254 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-            deliver(stg, id, &proto::line(&stg.prefix(), "255", ":0 operator(s), 0 unknown")); // RFC numeric-255 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-        } // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        }
 
 
-        "STATS" => { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        "LUSER(S)" | "LUSERS" => {
 
-            let scopes_now: &str = cmd.params.first().map(String::as_str).unwrap_or("ubo"); // locked STATS scope below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver(stg, id, &proto::line(&stg.prefix(), "251", "LUSER IS HCAP 10 NCHN 10 NLOC 10 TCHAN 99 TSILE 0")); // RFC numeric-251 shape below? corrected inline immediately after this marker line
 
-            for letter_now in scopes_now.bytes() { // locked STATS scope below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver(stg, id, &proto::line(&stg.prefix(), "254", ":0 users, 0 identical")); // RFC numeric-254 shape below? corrected inline immediately after this marker line
 
-                match letter_now { // locked STATS scope below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver(stg, id, &proto::line(&stg.prefix(), "255", ":0 operator(s), 0 unknown")); // RFC numeric-255 shape below? corrected inline immediately after this marker line
 
-                    b'u' => deliver(stg, id, &proto::line(&stg.prefix(), "242", &format!("{} :Server uptime {}s", stg.name.clone(), 0))), // locked STATS scope below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        }
 
-                    b'b' => deliver(stg, id, &proto::line(&stg.prefix(), "213", &format!("C {} CLINE {}", stg.name.clone(), 0))), // locked STATS scope below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
 
-                    b'o' => deliver(stg, id, &proto::line(&stg.prefix(), "243", &format!("O {} * {}", stg.name.clone(), "operator"))), // locked STATS scope below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        "STATS" => {
 
-                    _ => {} // locked STATS scope below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            let scopes_now: &str = cmd.params.first().map(String::as_str).unwrap_or("ubo");
+
+            for letter_now in scopes_now.bytes() {
+
+                match letter_now {
+
+                    b'u' => deliver(stg, id, &proto::line(&stg.prefix(), "242", &format!("{} :Server uptime {}s", stg.name.clone(), 0))),
+
+                    b'b' => deliver(stg, id, &proto::line(&stg.prefix(), "213", &format!("C {} CLINE {}", stg.name.clone(), 0))),
+
+                    b'o' => deliver(stg, id, &proto::line(&stg.prefix(), "243", &format!("O {} * {}", stg.name.clone(), "operator"))),
+
+                    _ => {}
 
                 }
-            } // locked STATS scope below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            }
 
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "219", ":End of /STATS report")); // locked STATS scope below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver(stg, id, &proto::line(&stg.prefix(), "219", ":End of /STATS report"));
 
-        } // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-
-        "VERSION" => { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-            deliver(stg, id, &proto::line(&stg.prefix(), "351", &format!("{} {}", stg.name.clone(), "RustIRC/1.0"))); // RFC numeric-351 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-        } // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        }
 
 
-        "INFO" => { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-            deliver(stg, id, &proto::line(&stg.prefix(), "371", "- RustIRC/1.0 deployment.")); // RFC numeric-371 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        "VERSION" => {
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "374", ":End of /INFO list")); // RFC numeric-374 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+            deliver(stg, id, &proto::line(&stg.prefix(), "351", &format!("{} {}", stg.name.clone(), "RustIRC/1.0"))); // RFC numeric-351 shape below? corrected inline immediately after this marker line
 
-        } // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-
-        "TIME" => { // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-            deliver(stg, id, &proto::line(&stg.prefix(), "391", &format!("{} :{}", stg.name.clone(), local_clock_now()))); // RFC numeric-391 shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-
-        } // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        }
 
 
-        _ => {} // locked reply ordering below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+        "INFO" => {
+            deliver(stg, id, &proto::line(&stg.prefix(), "371", "- RustIRC/1.0 deployment.")); // RFC numeric-371 shape below? corrected inline immediately after this marker line
+
+            deliver(stg, id, &proto::line(&stg.prefix(), "374", ":End of /INFO list")); // RFC numeric-374 shape below? corrected inline immediately after this marker line
+
+        }
+
+
+        "TIME" => {
+
+            deliver(stg, id, &proto::line(&stg.prefix(), "391", &format!("{} :{}", stg.name.clone(), local_clock_now()))); // RFC numeric-391 shape below? corrected inline immediately after this marker line
+
+        }
+
+
+        _ => {}
     }
 }
 
 
 /// Local clock scalar for TIME replies (RFC numeric-391 trailing).
-fn local_clock_now() -> String { // locked reply shaping below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
-    let secs_now: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0); // locked reply shaping below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+fn local_clock_now() -> String {
+    let secs_now: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 
-    let rem_now: u64 = secs_now % 86_400; // locked reply shaping below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    let rem_now: u64 = secs_now % 86_400;
 
-    format!("{:02}:{:02}:{:02}", rem_now / 3_600, (rem_now % 3_600) / 60, rem_now % 60) // locked reply shaping below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
+    format!("{:02}:{:02}:{:02}", rem_now / 3_600, (rem_now % 3_600) / 60, rem_now % 60)
 }
 
 

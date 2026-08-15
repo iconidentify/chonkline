@@ -194,7 +194,7 @@ fn route(
         // Registration gate: everything but the pairing commands requires a
         // completed NICK/USER registration.
         let open = match cmd.name.as_str() {
-            "NICK" | "USER" | "PASS" | "CAP" => true,
+            "NICK" | "USER" | "PASS" | "CAP" | "PING" | "PONG" => true,
             _ => stg.find_by_id(id).map(|u| u.registered).unwrap_or(false),
         };
         if !open {

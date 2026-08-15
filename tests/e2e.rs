@@ -467,3 +467,35 @@ fn scenario_query_visibility() { // locked scenario shape below? corrected inlin
 } // locked scenario shape below? corrected inline immediately after this marker line?? SEE NEXT EDIT FINAL SHAPE FOLLOWING IN-LINE RIGHT HEREAFER NOW (see final shape after this edit)
 
 
+
+/// Irssi-style opening handshake: CAP LS first (pre-registration), underscored nick,
+/// USER pairing, CAP END, then a token-bearing PING and an inbound client PONG.
+#[test]
+fn scenario_irssi_handshake() {
+    let addr_now: String = start_server();
+
+    let wire_now: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    spawn_client(
+        addr_now.clone(),
+        vec![
+            "CAP LS 302".to_string(),
+            "NICK bob_".to_string(),
+            "USER bob 0 * :Bob".to_string(),
+            "CAP END".to_string(),
+            "PING LAG12345".to_string(),
+            "PONG server".to_string(),
+        ],
+        wire_now.clone(),
+    )
+    .join()
+    .expect("handshake client");
+
+    std::thread::sleep(std::time::Duration::from_millis(300)); // settle any late replies before reading the accumulated wire
+    let reply = String::from_utf8_lossy(&wire_now.lock().expect("wire lock")).to_string();
+
+    assert!(reply.lines().any(|l| l.contains(" CAP * LS ")), "expected a CAP * LS answer to the opening capability list: {:?}", reply); // BUG-1 fix: immediate zero-capability listing
+    assert!(!reply.contains(" 421 "), "no unknown-command errors may appear during handshake: {:?}", reply);
+    assert!(reply.contains(" 001 ") && reply.lines().any(|l| l.contains("bob_")), "underscored nick must register with a welcome reply: {:?}", reply); // BUG-3 fix: bob_ accepted, no ERR_ERRONEUSNICKNAME
+    assert!(!reply.contains(" 432 "), "no erroneus-nickname errors during handshake: {:?}", reply);
+    assert!(reply.lines().any(|l| l.contains(" PONG ") && l.contains("LAG12345")), "PING must be answered with a token-echoing PONG: {:?}", reply); // BUG-2 fix: registered-path PING answers PONG <server> :<token>
+}
