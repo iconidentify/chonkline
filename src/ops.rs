@@ -260,6 +260,19 @@ pub fn park_unregistered(
 
 /// Liveness polling (RFC 8.4): connections silent for too long receive a PING;
 /// those that never answer are dropped with a quit message reflecting the event.
+/// Liveness windows in seconds. Production defaults follow the keepalive budget:
+/// ping after ~60s of silence, evict when no answer within ~90s more; tests may
+/// shrink both via environment overrides so reaping stays verifiable at test scale.
+fn eviction_window() -> std::time::Duration {
+    let secs: u64 = std::env::var("CHONKLINE_EVICTION_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(90);
+    std::time::Duration::from_secs(secs.max(1))
+}
+
+fn ping_after_window() -> std::time::Duration {
+    let secs: u64 = std::env::var("CHONKLINE_PING_AFTER_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+    std::time::Duration::from_secs(secs.max(1))
+}
+
 pub fn liveness_tick(state: &Arc<Mutex<ServerState>>) {
     let mut stg = state.lock().unwrap();
 
@@ -269,7 +282,7 @@ pub fn liveness_tick(state: &Arc<Mutex<ServerState>>) {
         .ping_outstanding
         .iter()
         .filter_map(|(&id, &at)| {
-            (now.duration_since(at) > Duration::from_secs(90)).then_some(id)
+            (now.duration_since(at) > eviction_window()).then_some(id)
         })
         .collect();
     for id in expired {
@@ -279,7 +292,7 @@ pub fn liveness_tick(state: &Arc<Mutex<ServerState>>) {
 
     let silent: Vec<usize> = stg
         .each_user()
-        .filter(|u| now.duration_since(u.last_rx) > Duration::from_secs(60))
+        .filter(|u| now.duration_since(u.last_rx) > ping_after_window())
         .map(|u| u.id)
         .collect();
     for id in silent {
@@ -300,7 +313,7 @@ fn send_to(stg: &ServerState, id: usize, line: &str) {
 }
 
 /// Announce the departure of a connection (if still present in state) and remove it.
-fn announce_loss_and_evict(stg: &mut ServerState, id: usize, reason: &str) {
+pub(crate) fn announce_loss_and_evict(stg: &mut ServerState, id: usize, reason: &str) {
     if let Some(pfx) = stg.find_by_id(id).map(|u| u.prefix()) {
         let line = proto::line(&pfx, "QUIT", &format!(":{}", reason));
         for other in stg.each_user() {

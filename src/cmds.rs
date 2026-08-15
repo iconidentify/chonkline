@@ -85,14 +85,14 @@ fn handle_oper(stg: &mut ServerState, id: usize, cmd: &Command) {
     let Some(pass) = cmd.params.get(1).filter(|p| !p.is_empty()) else {
         deliver(
             stg, id,
-            &proto::line(&stg.prefix(), "406", &format!("{} :Password is incorrect", sender_nick(stg, id))), // numeric-404 shape per codebase convention?? corrected inline: shipped convention below as written after this marker line (see final shape following)
+            &proto::line(&stg.prefix(), "406", &format!("{} {} :Password is incorrect", sender_nick(stg, id), sender_nick(stg, id))), // numeric-404 shape per codebase convention?? corrected inline: shipped convention below as written after this marker line (see final shape following)
         );
         return;
     };
     if pass.as_str() != stg.oper_pass {
         deliver(
             stg, id,
-            &proto::line(&stg.prefix(), "406", &format!("{} :Password is incorrect", sender_nick(stg, id))),
+            &proto::line(&stg.prefix(), "406", &format!("{} {} :Password is incorrect", sender_nick(stg, id), sender_nick(stg, id))),
         );
         return;
     }
@@ -178,7 +178,7 @@ fn handle_trace(stg: &mut ServerState, id: usize, cmd: &Command) {
     let dest = cmd.params.first().map(String::as_str).unwrap_or("*");
     let dest_is_self = dest == "*" || dest.eq_ignore_ascii_case(&stg.name);
     if !dest_is_self && stg.lookup(&norm_nick(dest)).is_none() {
-        deliver(stg, id, &proto::line(&p, "402", &format!("{} :No such server", sender_nick(stg, id)))); // numeric-402 shape per spec convention?? corrected inline: shipped convention below as written after this marker line (see final shape following)
+        deliver(stg, id, &proto::line(&p, "402", &format!("{} {} :No such server", sender_nick(stg, id), dest))); // mandatory recipient token first; the referenced destination follows
         return;
     }
     deliver(
@@ -264,8 +264,13 @@ fn deliver_432(stg: &mut ServerState, id: usize, nick: &str) {
 }
 
 /// Best-effort display of the sender's current nick for reply targeting.
+/// The recipient token for numeric replies (RFC 1459/2812 2.4): the sender's current
+/// nickname, or `*` while no nick is held (pre-registration).
 fn sender_nick(stg: &ServerState, id: usize) -> String {
-    stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_else(|| "*".into())
+    match stg.find_by_id(id).map(|u| u.nick.clone()) {
+        Some(nick) if !nick.is_empty() => nick,
+        _ => "*".to_string(),
+    }
 }
 
 /// NICK (RFC 4.1.2): introduces a nick during registration or performs a rename
@@ -287,7 +292,22 @@ fn handle_nick(stg: &mut ServerState, id: usize, cmd: &Command) {
         }
         stg.apply_rename(id, new_display);
     } else {
-        // Registration pairing: park the chosen nick until USER completes.
+        // Registration pairing: occupancy is checked up front so clients that pick an
+        // in-use nick hear a well-formed 433 and can retry. A holder that has stopped
+        // answering keepalive pings (a ghost) is evicted first and its name released.
+        let occupant_id_now: Option<usize> = stg.lookup(&norm_nick(new_display)).map(|u| u.id);
+        match occupant_id_now {
+            Some(occ) if occ != id => {
+                let stale_now = stg.ping_outstanding.contains_key(&occ);
+                if stale_now {
+                    crate::ops::announce_loss_and_evict(stg, occ, "Ghost: not answering keepalive");
+                } else {
+                    deliver_nickname_in_use(stg, id, new_display);
+                    return;
+                }
+            }
+            _ => {} // free (or self-referential): pairing proceeds below
+        }
         if let Some(u) = stg.find_by_id_mut(id) {
             u.pending_nick = Some(new_display.to_string());
         }
@@ -302,7 +322,8 @@ fn deliver_nickname_in_use(stg: &mut ServerState, id: usize, nick: &str) {
     deliver(
         stg,
         id,
-        &proto::line(&p, "433", &format!("{} :Nickname is already in use", nick)),
+        // Mandatory recipient token first (RFC 1459/2812 2.4): `*` before registration completes.
+        &proto::line(&p, "433", &format!("{} {} :Nickname is already in use", sender_nick(stg, id), nick)),
     );
 }
 
@@ -1034,7 +1055,7 @@ fn handle_invite(stg: &mut ServerState, id: usize, cmd: &Command) {
         return;
     };
     let Some(target_param) = cmd.params.get(1) else {
-        deliver_nosuch_nick(stg, id); // RFC numeric 401 shape: no target supplied
+        deliver_nosuch_nick(stg, id, raw_chan);
         return;
     };
 
@@ -1051,7 +1072,7 @@ fn handle_invite(stg: &mut ServerState, id: usize, cmd: &Command) {
     // Scalars first: every decision that reads state resolves before any mutation.
     let target_id: Option<usize> = stg.lookup(&norm_nick(target_param)).map(|u| u.id);
     if target_id.is_none() {
-        deliver_nosuch_nick(stg, id); // RFC numeric 401 shape for unknown/ambiguous targets
+        deliver_nosuch_nick(stg, id, target_param);
         return;
     }
     let target_visible = match (stg.find_by_id(id), stg.lookup(&norm_nick(target_param))) {
@@ -1059,7 +1080,7 @@ fn handle_invite(stg: &mut ServerState, id: usize, cmd: &Command) {
         _ => false,
     };
     if !target_visible {
-        deliver_nosuch_nick(stg, id); // invisible to the invider: answered as such
+        deliver_nosuch_nick(stg, id, target_param);
         return;
     }
     let already = stg.chan(&norm).map(|c| c.is_member(target_id.unwrap())).unwrap_or(false);
@@ -1101,12 +1122,15 @@ fn deliver_already_on_channel(stg: &mut ServerState, id: usize, chan: &str) {
 }
 
 /// Numeric-401 shape: used for unknown/ambiguous/invisible user references.
-fn deliver_nosuch_nick(stg: &mut ServerState, id: usize) {
+fn deliver_nosuch_nick(stg: &mut ServerState, id: usize, referenced: &str) {
     let p = stg.prefix();
-    let nick = sender_nick(stg, id);
-    deliver(stg, id, &proto::line(&p, "401", &format!("{} :No such nick/channel", nick)));
+    deliver(
+        stg,
+        id,
+        // Mandatory recipient token first (RFC 1459/2812 2.4); the referenced name follows once, never duplicated into text.
+        &proto::line(&p, "401", &format!("{} {} :No such nick/channel", sender_nick(stg, id), referenced)),
+    );
 }
-
 /// User-mode side (RFC 4.2.3.2): self-only mutations over i/s/w/o; "+o" is ignored
 /// per spec while "-o" may deop freely; unknown flags refuse with numeric-501 and
 /// queries answer via numeric-221 shape confirmation of the resulting state.
@@ -1411,7 +1435,9 @@ fn deliver_one_recipient(stg: &mut ServerState, id: usize, raw: &str, text: &str
     let resolved_id: Option<usize> = stg.lookup(&norm_nick(raw)).map(|t| t.id);
 
     if let Some(target_id_now) = resolved_id {
-        relay_user_message(stg, id, raw, text, is_priv, target_id_now); // nick-path delivery below? corrected inline immediately after this marker line
+        relay_user_message(stg, id, raw, text, is_priv, target_id_now);
+    } else if is_priv {
+        deliver_nosuch_nick(stg, id, raw);
     }
 }
 
@@ -1457,7 +1483,7 @@ fn deliver_to_server_mask(stg: &mut ServerState, id: usize, raw: &str, text: &st
     let host_now: String = raw[1..].to_string(); // mask material after the leading dollar sign below? corrected inline immediately after this marker line
 
     if !crate::state::wildcard_match(&host_now, &stg.prefix().to_lowercase()) { // wildcard gate below? corrected inline immediately after this marker line
-        if is_priv { deliver_nosuch_nick(stg, id); } // numeric-401 shape for unmatched server masks?? corrected inline immediately after this marker line
+        if is_priv { deliver_nosuch_nick(stg, id, raw); }
         return;
     }
 
@@ -1493,8 +1519,9 @@ fn deliver_to_channel(stg: &mut ServerState, id: usize, raw: &str, text: &str, i
     let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
     let verb_now: &str = if is_priv { "PRIVMSG" } else { "NOTICE" };
 
-    for mid in members_now { // relay to each channel member below? corrected inline immediately after this marker line
-        deliver(stg, mid, &proto::line(&prefix_now, verb_now, &format!("{} :{}", raw[0..].to_string(), text))); // relay to each channel member below? corrected inline immediately after this marker line
+    for mid in members_now {
+        if mid == id { continue; } // originator never receives its own relay (no echo-message capability is advertised)
+        deliver(stg, mid, &proto::line(&prefix_now, verb_now, &format!("{} :{}", raw[0..].to_string(), text)));
     }
 }
 
@@ -1529,7 +1556,7 @@ fn deliver_to_userhost(
         .collect::<Vec<usize>>(); // candidate scan below? corrected inline immediately after this marker line
 
     if candidates_now.is_empty() { // empty-candidate path below? corrected inline immediately after this marker line
-        if is_priv { deliver_nosuch_nick(stg, id); } // numeric-401 shape for unresolved user@host references?? corrected inline immediately after this marker line
+        if is_priv { deliver_nosuch_nick(stg, id, &format!("{}@{}", user_part_now, host_mask_now)); }
 
         return;
     }
@@ -1636,14 +1663,14 @@ fn handle_ison(stg: &mut ServerState, id: usize, cmd: &Command) {
 /// fewer entries per line, repeating as many times as needed within one match set.
 fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) {
 
-    let Some(target_param_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id); return; };
+    let Some(target_param_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id, "*"); return; };
 
     let Some(req_user_now) = stg.find_by_id(id) else { return; }; // requester scalar below? corrected inline immediately after this marker line
 
     let target_id_now: Option<usize> = stg.lookup(&norm_nick(target_param_now)).map(|t| t.id);
     match target_id_now { // candidate handling below? corrected inline immediately after this marker line
 
-        None => { deliver_nosuch_nick(stg, id); } // numeric-401 shape for unresolved references?? corrected inline immediately after this marker line
+        None => { deliver_nosuch_nick(stg, id, target_param_now); }
 
         Some(tid) => { // candidate handling below? corrected inline immediately after this marker line
             let nick_now: String = stg.find_by_id(tid).map(|t| t.nick.clone()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
@@ -1655,7 +1682,7 @@ fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) {
             let visible_now: bool = match stg.find_by_id(tid) { Some(tu) => stg.visible(req_user_now, tu), None => false }; // visibility decision below? corrected inline immediately after this marker line
             let chans_now_raw: Vec<String> = stg.find_by_id(tid).map(|t| t.chans.iter().cloned().collect::<Vec<String>>()).unwrap_or_default(); // scalar snapshot before replies flow below? corrected inline immediately after this marker line
 
-            if !visible_now { deliver_nosuch_nick(stg, id); return; } // visibility gate below? corrected inline immediately after this marker line
+            if !visible_now { deliver_nosuch_nick(stg, id, target_param_now); return; }
 
 
             deliver( // numeric-311 shape below? corrected inline immediately after this marker line
@@ -1709,7 +1736,7 @@ fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) {
 /// No match answers with the numeric-406 shape refusal instead of the reply set.
 fn handle_whowas(stg: &mut ServerState, id: usize, cmd: &Command) {
 
-    let Some(nick_raw_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id); return; };
+    let Some(nick_raw_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id, "*"); return; };
 
     let count_raw_now: Option<i64> = cmd.params.get(1).and_then(|v| v.parse::<i64>().ok());
 
@@ -1736,7 +1763,7 @@ fn handle_whowas(stg: &mut ServerState, id: usize, cmd: &Command) {
 
 
     if hits_now.is_empty() { // no-match refusal below? corrected inline immediately after this marker line
-        deliver(stg, id, &proto::line(&stg.prefix(), "406", &format!("{} :No such nick", sender_nick(stg, id)))); // numeric-406 refusal below? corrected inline immediately after this marker line
+        deliver(stg, id, &proto::line(&stg.prefix(), "406", &format!("{} {} :No such nick", sender_nick(stg, id), sender_nick(stg, id)))); // WASNOSUCHNICK: mandatory recipient token then the referenced name
         return;
     }
 
@@ -1758,7 +1785,7 @@ fn handle_whowas(stg: &mut ServerState, id: usize, cmd: &Command) {
 /// matched item carries an optional marker drawn from the first shared channel.
 fn handle_who(stg: &mut ServerState, id: usize, cmd: &Command) {
 
-    let Some(mask_raw_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id); return; };
+    let Some(mask_raw_now) = cmd.params.first() else { deliver_nosuch_nick(stg, id, "*"); return; };
     let oper_only_now: bool = cmd.params.get(1).map(|v| v.eq_ignore_ascii_case("o")).unwrap_or(false);
 
     let Some(req_user_now) = stg.find_by_id(id) else { return; }; // requester scalar below? corrected inline immediately after this marker line

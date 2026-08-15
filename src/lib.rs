@@ -60,7 +60,8 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
         // A dedicated task owns the listener; the supervisor below consumes
         // accepted connections from its channel and periodically polls
         // liveness (RFC 8.4), so cancellation is a single decision.
-        let mut iv = tokio::time::interval(Duration::from_secs(30));
+        let tick_secs: u64 = std::env::var("CHONKLINE_LIVENESS_TICK_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+        let mut iv = tokio::time::interval(Duration::from_secs(tick_secs.max(1)));
         let (conn_tx, mut conn_rx) = tokio::sync::mpsc::unbounded_channel::<tokio::net::TcpStream>();
         let accept_task = tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
