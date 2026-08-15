@@ -1,0 +1,32 @@
+name: Deploy
+# Manual only — pushing source never auto-cuts-over production.
+# Run after the Image workflow has published the tag you want to ship.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag (git SHA or "latest")
+        default: latest
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load scoped kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.LKE_DEPLOY_KUBECONFIG_B64 }}
+        run: |
+          test -n "$KUBECONFIG_B64"
+          mkdir -p "$RUNNER_TEMP/kube"
+          printf '%s' "$KUBECONFIG_B64" | base64 --decode > "$RUNNER_TEMP/kube/config"
+          echo "KUBECONFIG=$RUNNER_TEMP/kube/config" >> "$GITHUB_ENV"
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.34.9
+      - name: Apply
+        run: |
+          cd deploy/k8s
+          kustomize edit set image "chonkline=ghcr.io/${GITHUB_REPOSITORY}:${{ inputs.tag }}"
+          kubectl apply -k . --server-side --force-conflicts
+          kubectl rollout status deployment/chonkline -n chonkline --timeout=5m
+          kubectl get deploy,pod,svc -n chonkline

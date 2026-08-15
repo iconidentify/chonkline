@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: chonkline
+resources:
+  - deployment.yaml
+  - service.yaml
+# Existing namespace, ingress, cert, configmap and PVC are managed out-of-band
+# and reused as-is; this overlay only swaps the workload + service.
+images:
+  - name: chonkline
+    newName: ghcr.io/iconidentify/chonkline
+    newTag: latest
