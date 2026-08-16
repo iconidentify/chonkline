@@ -63,6 +63,32 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 // Client / user record
 // ---------------------------------------------------------------------------
 
+/// IRCv3 capabilities enabled on a connection after `CAP REQ` / ACK. Only caps
+/// the server genuinely honors are ever advertised or set here.
+#[derive(Debug, Clone, Default)]
+pub struct Caps {
+    pub server_time: bool,    // message @time= tags (RFC: ircv3 server-time)
+    pub away_notify: bool,    // AWAY broadcasts to shared-channel peers
+    pub extended_join: bool,  // JOIN carries account + realname
+    pub account_notify: bool, // ACCOUNT messages on login/logout
+    pub multi_prefix: bool,   // all membership prefixes in NAMES/WHO
+    pub sasl: bool,           // SASL authentication was requested
+}
+
+impl Caps {
+    /// Space-separated list of the caps currently enabled (for `CAP LIST`).
+    pub fn enabled_list(&self) -> String {
+        let mut v: Vec<&str> = Vec::new();
+        if self.server_time { v.push("server-time"); }
+        if self.away_notify { v.push("away-notify"); }
+        if self.extended_join { v.push("extended-join"); }
+        if self.account_notify { v.push("account-notify"); }
+        if self.multi_prefix { v.push("multi-prefix"); }
+        if self.sasl { v.push("sasl"); }
+        v.join(" ")
+    }
+}
+
 pub struct Cx {
     pub id: usize,
     pub tx: UnboundedSender<String>,
@@ -71,9 +97,20 @@ pub struct Cx {
     /// Normalized key used for all comparisons.
     pub nick_key: String,
     pub user: String,
-    pub host: String, // dotted-quad peer address in this deployment
+    pub host: String, // cloaked host shown to other users (see ops::cloak_host)
+    pub real_host: String, // true peer address, revealed only to operators
     pub realname: String,
     pub registered: bool,
+
+    /// Services account this connection is logged in to (SASL or NickServ
+    /// IDENTIFY), if any. Drives account-notify / extended-join and the +r idle
+    /// account tag.
+    pub account: Option<String>,
+
+    /// IRCv3 capabilities negotiated and enabled on this connection.
+    pub caps: Caps,
+    /// SASL mechanism selected mid-handshake (before the payload arrives).
+    pub sasl_mech: Option<String>,
 
     // Slots filled while the client completes the NICK/USER registration pair.
     pub pending_nick: Option<String>,  // display form chosen so far
@@ -219,6 +256,20 @@ impl Chn {
         } else {
             ""
         }
+    }
+
+    /// All membership prefixes for a user, high-to-low ("@+" when both op and
+    /// voiced). Used for the IRCv3 multi-prefix capability; the single-marker
+    /// `marker` form is used for clients without it.
+    pub fn all_markers(&self, cx_id: usize) -> String {
+        let mut s = String::new();
+        if self.ops.contains(&cx_id) {
+            s.push('@');
+        }
+        if self.voices.contains(&cx_id) {
+            s.push('+');
+        }
+        s
     }
 
     /// First active ban mask matching a user's identity, if any.
@@ -371,6 +422,9 @@ pub struct ServerState {
 
     /// Active fast-reconnect reclaim markers keyed by the contested holder's connection id.
     pub grace_reclaim: HashMap<usize, Reclaim>,
+
+    /// Registered services accounts (SASL / NickServ), persisted to disk.
+    pub accounts: crate::accounts::AccountStore,
 }
 
 impl ServerState {
@@ -399,6 +453,7 @@ impl ServerState {
             listen_desc: listen_desc.to_string(),
             ping_outstanding: HashMap::new(),
             grace_reclaim: HashMap::new(),
+            accounts: crate::accounts::AccountStore::load(std::env::var("IRC_ACCOUNTS_PATH").ok()),
         }
     }
 
@@ -457,6 +512,7 @@ impl ServerState {
         &mut self,
         id: usize,
         host: String,
+        real_host: String,
         tx: UnboundedSender<String>,
         notify: Arc<Notify>,
     ) {
@@ -467,8 +523,12 @@ impl ServerState {
             nick_key: String::new(),
             user: String::new(),
             host,
+            real_host,
             realname: String::new(),
             registered: false,
+            account: None,
+            caps: Caps::default(),
+            sasl_mech: None,
             pending_nick: None,
             pending_user: None,
             cap_negotiating: false,
@@ -696,8 +756,12 @@ mod tests {
             nick_key: norm_nick("alice"),
             user: "bob".into(),
             host: "example.edu".into(),
+            real_host: "example.edu".into(),
             realname: "A Person".into(),
             registered: true,
+            account: None,
+            caps: Caps::default(),
+            sasl_mech: None,
             pending_nick: None,
             pending_user: None,
             cap_negotiating: false,

@@ -25,6 +25,19 @@ fn flood_window() -> Duration {
     Duration::from_millis(ms.max(1))
 }
 
+/// Deterministic host cloak: users see `<8-hex>.<suffix>` derived from an
+/// HMAC-SHA256 of their real address, never the raw IP. Deterministic per
+/// address so channel bans on a cloak keep working across reconnects, while the
+/// real address is disclosed only to operators. Tunable via IRC_CLOAK_SECRET
+/// (set a real secret in production) and IRC_CLOAK_SUFFIX.
+pub(crate) fn cloak_host(real: &str) -> String {
+    let secret = std::env::var("IRC_CLOAK_SECRET")
+        .unwrap_or_else(|_| "chonkline-default-cloak-secret".to_string());
+    let suffix = std::env::var("IRC_CLOAK_SUFFIX").unwrap_or_else(|_| "chonkbase.net".to_string());
+    let mac = crate::crypto::hmac_sha256(secret.as_bytes(), real.as_bytes());
+    format!("{}.{}", crate::crypto::hex(&mac[..4]), suffix)
+}
+
 fn find_terminator(buf: &[u8]) -> Option<usize> {
     for (i, &b) in buf.iter().enumerate() {
         if b == b'\n' || b == b'\r' {
@@ -54,10 +67,11 @@ pub fn spawn_connection(
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     // Peer address stands in for the client-supplied hostname and any ident/
     // reverse-DNS lookups, which are unavailable in this deployment.
-    let host = sock
+    let real_host = sock
         .peer_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or("0.0.0.0".into());
+    let host = cloak_host(&real_host);
 
     // OS-level keepalive on every accepted socket: dead peers behind a load
     // balancer surface as half-open connections that no application-layer ping
@@ -82,7 +96,7 @@ pub fn spawn_connection(
     });
 
     let notify = Arc::new(Notify::new());
-    park_unregistered(&state, id, host, tx.clone(), notify.clone());
+    park_unregistered(&state, id, host, real_host, tx.clone(), notify.clone());
     let st_owned = state.clone(); // owned copy: async-move captures by value only own values here
     tokio::spawn(async move {
         run_reader(st_owned, id, rd, notify).await;
@@ -211,7 +225,7 @@ fn route(
         // Registration gate: everything but the pairing commands requires a
         // completed NICK/USER registration.
         let open = match cmd.name.as_str() {
-            "NICK" | "USER" | "PASS" | "CAP" | "PING" | "PONG" => true,
+            "NICK" | "USER" | "PASS" | "CAP" | "AUTHENTICATE" | "PING" | "PONG" => true,
             _ => stg.find_by_id(id).map(|u| u.registered).unwrap_or(false),
         };
         if !open {
@@ -276,6 +290,7 @@ pub fn park_unregistered(
     state: &Arc<Mutex<ServerState>>,
     id: usize,
     host: String,
+    real_host: String,
     tx: mpsc::UnboundedSender<String>,
     notify: Arc<Notify>,
 ) {
@@ -283,7 +298,7 @@ pub fn park_unregistered(
     if stg.find_by_id(id).is_some() {
         return; // already parked (should not happen); be harmless
     }
-    stg.park_new(id, host, tx, notify);
+    stg.park_new(id, host, real_host, tx, notify);
 }
 
 /// Liveness polling (RFC 8.4): connections silent for too long receive a PING;

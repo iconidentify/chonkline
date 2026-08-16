@@ -27,9 +27,34 @@ spec:
               value: "6667"
             - name: IRC_SERVER_NAME
               value: "irc.chonkbase.net"
+            # Registered accounts (SASL / NickServ) persist on the block volume.
+            - name: IRC_ACCOUNTS_PATH
+              value: "/var/lib/chonkline/accounts.db"
+            # Deterministic host-cloak key; keeps user IPs private and cloaks
+            # stable across restarts so channel bans on a cloak keep working.
+            - name: IRC_CLOAK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: chonkline-cloak
+                  key: key
+            - name: IRC_CLOAK_SUFFIX
+              value: "users.chonkbase.net"
+            - name: IRC_OPER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: chonkline-oper
+                  key: username
+            - name: IRC_OPER_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: chonkline-oper
+                  key: password
           ports:
             - name: irc
               containerPort: 6667
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/chonkline
           readinessProbe:
             tcpSocket:
               port: irc
@@ -93,7 +118,14 @@ spec:
             runAsGroup: 65532
             capabilities:
               drop: ["ALL"]
+      # fsGroup makes the block volume group-writable by the non-root uid so the
+      # account store can be persisted under readOnlyRootFilesystem.
+      securityContext:
+        fsGroup: 65532
       volumes:
         - name: tls-cert
           secret:
             secretName: chonkline-tls
+        - name: data
+          persistentVolumeClaim:
+            claimName: chonkline-data

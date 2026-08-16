@@ -9,10 +9,20 @@ the only runtime dependency is `tokio`.
 - Connection registration (`PASS` / `NICK` / `USER`), MOTD, LUSERS
 - Channels: `JOIN` / `PART` / `TOPIC` / `NAMES` / `LIST` / `INVITE` / `KICK`
 - Channel and user `MODE` (invite-only, keys, limits, bans, ops, …)
-- Messaging: `PRIVMSG` / `NOTICE`
+- Messaging: `PRIVMSG` / `NOTICE` (CTCP passes through transparently)
 - Queries: `WHO` / `WHOIS` / `WHOWAS` / `ISON` / `USERHOST`
 - Server info: `VERSION` / `STATS` / `TIME` / `ADMIN` / `INFO` / `MOTD`
 - `AWAY`, `OPER`, `WALLOPS`, `PING` / `PONG` keepalive
+- **Accounts**: `NickServ` `REGISTER` / `IDENTIFY`, PBKDF2-hashed passwords
+  persisted to disk
+- **SASL** `PLAIN` authentication at connection time
+- **IRCv3 capabilities**: `sasl`, `server-time`, `away-notify`, `extended-join`,
+  `account-notify`, `multi-prefix` (proper `CAP LS 302` negotiation)
+- **Host cloaking**: users' real addresses are hidden behind a stable HMAC cloak
+  (revealed to operators via `WHOIS`)
+
+The only runtime dependency is `tokio`; the cryptography (SHA-256, HMAC, PBKDF2,
+base64) is implemented in-tree and checked against published test vectors.
 
 ## Quick start
 
@@ -25,12 +35,15 @@ IRC_PORT=6667 cargo run --release
 
 All configuration is via environment variables.
 
-| Env var           | Default     | Meaning                           |
-|-------------------|-------------|-----------------------------------|
-| `IRC_PORT`        | `6697`      | TCP port the server listens on    |
-| `IRC_SERVER_NAME` | `chonkline` | Server name reported in numerics  |
-| `IRC_OPER_USER`   | `oper`      | `OPER` username                   |
-| `IRC_OPER_PASS`   | `secret`    | `OPER` password                   |
+| Env var             | Default          | Meaning                                       |
+|---------------------|------------------|-----------------------------------------------|
+| `IRC_PORT`          | `6697`           | TCP port the server listens on                |
+| `IRC_SERVER_NAME`   | `chonkline`      | Server name reported in numerics              |
+| `IRC_OPER_USER`     | `oper`           | `OPER` username                               |
+| `IRC_OPER_PASS`     | `secret`         | `OPER` password                               |
+| `IRC_ACCOUNTS_PATH` | *(unset)*        | Account store file; unset = in-memory only    |
+| `IRC_CLOAK_SECRET`  | *(built-in)*     | HMAC key for host cloaks (set in production)   |
+| `IRC_CLOAK_SUFFIX`  | `chonkbase.net`  | Domain suffix appended to cloaked hosts       |
 
 ## Test
 

@@ -56,6 +56,38 @@ pub fn user_prefix(nick: &str, user: &str, host: &str) -> String {
     format!("{}!{}@{}", nick, user, host)
 }
 
+/// Civil date/time (UTC) from a Unix timestamp — Howard Hinnant's algorithm,
+/// valid across the full proleptic Gregorian range without a calendar library.
+fn civil_from_epoch(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86400) as i64;
+    let rem = (secs % 86400) as u32;
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d, h, mi, s)
+}
+
+/// IRCv3 `server-time` timestamp: ISO-8601 UTC with milliseconds, e.g.
+/// `2026-08-16T08:12:34.567Z`.
+pub fn ircv3_timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let (y, mo, d, h, mi, s) = civil_from_epoch(now.as_secs());
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y, mo, d, h, mi, s, now.subsec_millis()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +129,15 @@ mod tests {
         let many: Vec<String> = (0..16).map(|i| format!("p{}", i)).collect();
         let cmd = format!("MODE {}", many.join(" "));
         assert!(parse(&cmd).is_none()); // more than 15 parameters
+    }
+
+    #[test]
+    fn timestamp_civil_conversion() {
+        // 1700000000 = 2023-11-14T22:13:20Z (known epoch).
+        let (y, mo, d, h, mi, s) = super::civil_from_epoch(1_700_000_000);
+        assert_eq!((y, mo, d, h, mi, s), (2023, 11, 14, 22, 13, 20));
+        // epoch 0 = 1970-01-01T00:00:00Z
+        assert_eq!(super::civil_from_epoch(0), (1970, 1, 1, 0, 0, 0));
     }
 
     #[test]

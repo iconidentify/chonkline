@@ -33,7 +33,9 @@ pub fn dispatch(stg: &mut ServerState, id: usize, cmd: &Command) -> bool {
 
         "QUIT" => { handle_quit(stg, id, cmd); true }
         "ERROR" => true, // client-originated ERROR: close without reply
-        "CAP" | "PING" => { handle_misc_stub(stg, id, cmd); false }
+        "CAP" => { handle_cap(stg, id, cmd); false }
+        "AUTHENTICATE" => { handle_authenticate(stg, id, cmd); false }
+        "PING" => { handle_misc_stub(stg, id, cmd); false }
         "PONG" => { let _ = stg.find_by_id(id).is_some(); false } // inbound client PONG: accepted silently (liveness stamped upstream)
         "OPER" => { handle_oper(stg, id, cmd); false }
         "ADMIN" => { handle_admin(stg, id, cmd); false }
@@ -182,6 +184,18 @@ fn deliver_unknown_command(stg: &mut ServerState, id: usize, cmd: &Command) {
 fn deliver(stg: &mut ServerState, id: usize, line: &str) {
     if let Some(u) = stg.find_by_id(id) {
         let _ = u.tx.send(line.to_string()); // slow/dead sockets drop the reply
+    }
+}
+
+/// Deliver a user-visible event line, prepending an IRCv3 `@time=` tag for
+/// recipients that negotiated `server-time`. Used for every relayed message and
+/// membership event so bouncers and loggers get accurate timestamps.
+fn relay_tagged(stg: &mut ServerState, target_id: usize, base_line: &str) {
+    let with_time = stg.find_by_id(target_id).map(|u| u.caps.server_time).unwrap_or(false);
+    if with_time {
+        deliver(stg, target_id, &format!("@time={} {}", proto::ircv3_timestamp(), base_line));
+    } else {
+        deliver(stg, target_id, base_line);
     }
 }
 
@@ -647,12 +661,31 @@ fn join_existing(stg: &mut ServerState, id: usize, norm: &str, key: &str) {
     }
 
     let members: Vec<usize> = stg.chan(norm).map(|c| c.members.iter().copied().collect()).unwrap_or_default();
-    for mid in members {
-        if mid == id { continue; }
-        deliver(stg, mid, &proto::line(&sender_prefix, "JOIN", &display));
-    }
+    broadcast_join(stg, id, &members, &sender_prefix, &display);
 
     joiner_replies(stg, id, &display);
+}
+
+/// Broadcast a JOIN to existing members, choosing the extended-join form
+/// (`JOIN <chan> <account> :<realname>`) for recipients that negotiated it and
+/// the plain form otherwise, each stamped with server-time where enabled.
+fn broadcast_join(stg: &mut ServerState, id: usize, members: &[usize], sender_prefix: &str, display: &str) {
+    let (acct, realname) = stg
+        .find_by_id(id)
+        .map(|u| (u.account.clone().unwrap_or_else(|| "*".into()), u.realname.clone()))
+        .unwrap_or_else(|| ("*".into(), String::new()));
+    for &mid in members {
+        if mid == id {
+            continue;
+        }
+        let ext = stg.find_by_id(mid).map(|u| u.caps.extended_join).unwrap_or(false);
+        let line = if ext {
+            proto::line(sender_prefix, "JOIN", &format!("{} {} :{}", display, acct, realname))
+        } else {
+            proto::line(sender_prefix, "JOIN", display)
+        };
+        relay_tagged(stg, mid, &line);
+    }
 }
 
 /// Topic plus NAMES-style replies owed to a user who just joined (RFC 4.2.1 /
@@ -661,7 +694,16 @@ fn join_existing(stg: &mut ServerState, id: usize, norm: &str, key: &str) {
 /// topic and NAMES burst, so clients that open a channel buffer on self-join work.
 fn joiner_replies(stg: &mut ServerState, id: usize, display: &str) {
     let sender_prefix = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
-    deliver(stg, id, &proto::line(&sender_prefix, "JOIN", &display)); // RFC 3.2.1 self-echo
+    // RFC 3.2.1 self-echo, in the client's own negotiated JOIN form.
+    let self_join = match stg.find_by_id(id).map(|u| (u.caps.extended_join, u.account.clone(), u.realname.clone())) {
+        Some((true, acct, realname)) => proto::line(
+            &sender_prefix,
+            "JOIN",
+            &format!("{} {} :{}", display, acct.unwrap_or_else(|| "*".into()), realname),
+        ),
+        _ => proto::line(&sender_prefix, "JOIN", display),
+    };
+    relay_tagged(stg, id, &self_join);
 
     let topic_now = stg.chan(&display.to_lowercase()).map(|c| c.topic.clone()).unwrap_or_default();
 
@@ -671,11 +713,12 @@ fn joiner_replies(stg: &mut ServerState, id: usize, display: &str) {
         numeric(stg, id, "332", &[display, &format!(":{}", topic_now)]); // RFC numeric 332
     }
 
+    let multi = stg.find_by_id(id).map(|u| u.caps.multi_prefix).unwrap_or(false);
     let mut nicks: Vec<String> = Vec::new();
     if let Some(c) = stg.chan(&display.to_lowercase()) {
         for mid in c.members.iter() {
             if let Some(u) = find_member_by_id(stg, *mid) {
-                let marker = c.marker(*mid);
+                let marker = if multi { c.all_markers(*mid) } else { c.marker(*mid).to_string() };
                 nicks.push(format!("{}{}", marker, u.nick));
             }
         }
@@ -1206,10 +1249,14 @@ fn handle_names(stg: &mut ServerState, id: usize, cmd: &Command) {
             continue; // +p/+s channels are invisible to outsiders (operators see all)
         }
 
+        let multi = stg.find_by_id(id).map(|u| u.caps.multi_prefix).unwrap_or(false);
         let members_now: Vec<usize> = stg.chan(&norm_key).map(|c| c.members.iter().copied().collect()).unwrap_or_default();
         let markers_now: Option<Vec<String>> = stg.chan(&norm_key).and_then(|c| {
             Some(members_now.iter()
-                .filter_map(|mid| find_member_by_id(stg, *mid).map(|u| format!("{}{}", c.marker(*mid), u.nick)))
+                .filter_map(|mid| find_member_by_id(stg, *mid).map(|u| {
+                    let pfx = if multi { c.all_markers(*mid) } else { c.marker(*mid).to_string() };
+                    format!("{}{}", pfx, u.nick)
+                }))
                 .collect::<Vec<String>>())
         });
         if let Some(nicks) = markers_now {
@@ -1352,13 +1399,33 @@ fn handle_away(stg: &mut ServerState, id: usize, cmd: &Command) {
     let Some(note) = cmd.params.first().map(String::as_str).filter(|s| !s.is_empty()) else {
         if let Some(u) = stg.find_by_id_mut(id) { u.away = None; }
         numeric(stg, id, "305", &["You are no longer marked as being away"]); // RFC numeric 305: trailing shape for clearing away status
+        announce_away_change(stg, id, None);
         return;
     };
 
+    let truncated: String = note.chars().take(100).collect(); // conventional cap, truncation not error
     if let Some(u) = stg.find_by_id_mut(id) {
-        u.away = Some(note.chars().take(100).collect::<String>()); // conventional cap, truncation not error
+        u.away = Some(truncated.clone());
     }
     numeric(stg, id, "306", &["You have been marked as being away"]); // RFC numeric 306: trailing shape for setting away status
+    announce_away_change(stg, id, Some(&truncated));
+}
+
+/// away-notify (IRCv3): tell shared-channel peers who negotiated the cap that
+/// this user went away (`AWAY :message`) or came back (`AWAY`, no argument).
+fn announce_away_change(stg: &mut ServerState, id: usize, message: Option<&str>) {
+    let prefix = match stg.find_by_id(id) {
+        Some(u) => u.prefix(),
+        None => return,
+    };
+    let line = match message {
+        Some(m) => proto::line(&prefix, "AWAY", &format!(":{}", m)),
+        None => proto::line(&prefix, "AWAY", ""),
+    };
+    let recipients = shared_channel_peers(stg, id, |u| u.caps.away_notify);
+    for rid in recipients {
+        relay_tagged(stg, rid, &line);
+    }
 }
 
 
@@ -1378,6 +1445,131 @@ fn handle_privmsg(stg: &mut ServerState, id: usize, cmd: &Command, is_priv: bool
     for raw in recips_raw.split(',').filter(|c| !c.is_empty()) {
         deliver_one_recipient(stg, id, raw, text.unwrap(), is_priv);
     }
+}
+
+/// NickServ services pseudo-user: account registration and login. Replies are
+/// NOTICEs from a synthetic `NickServ!services@<server>` prefix. Only PRIVMSGs
+/// are acted on (NOTICEs are ignored to avoid client auto-reply loops).
+fn handle_nickserv(stg: &mut ServerState, id: usize, text: &str, is_priv: bool) {
+    if !is_priv {
+        return;
+    }
+    let registered = stg.find_by_id(id).map(|u| u.registered).unwrap_or(false);
+    if !registered {
+        return;
+    }
+    let mut parts = text.split_whitespace();
+    let sub = parts.next().unwrap_or("").to_uppercase();
+    match sub.as_str() {
+        "REGISTER" => {
+            let pass = parts.next().unwrap_or("");
+            let nick = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
+            if pass.is_empty() {
+                nickserv_notice(stg, id, "Syntax: REGISTER <password>");
+                return;
+            }
+            match stg.accounts.register(&nick, pass) {
+                Ok(()) => {
+                    if let Some(u) = stg.find_by_id_mut(id) {
+                        u.account = Some(nick.clone());
+                    }
+                    nickserv_notice(stg, id, &format!("Account \x02{}\x02 registered; you are now identified.", nick));
+                    announce_account_change(stg, id, Some(&nick));
+                }
+                Err(e) => nickserv_notice(stg, id, &format!("Registration failed: {}.", e)),
+            }
+        }
+        "IDENTIFY" | "LOGIN" => {
+            let a = parts.next().unwrap_or("");
+            let b = parts.next();
+            let (acct, pass) = match b {
+                Some(p) => (a.to_string(), p),
+                None => (stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default(), a),
+            };
+            if pass.is_empty() {
+                nickserv_notice(stg, id, "Syntax: IDENTIFY [account] <password>");
+                return;
+            }
+            if stg.accounts.verify(&acct, pass) {
+                let disp = stg.accounts.display_name(&acct).unwrap_or(acct);
+                if let Some(u) = stg.find_by_id_mut(id) {
+                    u.account = Some(disp.clone());
+                }
+                nickserv_notice(stg, id, &format!("You are now identified for \x02{}\x02.", disp));
+                announce_account_change(stg, id, Some(&disp));
+            } else {
+                nickserv_notice(stg, id, "Invalid account or password.");
+            }
+        }
+        "LOGOUT" => {
+            let was = stg.find_by_id(id).and_then(|u| u.account.clone());
+            if let Some(u) = stg.find_by_id_mut(id) {
+                u.account = None;
+            }
+            if was.is_some() {
+                announce_account_change(stg, id, None);
+            }
+            nickserv_notice(stg, id, "You are now logged out.");
+        }
+        "" | "HELP" => {
+            nickserv_notice(stg, id, "NickServ: REGISTER <password> | IDENTIFY [account] <password> | LOGOUT");
+        }
+        _ => nickserv_notice(stg, id, "Unknown command. Try HELP."),
+    }
+}
+
+/// Send one NickServ NOTICE to a connection.
+fn nickserv_notice(stg: &mut ServerState, id: usize, text: &str) {
+    let srv = stg.name.clone();
+    let nick = sender_nick(stg, id);
+    let line = proto::line(
+        &format!(":NickServ!services@{}", srv),
+        "NOTICE",
+        &format!("{} :{}", nick, text),
+    );
+    deliver(stg, id, &line);
+}
+
+/// account-notify (IRCv3): tell shared-channel peers who negotiated the cap that
+/// this connection logged in (`ACCOUNT <name>`) or out (`ACCOUNT *`).
+fn announce_account_change(stg: &mut ServerState, id: usize, account: Option<&str>) {
+    let prefix = match stg.find_by_id(id) {
+        Some(u) => u.prefix(),
+        None => return,
+    };
+    let line = proto::line(&prefix, "ACCOUNT", account.unwrap_or("*"));
+    let recipients = shared_channel_peers(stg, id, |u| u.caps.account_notify);
+    for rid in recipients {
+        deliver(stg, rid, &line);
+    }
+}
+
+/// Distinct connection ids sharing at least one channel with `id` (excluding
+/// `id` itself) whose capability predicate holds. Used by the notify caps.
+fn shared_channel_peers<F: Fn(&crate::state::Cx) -> bool>(
+    stg: &ServerState,
+    id: usize,
+    pred: F,
+) -> Vec<usize> {
+    let chans: Vec<String> = stg
+        .find_by_id(id)
+        .map(|u| u.chans.iter().cloned().collect())
+        .unwrap_or_default();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for ck in &chans {
+        if let Some(c) = stg.chan(ck) {
+            for mid in c.members.iter().copied() {
+                if mid == id || !seen.insert(mid) {
+                    continue;
+                }
+                if stg.find_by_id(mid).map(&pred).unwrap_or(false) {
+                    out.push(mid);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Missing-recipient and missing-text replies (RFC numerics-411/412, PRIV paths only).
@@ -1405,6 +1597,13 @@ fn dollar_mask_now(token: &str) -> bool {
 fn deliver_one_recipient(stg: &mut ServerState, id: usize, raw: &str, text: &str, is_priv: bool) {
     if dollar_mask_now(raw) {
         deliver_to_server_mask(stg, id, raw, text, is_priv); // $ server-name mask (single-server deployment)
+        return;
+    }
+
+    // Services pseudo-user: NickServ handles account registration / login. It is
+    // not a real connection, so it is answered here rather than relayed.
+    if norm_nick(raw) == "nickserv" {
+        handle_nickserv(stg, id, text, is_priv);
         return;
     }
 
@@ -1451,7 +1650,7 @@ fn relay_user_message(
         &format!("{} :{}", raw[0..].to_string(), text),
 
     );
-    deliver(stg, target_id_now, &line_now);
+    relay_tagged(stg, target_id_now, &line_now);
 
     if is_priv {
         let away_now: Option<String> = stg.find_by_id(target_id_now).and_then(|u| u.away.clone());
@@ -1507,7 +1706,7 @@ fn deliver_to_channel(stg: &mut ServerState, id: usize, raw: &str, text: &str, i
 
     for mid in members_now {
         if mid == id { continue; } // originator never receives its own relay (no echo-message capability is advertised)
-        deliver(stg, mid, &proto::line(&prefix_now, verb_now, &format!("{} :{}", raw[0..].to_string(), text)));
+        relay_tagged(stg, mid, &proto::line(&prefix_now, verb_now, &format!("{} :{}", raw[0..].to_string(), text)));
     }
 }
 
@@ -1675,6 +1874,19 @@ fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) {
 
             numeric(stg, id, "311", &[&nick_now, &user_now, &host_now, "*", &format!(":{}", stg.name)]);
 
+            // RPL_WHOISACCOUNT (330): the services account the target is logged in to.
+            if let Some(acct_now) = stg.find_by_id(tid).and_then(|t| t.account.clone()) {
+                numeric(stg, id, "330", &[&nick_now, &acct_now, "is logged in as"]);
+            }
+
+            // RPL_WHOISACTUALLY (338): operators (and self) may see the real host
+            // behind the cloak; ordinary users never do.
+            let req_is_oper = stg.find_by_id(id).map(|u| u.oper).unwrap_or(false);
+            if req_is_oper || id == tid {
+                if let Some(real_now) = stg.find_by_id(tid).map(|t| t.real_host.clone()) {
+                    numeric(stg, id, "338", &[&nick_now, &format!("{}@{}", user_now, real_now), "is actually using host"]);
+                }
+            }
 
             if oper_now {
                 numeric(stg, id, "313", &[&format!("{} is operating as an IRC Operator", nick_now)]);
@@ -1887,30 +2099,190 @@ fn who_marker_for(stg: &ServerState, req_id: usize, target: &crate::state::Cx) -
 
 
 
-/// Misc-command replies under locked conventions (CAP zero-caps; WALLOPS/SUMMON/USERS disabled-shapes).
+/// IRCv3 capabilities this server advertises AND honors. Never advertise a cap
+/// that is not actually implemented.
+const SUPPORTED_CAPS: &[&str] = &[
+    "sasl",
+    "server-time",
+    "away-notify",
+    "extended-join",
+    "account-notify",
+    "multi-prefix",
+];
+
+fn cap_token(c: &str, with_values: bool) -> String {
+    if with_values && c == "sasl" {
+        "sasl=PLAIN".to_string()
+    } else {
+        c.to_string()
+    }
+}
+
+fn set_cap(caps: &mut crate::state::Caps, name: &str, on: bool) {
+    match name {
+        "server-time" => caps.server_time = on,
+        "away-notify" => caps.away_notify = on,
+        "extended-join" => caps.extended_join = on,
+        "account-notify" => caps.account_notify = on,
+        "multi-prefix" => caps.multi_prefix = on,
+        "sasl" => caps.sasl = on,
+        _ => {}
+    }
+}
+
+/// CAP negotiation (IRCv3 capability-negotiation-3.2). LS advertises the honored
+/// set (with `sasl=PLAIN` under `CAP LS 302`); REQ is all-or-nothing ACK/NAK;
+/// LIST reports the enabled set; END closes negotiation and releases the welcome
+/// burst withheld during the exchange.
+fn handle_cap(stg: &mut ServerState, id: usize, cmd: &Command) {
+    let sub = cmd.params.first().map(|s| s.to_uppercase()).unwrap_or_default();
+    match sub.as_str() {
+        "LS" => {
+            if let Some(u) = stg.find_by_id_mut(id) {
+                u.cap_negotiating = true;
+            }
+            let with_values = cmd.params.get(1).map(|v| v == "302").unwrap_or(false);
+            let list = SUPPORTED_CAPS
+                .iter()
+                .map(|c| cap_token(c, with_values))
+                .collect::<Vec<String>>()
+                .join(" ");
+            deliver(stg, id, &proto::line(&stg.prefix(), "CAP", &format!("* LS :{}", list)));
+        }
+        "LIST" => {
+            let enabled = stg.find_by_id(id).map(|u| u.caps.enabled_list()).unwrap_or_default();
+            deliver(stg, id, &proto::line(&stg.prefix(), "CAP", &format!("* LIST :{}", enabled)));
+        }
+        "REQ" => {
+            let req = cmd.params.get(1).map(|s| s.trim_start_matches(':').trim()).unwrap_or("");
+            let tokens: Vec<&str> = req.split_whitespace().collect();
+            let all_ok = !tokens.is_empty()
+                && tokens.iter().all(|t| SUPPORTED_CAPS.contains(&t.trim_start_matches('-')));
+            if let Some(u) = stg.find_by_id_mut(id) {
+                u.cap_negotiating = true;
+            }
+            if all_ok {
+                for t in &tokens {
+                    let enable = !t.starts_with('-');
+                    let name = t.trim_start_matches('-');
+                    if let Some(u) = stg.find_by_id_mut(id) {
+                        set_cap(&mut u.caps, name, enable);
+                    }
+                }
+                deliver(stg, id, &proto::line(&stg.prefix(), "CAP", &format!("* ACK :{}", req)));
+            } else {
+                deliver(stg, id, &proto::line(&stg.prefix(), "CAP", &format!("* NAK :{}", req)));
+            }
+        }
+        "END" => {
+            if let Some(u) = stg.find_by_id_mut(id) {
+                u.cap_negotiating = false;
+            }
+            flush_cap_gated_welcome(stg, id);
+        }
+        _ => {} // unknown subcommand: silently ignored, never an error
+    }
+}
+
+/// SASL PLAIN (IRCv3 sasl-3.1). The exchange is: client `AUTHENTICATE PLAIN`,
+/// server `AUTHENTICATE +`, client base64(authzid \0 authcid \0 passwd), then
+/// 900 (RPL_LOGGEDIN) + 903 (RPL_SASLSUCCESS) on success or 904 on failure.
+fn handle_authenticate(stg: &mut ServerState, id: usize, cmd: &Command) {
+    // SASL is only meaningful when the client negotiated the cap and is not yet
+    // registered (RFC: authentication happens during registration).
+    let (has_cap, registered) = stg
+        .find_by_id(id)
+        .map(|u| (u.caps.sasl, u.registered))
+        .unwrap_or((false, false));
+    if registered {
+        numeric(stg, id, "907", &["You have already authenticated using SASL"]);
+        return;
+    }
+    if !has_cap {
+        numeric(stg, id, "906", &["SASL authentication aborted"]);
+        return;
+    }
+
+    let arg = cmd.params.first().map(String::as_str).unwrap_or("");
+
+    // Abort request.
+    if arg == "*" {
+        if let Some(u) = stg.find_by_id_mut(id) {
+            u.sasl_mech = None;
+        }
+        numeric(stg, id, "906", &["SASL authentication aborted"]);
+        return;
+    }
+
+    // Mechanism selection step.
+    let pending_mech = stg.find_by_id(id).and_then(|u| u.sasl_mech.clone());
+    if pending_mech.is_none() {
+        if arg.eq_ignore_ascii_case("PLAIN") {
+            if let Some(u) = stg.find_by_id_mut(id) {
+                u.sasl_mech = Some("PLAIN".to_string());
+            }
+            deliver(stg, id, &proto::line("", "AUTHENTICATE", "+"));
+        } else {
+            // Only PLAIN is offered; steer the client to it.
+            numeric(stg, id, "908", &["PLAIN", "are the available SASL mechanisms"]);
+            numeric(stg, id, "904", &["SASL authentication failed"]);
+        }
+        return;
+    }
+
+    // Credential step: `arg` is the base64 PLAIN payload.
+    let decoded = match crate::crypto::base64_decode(arg) {
+        Some(d) => d,
+        None => {
+            reset_sasl(stg, id);
+            numeric(stg, id, "904", &["SASL authentication failed"]);
+            return;
+        }
+    };
+    // PLAIN = authzid \0 authcid \0 passwd
+    let parts: Vec<&[u8]> = decoded.split(|&b| b == 0).collect();
+    if parts.len() != 3 {
+        reset_sasl(stg, id);
+        numeric(stg, id, "904", &["SASL authentication failed"]);
+        return;
+    }
+    let authcid = String::from_utf8_lossy(parts[1]).to_string();
+    let passwd = String::from_utf8_lossy(parts[2]).to_string();
+
+    if stg.accounts.verify(&authcid, &passwd) {
+        let disp = stg.accounts.display_name(&authcid).unwrap_or(authcid);
+        if let Some(u) = stg.find_by_id_mut(id) {
+            u.account = Some(disp.clone());
+            u.sasl_mech = None;
+        }
+        // 900 RPL_LOGGEDIN wants a nick!user@host; pre-registration these may be
+        // partially known, so fall back to '*' fields where absent.
+        let ident = stg
+            .find_by_id(id)
+            .map(|u| {
+                let n = if u.nick.is_empty() { "*" } else { &u.nick };
+                let us = if u.user.is_empty() { "*" } else { &u.user };
+                format!("{}!{}@{}", n, us, u.host)
+            })
+            .unwrap_or_else(|| "*!*@*".into());
+        numeric(stg, id, "900", &[&ident, &disp, &format!(":You are now logged in as {}", disp)]);
+        numeric(stg, id, "903", &["SASL authentication successful"]);
+    } else {
+        reset_sasl(stg, id);
+        numeric(stg, id, "904", &["SASL authentication failed"]);
+    }
+}
+
+fn reset_sasl(stg: &mut ServerState, id: usize) {
+    if let Some(u) = stg.find_by_id_mut(id) {
+        u.sasl_mech = None;
+    }
+}
+
+/// Misc-command replies under locked conventions (PING; WALLOPS/SUMMON/USERS disabled-shapes).
 fn handle_misc_stub(stg: &mut ServerState, id: usize, cmd: &Command) {
 
     match cmd.name.as_str() {
-
-        "CAP" => match cmd.params.first().map(String::as_str).unwrap_or("") {
-            "LS" | "LIST" => {
-                if let Some(u) = stg.find_by_id_mut(id) { u.cap_negotiating = true; } // round-4: negotiation open, the welcome burst is withheld until CAP END
-                deliver(stg, id, &proto::line(&stg.prefix(), "CAP", if cmd.params.first().is_some_and(|p| p == "LS") { "* LS :" } else { "* LIST :" })); // zero capabilities advertised; empty list after the trailing marker
-            }
-            "REQ" => match cmd.params.get(1) {
-                Some(caps_now) if !caps_now.is_empty() => {
-                    if let Some(u) = stg.find_by_id_mut(id) { u.cap_negotiating = true; } // round-4: negotiation open, the welcome burst is withheld until CAP END
-                    deliver(stg, id, &proto::line(&stg.prefix(), "CAP", &format!("* NAK :{}", caps_now.trim_start_matches(':')))); // nothing advertised: requested capabilities echoed in the NAK trailing text
-                }
-                _ => { if let Some(u) = stg.find_by_id_mut(id) { u.cap_negotiating = true; } }
-            },
-            "END" => {
-                if let Some(u) = stg.find_by_id_mut(id) { u.cap_negotiating = false; } // negotiation closed: registration replies may flow again
-                flush_cap_gated_welcome(stg, id); // delivers the parked welcome burst when one is owed (round-4)
-            }
-            _ => {} // any other subcommand: no reply, never an error
-        }
-
 
         "PING" => {
 
