@@ -179,6 +179,28 @@ fn notice_and_ctcp_relay_between_users() {
 }
 
 #[test]
+fn mode_op_broadcast_has_flag_and_target() {
+    let addr = start_server();
+    let mut a = client(&addr);
+    register(&mut a, "opper");
+    send(&mut a, "JOIN #ops");
+    let _ = drain_until(&mut a, "JOIN", 3);
+
+    let mut b = client(&addr);
+    register(&mut b, "victim");
+    send(&mut b, "JOIN #ops");
+    let _ = drain_until(&mut b, "JOIN", 3);
+    let _ = drain_until(&mut a, "victim", 2); // a observes b's join
+
+    send(&mut a, "MODE #ops +o victim");
+    let m = drain_until(&mut b, "MODE #ops", 3);
+    let line = m.lines().find(|l| l.contains("MODE #ops")).expect("no MODE broadcast");
+    // Correct shape: "<chan> +o <nick>" — flag joined to sign, target present.
+    assert!(line.contains("MODE #ops +o victim"), "malformed op MODE: {line:?}");
+    assert!(!line.contains("+ o"), "stray space between sign and flag: {line:?}");
+}
+
+#[test]
 fn chanserv_register_and_founder_autoop() {
     let addr = start_server();
     let mut a = client(&addr);

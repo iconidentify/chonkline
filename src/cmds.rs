@@ -1102,8 +1102,13 @@ fn perform_priv_change(
     }
 
     let display = stg.chan(norm).map(|c| c.display.clone()).unwrap_or_else(|| norm.to_string());
-    let kicker = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
-    Some(proto::line(&kicker, "MODE", &format!("{} {} {}", display, if on { "+" } else { "-" }, pflag)))
+    let target_display = stg.find_by_id(target_id).map(|u| u.nick.clone()).unwrap_or_else(|| target_nick.to_string());
+    let setter = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
+    // Correct membership-mode shape: "<chan> +o <nick>" — the sign and flag are a
+    // single token and the affected nick is the mode argument. (Previously emitted
+    // "<chan> + o" with a stray space and no target, which broke mode tracking in
+    // clients and bots such as eggdrop.)
+    Some(proto::line(&setter, "MODE", &format!("{} {}{} {}", display, if on { "+" } else { "-" }, pflag, target_display)))
 }
 
 /// Numeric-501 delivery for a malformed or unrecognized user-mode flag.
