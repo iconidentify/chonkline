@@ -513,11 +513,6 @@ const MOTD: &[&str] = &[
     "        /msg ChanServ REGISTER #channel",
     "        /msg ChanServ INFO #channel",
     "",
-    "  Registered founders are re-opped automatically, and a",
-    "  registered channel keeps its topic across restarts.",
-    "",
-    "  Play nice, and enjoy the server.",
-    "",
 ];
 
 /// The registration reply sequence (RFC 8.5): an unambiguous server identity,
