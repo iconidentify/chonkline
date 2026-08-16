@@ -55,8 +55,8 @@ spec:
             runAsGroup: 65532
             capabilities:
               drop: ["ALL"]
-        # TLS termination for 6697: decrypts with the cert-manager cert and
-        # forwards plaintext IRC to the daemon on localhost:6667.
+        # TLS on 6697: terminates TLS with the cert-manager cert, forwards plaintext
+        # to the daemon on 6667. (ingress does not send PROXY protocol to this backend.)
         - name: tls
           image: ghostunnel/ghostunnel:v1.8.2
           args:
