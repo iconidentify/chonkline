@@ -881,3 +881,79 @@ fn scenario_ghost_reap() {
         "within the reduced ping/eviction window the abandoned nick `zed` must become reusable for a fresh registration"
     );
 }
+
+/// The acting client must be echoed its own membership lines (RFC 3.2.1): its own
+/// JOIN precedes the topic + NAMES burst on the way in, and its own PART comes on
+/// the way out. WeeChat/irssi open the channel buffer on exactly these self-echoes.
+#[test]
+fn scenario_self_echo_membership() {
+    use std::io::Read as _;
+    let addr_now: String = start_server();
+
+    let mut sock_now: TcpStream = connect_timed(&addr_now);
+    send_line(&mut sock_now, "NICK selfer");
+    std::thread::sleep(Duration::from_millis(50));
+    send_line(&mut sock_now, "USER selfe 0 * :Selfer");
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut wire_now: Vec<u8> = Vec::new();
+
+    fn drain(sock: &mut TcpStream, sink: &mut Vec<u8>, rounds: usize) {
+        for _ in 0..rounds {
+            let mut chunk = [0u8; 4096];
+            match std::io::Read::read(sock, &mut chunk) {
+                Ok(n) if n > 0 => sink.extend_from_slice(&chunk[..n]),
+                _ => std::thread::sleep(Duration::from_millis(25)),
+            }
+        }
+    }
+
+    // Read until the registration welcome has landed, so the JOIN burst is isolated.
+    for _ in 0..128 {
+        drain(&mut sock_now, &mut wire_now, 4);
+        if String::from_utf8_lossy(&wire_now).contains(" 001 ") { break; }
+    }
+    // Drain the rest of the welcome burst before sending JOIN.
+    drain(&mut sock_now, &mut wire_now, 8);
+
+    send_line(&mut sock_now, "JOIN #solo");
+    // Wait for the full inbound join burst (366 closes the NAMES list).
+    let mut got_end = false;
+    for _ in 0..128 {
+        drain(&mut sock_now, &mut wire_now, 4);
+        if String::from_utf8_lossy(&wire_now).contains(" 366 ") { got_end = true; break; }
+    }
+    assert!(got_end, "joiner should receive the closing NAMES burst");
+
+    send_line(&mut sock_now, "PART #solo");
+    let mut got_part = false;
+    for _ in 0..128 {
+        drain(&mut sock_now, &mut wire_now, 4);
+        if String::from_utf8_lossy(&wire_now).contains(" PART #solo") { got_part = true; break; }
+    }
+    assert!(got_part, "parter should receive its own PART line");
+
+    let text_now = String::from_utf8_lossy(&wire_now).to_string();
+    let lines_now: Vec<&str> = text_now.lines().collect();
+
+    let idx_join = lines_now.iter().position(|l| l.contains(" JOIN #solo"));
+    let idx_topic = lines_now.iter().position(|l| l.contains(" 331 ") || l.contains(" 332 "));
+    let idx_names = lines_now.iter().position(|l| l.contains(" 353 "));
+    let idx_end = lines_now.iter().position(|l| l.contains(" 366 "));
+    let idx_part = lines_now.iter().position(|l| l.contains(" PART #solo"));
+
+    assert!(idx_join.is_some(), "self-echoed JOIN missing: {:?}", text_now);
+    assert!(idx_topic.is_some(), "topic reply (331/332) missing: {:?}", text_now);
+    assert!(idx_names.is_some(), "NAMES listing (353) missing: {:?}", text_now);
+    assert!(idx_end.is_some(), "end of NAMES (366) missing: {:?}", text_now);
+    assert!(idx_part.is_some(), "self-echoed PART missing: {:?}", text_now);
+
+    // RFC order: own JOIN, then topic, then 353, then 366, then own PART.
+    let (ij, it, in_, ie, ip) = (idx_join.unwrap(), idx_topic.unwrap(), idx_names.unwrap(), idx_end.unwrap(), idx_part.unwrap());
+    assert!(ij < it, "own JOIN must precede the topic reply");
+    assert!(it < in_, "topic reply must precede the NAMES listing");
+    assert!(in_ < ie, "NAMES listing must precede the end-of-NAMES");
+    assert!(ie < ip, "end-of-NAMES must precede the own PART");
+
+    drop(sock_now);
+}

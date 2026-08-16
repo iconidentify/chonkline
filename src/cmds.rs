@@ -649,10 +649,17 @@ fn join_existing(stg: &mut ServerState, id: usize, norm: &str, key: &str) {
 
 /// Topic plus NAMES-style replies owed to a user who just joined (RFC 4.2.1 /
 /// numerics-353/366 shapes). Member listings carry op/voice markers per the RFC.
+/// The joiner also receives its own `JOIN` membership line (RFC 3.2.1) before the
+/// topic and NAMES burst, so clients that open a channel buffer on self-join work.
 fn joiner_replies(stg: &mut ServerState, id: usize, display: &str) {
+    let sender_prefix = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
+    deliver(stg, id, &proto::line(&sender_prefix, "JOIN", &display)); // RFC 3.2.1 self-echo
+
     let topic_now = stg.chan(&display.to_lowercase()).map(|c| c.topic.clone()).unwrap_or_default();
 
-    if !topic_now.is_empty() {
+    if topic_now.is_empty() {
+        deliver(stg, id, &proto::line(&stg.prefix(), "331", &format!("{} :No topic is set", display))); // RFC numeric 331
+    } else {
         deliver(
             stg,
             id,
@@ -737,6 +744,10 @@ fn handle_part(stg: &mut ServerState, id: usize, cmd: &Command) {
         if let Some(c) = stg.chan_mut(&norm) {
             c.eject(id);
         }
+
+        // RFC 3.2.1: the parting user must receive its own PART line (the
+        // self-echo suppression that keeps channel messages quiet is wrong here).
+        deliver(stg, id, &proto::line(&sender_prefix, "PART", &part_tail(raw, reason)));
 
         let members: Vec<usize> = stg.chan(&norm).map(|c| c.members.iter().copied().collect()).unwrap_or_default();
         for mid in members {
