@@ -12,5 +12,8 @@ spec:
     - name: irc
       port: 6667
       targetPort: irc
-  # TLS (6697) and the web/HTTP interface (8080) are intentionally retired in
-  # the Rust rewrite. Non-TLS 6667 only for the initial launch.
+    - name: irc-tls
+      port: 6697
+      targetPort: irc-tls
+  # 6667 = plaintext IRC (rustircd). 6697 = TLS, terminated by the ghostunnel
+  # sidecar using the cert-manager chonkline-tls cert, forwarded to 6667.

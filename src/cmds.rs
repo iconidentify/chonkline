@@ -932,6 +932,17 @@ fn mode_channel(stg: &mut ServerState, id: usize, raw: &str, terms_in: &[String]
             }
         }
 
+        // #8: broadcast the applied channel-mode change to every member. +o/+v
+        // already broadcast via perform_priv_change; this covers the simple/key/
+        // limit/ban modes that were previously applied silently.
+        let has_ov = term[1..].chars().any(|c| c == 'o' || c == 'v');
+        if !has_ov {
+            let end = (i + 1 + extra_consumed).min(terms.len());
+            let args = terms[i + 1..end].join(" ");
+            let body = if args.is_empty() { format!("{} {}", raw, term) } else { format!("{} {} {}", raw, term, args) };
+            member_changes.push(proto::line(&sender_prefix, "MODE", &body));
+        }
+
         i += 1 + extra_consumed; // advance past this term and every token it consumed
     }
 
