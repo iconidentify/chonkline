@@ -481,7 +481,7 @@ pub struct ServerState {
     pub chanreg: crate::channels::ChannelRegistry,
 
     // ---- lifetime statistics (surfaced by the web property) ----
-    pub total_connections: u64,  // accepted connections since start
+    pub total_connections: u64,  // registered client sessions since start (excludes health checks)
     pub peak_users: usize,       // high-water mark of concurrent registered users
     pub messages_relayed: u64,   // PRIVMSG/NOTICE lines relayed
 
@@ -529,7 +529,8 @@ impl ServerState {
         self.started_at.elapsed().as_secs()
     }
 
-    /// Record an accepted connection (lifetime counter).
+    /// Record a fully-registered client session (lifetime counter). Not called
+    /// for bare TCP health-check connects, keeping the figure meaningful.
     pub fn note_connection(&mut self) {
         self.total_connections = self.total_connections.saturating_add(1);
     }
@@ -627,7 +628,6 @@ impl ServerState {
         };
         let _ = &mut cx; // fields complete above; insert verbatim
         self.unreg.insert(id, cx);
-        self.note_connection();
     }
 
     /// Find where a connection currently lives (unregistered record or the
@@ -673,6 +673,9 @@ impl ServerState {
         cx.registered = true;
         self.users.insert(inserted_key, cx);
         self.peak_users = self.peak_users.max(self.users.len());
+        // Count only fully-registered client sessions, so load-balancer / kube
+        // tcp health checks (which connect without registering) are excluded.
+        self.note_connection();
         self.users.get(&lookup_key)
     }
 

@@ -11,25 +11,33 @@
   a{color:var(--accent);text-decoration:none;} a:hover{text-decoration:underline;}
   .wrap{max-width:960px;margin:0 auto;padding:28px 18px 64px;}
   pre.art{color:var(--accent);font-size:12px;line-height:1.1;margin:0;overflow-x:auto;text-shadow:0 0 8px rgba(124,252,124,.25);}
-  .tag{color:var(--dim);margin:6px 0 26px;}
+  .tag{color:var(--dim);margin:6px 0 6px;}
   .tag b{color:var(--amber);}
-  h2{font-size:14px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--line);padding-bottom:6px;margin:34px 0 16px;}
+  .links{color:var(--dim);margin:0 0 26px;font-size:13px;}
+  h2{font-size:14px;letter-spacing:2px;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--line);padding-bottom:6px;margin:34px 0 16px;display:flex;justify-content:space-between;align-items:baseline;}
+  h2 .ctl{font-size:11px;letter-spacing:1px;}
+  h2 .ctl a{cursor:pointer;}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;}
   .stat{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;}
   .stat .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;}
   .stat .v{color:var(--fg);font-size:22px;margin-top:4px;font-variant-numeric:tabular-nums;}
-  .stat .v small{font-size:12px;color:var(--dim);}
-  .rel{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:14px 16px;margin-bottom:14px;}
-  .rel .h{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;}
+  .rel{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;margin-bottom:12px;overflow:hidden;}
+  .rel .h{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;padding:12px 16px;cursor:pointer;user-select:none;}
+  .rel .h:hover{background:rgba(124,252,124,.05);}
   .rel .title{color:var(--amber);font-weight:bold;}
+  .rel .title .caret{color:var(--accent);display:inline-block;width:14px;transition:transform .15s;}
+  .rel.open .title .caret{transform:rotate(90deg);}
   .rel .date{color:var(--dim);font-size:12px;}
-  .rel .summary{color:var(--fg);margin:8px 0 0;}
+  .rel .body{display:none;padding:0 16px 14px;}
+  .rel.open .body{display:block;}
+  .rel .summary{color:var(--fg);margin:2px 0 0;}
   .rel ul{margin:10px 0 0;padding-left:18px;} .rel li{margin:3px 0;color:var(--fg);}
   .rel li::marker{color:var(--accent);}
   .connect{background:var(--panel);border:1px dashed var(--line);border-radius:8px;padding:12px 16px;color:var(--dim);}
   .connect code{color:var(--accent);}
   .muted{color:var(--dim);}
   footer{margin-top:40px;color:var(--dim);font-size:12px;text-align:center;}
+  footer a{color:var(--dim);text-decoration:underline;}
   .pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);animation:p 2s infinite;vertical-align:middle;margin-right:6px;}
   @keyframes p{0%,100%{opacity:1}50%{opacity:.35}}
 </style>
@@ -42,6 +50,7 @@
 | (__| | | | (_) | | | |   <| | | | | |  __/
  \___|_| |_|\___/|_| |_|_|\_\_|_|_| |_|\___|</pre>
   <div class="tag"><span class="pulse"></span><b id="srv">irc.chonkbase.net</b> &mdash; a small, fast IRC server written in Rust <span class="muted">(<span id="ver">beta</span>)</span></div>
+  <div class="links">source: <a href="https://github.com/iconidentify/chonkline" target="_blank" rel="noopener">github.com/iconidentify/chonkline</a> &middot; GPL-3.0-or-later</div>
 
   <div class="connect">
     connect: <code>/server irc.chonkbase.net 6697</code> (TLS) &nbsp;|&nbsp; <code>6667</code> plaintext<br>
@@ -51,10 +60,13 @@
   <h2>Live stats</h2>
   <div class="grid" id="stats"><div class="muted">loading&hellip;</div></div>
 
-  <h2>Release notes</h2>
+  <h2>Release notes <span class="ctl"><a id="expand">expand all</a> &middot; <a id="collapse">collapse all</a></span></h2>
   <div id="releases"><div class="muted">loading&hellip;</div></div>
 
-  <footer>served by the chonkline daemon &middot; stats refresh every 5s &middot; release notes summarized by a self-hosted LLM</footer>
+  <footer>
+    served by the chonkline daemon &middot; stats refresh every 5s &middot; release notes summarized by a self-hosted LLM<br>
+    <a href="https://github.com/iconidentify/chonkline" target="_blank" rel="noopener">source on GitHub (GPL-3.0)</a>
+  </footer>
 </div>
 
 <script>
@@ -80,7 +92,7 @@ async function loadStats(){
       ["operators",num(s.operators)],
       ["accounts",num(s.registered_accounts)],
       ["reg. channels",num(s.registered_channels)],
-      ["connections",num(s.total_connections)],
+      ["sessions",num(s.total_connections)],
       ["messages relayed",num(s.messages_relayed)],
     ];
     document.getElementById("stats").innerHTML=cards.map(function(c){
@@ -89,20 +101,27 @@ async function loadStats(){
   }catch(e){ document.getElementById("stats").innerHTML='<div class="muted">stats unavailable</div>'; }
 }
 function esc(t){const d=document.createElement("div"); d.textContent=t==null?"":String(t); return d.innerHTML;}
+function setAll(open){document.querySelectorAll(".rel").forEach(function(el){el.classList.toggle("open",open);});}
 async function loadReleases(){
   try{
     const r=await fetch("/api/releases",{cache:"no-store"}); const data=await r.json();
     const rels=(data&&data.releases)||[];
     if(!rels.length){ document.getElementById("releases").innerHTML='<div class="muted">no release notes yet</div>'; return; }
-    document.getElementById("releases").innerHTML=rels.map(function(v){
+    document.getElementById("releases").innerHTML=rels.map(function(v,i){
       const hi=(v.highlights||[]).map(function(h){return "<li>"+esc(h)+"</li>";}).join("");
-      return '<div class="rel"><div class="h"><span class="title">'+esc(v.title||v.version||"update")+
-        '</span><span class="date">'+esc(v.date||"")+'</span></div>'+
-        (v.summary?'<p class="summary">'+esc(v.summary)+'</p>':'')+
-        (hi?'<ul>'+hi+'</ul>':'')+'</div>';
+      return '<div class="rel'+(i===0?' open':'')+'">'+
+        '<div class="h" onclick="this.parentNode.classList.toggle(\'open\')">'+
+          '<span class="title"><span class="caret">&#9654;</span> '+esc(v.title||v.version||"update")+'</span>'+
+          '<span class="date">'+esc(v.date||"")+'</span></div>'+
+        '<div class="body">'+
+          (v.summary?'<p class="summary">'+esc(v.summary)+'</p>':'')+
+          (hi?'<ul>'+hi+'</ul>':'')+
+        '</div></div>';
     }).join("");
   }catch(e){ document.getElementById("releases").innerHTML='<div class="muted">release notes unavailable</div>'; }
 }
+document.getElementById("expand").addEventListener("click",function(){setAll(true);});
+document.getElementById("collapse").addEventListener("click",function(){setAll(false);});
 loadStats(); loadReleases();
 setInterval(loadStats,5000);
 </script>
