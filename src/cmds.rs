@@ -519,6 +519,9 @@ fn welcome_sequence(stg: &mut ServerState, id: usize, _nick_snapshot_at_completi
     }
     numeric(stg, id, "255", &[&format!("I have {} clients and 0 servers", users)]);
 
+    // RPL_MOTDSTART (375) MUST precede the 372 lines: strict clients (BitchX)
+    // allocate their MOTD buffer here and crash on 372 without it.
+    numeric(stg, id, "375", &[&format!("- {} Message of the Day -", stg.name)]);
     for line in MOTD {
         let text: String = line.chars().take(80).collect();
         numeric(stg, id, "372", &[&format!("- {}", text)]);
