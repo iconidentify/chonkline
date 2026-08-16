@@ -67,12 +67,15 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 /// the server genuinely honors are ever advertised or set here.
 #[derive(Debug, Clone, Default)]
 pub struct Caps {
-    pub server_time: bool,    // message @time= tags (RFC: ircv3 server-time)
-    pub away_notify: bool,    // AWAY broadcasts to shared-channel peers
-    pub extended_join: bool,  // JOIN carries account + realname
-    pub account_notify: bool, // ACCOUNT messages on login/logout
-    pub multi_prefix: bool,   // all membership prefixes in NAMES/WHO
-    pub sasl: bool,           // SASL authentication was requested
+    pub server_time: bool,        // message @time= tags (RFC: ircv3 server-time)
+    pub away_notify: bool,        // AWAY broadcasts to shared-channel peers
+    pub extended_join: bool,      // JOIN carries account + realname
+    pub account_notify: bool,     // ACCOUNT messages on login/logout
+    pub multi_prefix: bool,       // all membership prefixes in NAMES/WHO
+    pub userhost_in_names: bool,  // NAMES lists nick!user@host
+    pub chghost: bool,            // CHGHOST notifications on host change
+    pub cap_notify: bool,         // CAP NEW/DEL notifications
+    pub sasl: bool,               // SASL authentication was requested
 }
 
 impl Caps {
@@ -84,6 +87,9 @@ impl Caps {
         if self.extended_join { v.push("extended-join"); }
         if self.account_notify { v.push("account-notify"); }
         if self.multi_prefix { v.push("multi-prefix"); }
+        if self.userhost_in_names { v.push("userhost-in-names"); }
+        if self.chghost { v.push("chghost"); }
+        if self.cap_notify { v.push("cap-notify"); }
         if self.sasl { v.push("sasl"); }
         v.join(" ")
     }
@@ -199,6 +205,9 @@ impl Cx {
 pub struct Chn {
     pub display: String, // original case ("#Foo")
     pub topic: String,
+    pub topic_setter: String, // nick that last set the topic (for RPL_TOPICWHOTIME)
+    pub topic_time: u64,      // unix seconds when the topic was set
+    pub created_at: u64,      // unix seconds the channel was created (RPL_CREATIONTIME)
     invite_only: bool,   // +i (invite-only)
     nomsg: bool,         // +n (no external messages)
     private: bool,       // +p
@@ -208,6 +217,8 @@ pub struct Chn {
     pub key_limit: i32,  // +l; 0 = unlimited
     chan_key: Option<String>, // +k
     bans: Vec<String>,   // +b masks (lowercased)
+    excepts: Vec<String>, // +e ban-exception masks (lowercased)
+    invex: Vec<String>,  // +I invite-exception masks (lowercased)
     invites: BTreeSet<usize>,
     pub ops: BTreeSet<usize>,    // connection ids with operator privileges here
     pub voices: BTreeSet<usize>,
@@ -219,6 +230,12 @@ impl Chn {
         Chn {
             display: display.to_string(),
             topic: String::new(),
+            topic_setter: String::new(),
+            topic_time: 0,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             invite_only: false,
             nomsg: false,
             private: false,
@@ -228,6 +245,8 @@ impl Chn {
             key_limit: 0,
             chan_key: None,
             bans: Vec::new(),
+            excepts: Vec::new(),
+            invex: Vec::new(),
             invites: BTreeSet::new(),
             ops: BTreeSet::new(),
             voices: BTreeSet::new(),
@@ -323,6 +342,37 @@ impl Chn {
 
     pub fn ban_mask_list(&self) -> &[String] { &self.bans }
 
+    // +e ban exceptions and +I invite exceptions: same list-mode shape as +b.
+    pub(crate) fn add_except(&mut self, mask: &str) {
+        let m = mask.to_lowercase();
+        if !self.excepts.contains(&m) { self.excepts.push(m); }
+    }
+    pub(crate) fn remove_except(&mut self, mask: &str) -> bool {
+        let before = self.excepts.len();
+        self.excepts.retain(|b| b != &mask.to_lowercase());
+        self.excepts.len() < before
+    }
+    pub fn except_mask_list(&self) -> &[String] { &self.excepts }
+    /// True when a user's identity matches any +e exception (exempt from bans).
+    pub fn except_match(&self, target: &Cx) -> bool {
+        self.excepts.iter().any(|m| target.matches_ban(m))
+    }
+
+    pub(crate) fn add_invex(&mut self, mask: &str) {
+        let m = mask.to_lowercase();
+        if !self.invex.contains(&m) { self.invex.push(m); }
+    }
+    pub(crate) fn remove_invex(&mut self, mask: &str) -> bool {
+        let before = self.invex.len();
+        self.invex.retain(|b| b != &mask.to_lowercase());
+        self.invex.len() < before
+    }
+    pub fn invex_mask_list(&self) -> &[String] { &self.invex }
+    /// True when a user's identity matches any +I invite exception (bypasses +i).
+    pub fn invex_match(&self, target: &Cx) -> bool {
+        self.invex.iter().any(|m| target.matches_ban(m))
+    }
+
     /// Invite bookkeeping.
     pub(crate) fn invite(&mut self, cx_id: usize) { self.invites.insert(cx_id); }
     pub fn invited(&self, cx_id: usize) -> bool { self.invites.contains(&cx_id) }
@@ -337,7 +387,8 @@ impl Chn {
         if self.secret { s.push('s'); }
         if self.op_topic { s.push('t'); }
         if self.moderated { s.push('m'); }
-        if !self.bans.is_empty() { s.push('b'); }
+        // +b is a list mode (shown via 367/368), not a simple flag; it is not
+        // reported in RPL_CHANNELMODEIS.
         if self.chan_key.is_some() { s.push('k'); }
         if self.key_limit > 0 { s.push('l'); }
         s
@@ -717,6 +768,29 @@ impl ServerState {
     /// Iteration over registered users (shared) for broadcasts.
     pub fn each_user(&self) -> impl Iterator<Item = &Cx> + '_ {
         self.users.values()
+    }
+
+    /// Distinct connection ids that share at least one channel with `id`
+    /// (excluding `id` itself). These are exactly the users who witness a
+    /// user's presence events — QUIT and NICK — per RFC 2812; a user in no
+    /// common channel must not be notified.
+    pub fn channel_peers(&self, id: usize) -> Vec<usize> {
+        let chans: Vec<String> = match self.find_by_id(id) {
+            Some(u) => u.chans.iter().cloned().collect(),
+            None => return Vec::new(),
+        };
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for ck in &chans {
+            if let Some(c) = self.chans.get(ck) {
+                for &mid in &c.members {
+                    if mid != id && seen.insert(mid) {
+                        out.push(mid);
+                    }
+                }
+            }
+        }
+        out
     }
 }
 

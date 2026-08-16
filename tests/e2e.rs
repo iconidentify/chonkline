@@ -535,6 +535,7 @@ fn scenario_wellformed_433() {
         let stop_one = stop_responder.clone();
         let responder = std::thread::spawn(move || {
             let mut sock_one = match std::net::TcpStream::connect(&addr_one) { Ok(s) => s, Err(_) => return };
+            let _ = sock_one.set_read_timeout(Some(std::time::Duration::from_millis(100)));
             send_line(&mut sock_one, "NICK dup");
             std::thread::sleep(std::time::Duration::from_millis(140)); // pacing > shrunk 120ms flood window
             send_line(&mut sock_one, "USER dup 0 * :Dup");
@@ -584,13 +585,13 @@ fn scenario_wellformed_433() {
         // Client-2 collides on the held nick, then recovers under an alternate one; every wait is bounded by construction.
         let mut second_sock = std::net::TcpStream::connect(&addr_now).expect("second connect");
         send_line(&mut second_sock, "NICK dup");
-        let collision_reply: String = drain(&mut second_sock, |t| t.contains(" 433 "), 48); // active-holder response lands within ms nominally
+        let collision_reply: String = drain(&mut second_sock, |t| t.contains(" 433 "), 48);
 
         std::thread::sleep(std::time::Duration::from_millis(140)); // pacing > shrunk 120ms flood window
         send_line(&mut second_sock, "NICK dup2");
         std::thread::sleep(std::time::Duration::from_millis(140));
         send_line(&mut second_sock, "USER du 0 * :Du");
-        let recovery_reply: String = drain(&mut second_sock, |t| t.contains(" 001 "), 48); // synchronous welcome: nominal sub-second
+        let recovery_reply: String = drain(&mut second_sock, |t| t.contains(" 001 "), 48);
 
 
     assert!(

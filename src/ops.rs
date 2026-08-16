@@ -268,11 +268,8 @@ fn cleanup_on_eof(state: &Arc<Mutex<ServerState>>, id: usize) {
     match stg.find_by_id(id).map(|u| (u.registered, u.prefix())) {
         Some((true, pfx)) => {
             let line = proto::line(&pfx, "QUIT", ":Client connection lost");
-            for other in stg.each_user() {
-                if other.id == id {
-                    continue;
-                }
-                let _ = other.tx.send(line.clone());
+            for mid in stg.channel_peers(id) {
+                send_to(&stg, mid, &line); // only channel peers witness the quit
             }
         }
         Some(_) => {} // unregistered: nothing to announce
@@ -402,11 +399,8 @@ fn send_to(stg: &ServerState, id: usize, line: &str) {
 pub(crate) fn announce_loss_and_evict(stg: &mut ServerState, id: usize, reason: &str) {
     if let Some(pfx) = stg.find_by_id(id).map(|u| u.prefix()) {
         let line = proto::line(&pfx, "QUIT", &format!(":{}", reason));
-        for other in stg.each_user() {
-            if other.id == id {
-                continue;
-            }
-            let _ = other.tx.send(line.clone());
+        for mid in stg.channel_peers(id) {
+            send_to(stg, mid, &line); // only channel peers witness the quit
         }
     }
     stg.eject_user(id);
