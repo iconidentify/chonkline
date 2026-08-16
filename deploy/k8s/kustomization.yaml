@@ -9,4 +9,4 @@ resources:
 images:
   - name: chonkline
     newName: ghcr.io/iconidentify/chonkline
-    newTag: 716d100756d70defa73984be9297bc42eb9db014
+    newTag: 0f25fba77263c3569587811f9aa5a918ac8a164b
