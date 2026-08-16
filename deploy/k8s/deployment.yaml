@@ -30,6 +30,9 @@ spec:
             # Registered accounts (SASL / NickServ) persist on the block volume.
             - name: IRC_ACCOUNTS_PATH
               value: "/var/lib/chonkline/accounts.db"
+            # Registered channels (ChanServ) persist alongside accounts.
+            - name: IRC_CHANNELS_PATH
+              value: "/var/lib/chonkline/channels.db"
             # Deterministic host-cloak key; keeps user IPs private and cloaks
             # stable across restarts so channel bans on a cloak keep working.
             - name: IRC_CLOAK_SECRET

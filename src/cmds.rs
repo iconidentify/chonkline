@@ -486,11 +486,38 @@ fn deliver_need_more_params(stg: &mut ServerState, id: usize, command: &str) {
 /// Built-in MOTD served both at registration (RFC 8.5) and on request. Lines are
 /// kept within the 80-character limit of RFC numeric-372 usage.
 const MOTD: &[&str] = &[
-    "Welcome to Chonkline.",
-    "A lightweight IRC server speaking RFC 1459/2812 with the",
-    "common client extensions.",
     "",
-    "This is a beta service; no MOTD file is configured.",
+    "      _                 _    _ _",
+    "  ___| |__   ___  _ __ | | _| (_)_ __   ___",
+    " / __| '_ \\ / _ \\| '_ \\| |/ / | | '_ \\ / _ \\",
+    "| (__| | | | (_) | | | |   <| | | | | |  __/",
+    " \\___|_| |_|\\___/|_| |_|_|\\_\\_|_|_| |_|\\___|",
+    "",
+    "        Chonkbase IRC  --  irc.chonkbase.net  (beta)",
+    "",
+    "  A small, fast IRC server written in Rust. What it offers:",
+    "",
+    "    *  TLS on port 6697, plaintext on 6667",
+    "    *  SASL PLAIN authentication at connect time",
+    "    *  IRCv3: server-time, away-notify, extended-join,",
+    "              account-notify, multi-prefix",
+    "    *  Your address is cloaked -- other users never see your IP",
+    "",
+    "  Services -- claim and protect your identity:",
+    "",
+    "    Nicknames / accounts  (NickServ)",
+    "        /msg NickServ REGISTER <password>",
+    "        /msg NickServ IDENTIFY <password>",
+    "",
+    "    Channels  (ChanServ) -- register one you operate",
+    "        /msg ChanServ REGISTER #channel",
+    "        /msg ChanServ INFO #channel",
+    "",
+    "  Registered founders are re-opped automatically, and a",
+    "  registered channel keeps its topic across restarts.",
+    "",
+    "  Play nice, and enjoy the server.",
+    "",
 ];
 
 /// The registration reply sequence (RFC 8.5): an unambiguous server identity,
@@ -535,9 +562,13 @@ fn welcome_sequence(stg: &mut ServerState, id: usize, _nick_snapshot_at_completi
     // RPL_MOTDSTART (375) MUST precede the 372 lines: strict clients (BitchX)
     // allocate their MOTD buffer here and crash on 372 without it.
     numeric(stg, id, "375", &[&format!("- {} Message of the Day -", stg.name)]);
+    // MOTD lines are emitted verbatim (no forced "- " prefix) so the ASCII art
+    // renders with a clean left edge; empty lines become a single space to keep
+    // a valid trailing parameter.
     for line in MOTD {
-        let text: String = line.chars().take(80).collect();
-        numeric(stg, id, "372", &[&format!("- {}", text)]);
+        let text: String = line.chars().take(120).collect();
+        let shown: &str = if text.is_empty() { " " } else { &text };
+        numeric(stg, id, "372", &[shown]);
     }
     numeric(stg, id, "376", &["End of /MOTD command"]);
 }
@@ -595,12 +626,33 @@ fn handle_join(stg: &mut ServerState, id: usize, cmd: &Command) {
             continue;
         }
 
+        // A registered channel that had emptied out is being recreated: restore
+        // its persisted topic and withhold the automatic creator-op — only the
+        // founder is opped (below), so ownership survives the channel emptying.
+        let registered = stg.chanreg.is_registered(&chan_key_norm);
+        let restore_topic = if registered {
+            stg.chanreg.get(&chan_key_norm).map(|r| r.topic.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
         let created = stg.chan_or_create(&chan_key_norm.clone(), display.clone());
-        created.admit_as_op(id);
+        if registered {
+            created.admit_plain(id);
+        } else {
+            created.admit_as_op(id);
+        }
+        if registered && !restore_topic.is_empty() {
+            if let Some(c) = stg.chan_mut(&chan_key_norm) {
+                c.topic = restore_topic;
+            }
+        }
         if let Some(u) = stg.find_by_id_mut(id) {
             u.chans.insert(chan_key_norm.clone());
         }
         joiner_replies(stg, id, &display);
+        if registered {
+            apply_founder_status(stg, id, &chan_key_norm);
+        }
     }
 }
 
@@ -664,6 +716,7 @@ fn join_existing(stg: &mut ServerState, id: usize, norm: &str, key: &str) {
     broadcast_join(stg, id, &members, &sender_prefix, &display);
 
     joiner_replies(stg, id, &display);
+    apply_founder_status(stg, id, norm); // founder rejoining a registered channel regains +o
 }
 
 /// Broadcast a JOIN to existing members, choosing the extended-join form
@@ -839,9 +892,13 @@ fn handle_topic(stg: &mut ServerState, id: usize, cmd: &Command) {
             if let Some(c) = stg.chan_mut(&norm) {
                 c.topic = new_topic.to_string();
             }
+            // Registered channels keep their topic across restarts.
+            if stg.chanreg.is_registered(&norm) {
+                stg.chanreg.set_topic(&norm, new_topic);
+            }
             let members: Vec<usize> = stg.chan(&norm).map(|c| c.members.iter().copied().collect()).unwrap_or_default();
             for mid in members {
-                deliver(stg, mid, &proto::line(&sender_prefix, "TOPIC", &format!("{} :{}", raw, new_topic)));
+                relay_tagged(stg, mid, &proto::line(&sender_prefix, "TOPIC", &format!("{} :{}", raw, new_topic)));
             }
         }
         None => match stg.chan(&norm).map(|c| c.topic.clone()).unwrap_or_default() {
@@ -1524,14 +1581,135 @@ fn handle_nickserv(stg: &mut ServerState, id: usize, text: &str, is_priv: bool) 
 
 /// Send one NickServ NOTICE to a connection.
 fn nickserv_notice(stg: &mut ServerState, id: usize, text: &str) {
+    services_notice(stg, id, "NickServ", text);
+}
+
+/// ChanServ services pseudo-user: channel registration keyed to services
+/// accounts. REGISTER requires the caller to be logged in and hold operator
+/// status on the target channel; the founder is then auto-opped on join and the
+/// channel's topic persists across restarts.
+fn handle_chanserv(stg: &mut ServerState, id: usize, text: &str, is_priv: bool) {
+    if !is_priv {
+        return;
+    }
+    if !stg.find_by_id(id).map(|u| u.registered).unwrap_or(false) {
+        return;
+    }
+    let mut parts = text.split_whitespace();
+    let sub = parts.next().unwrap_or("").to_uppercase();
+    let chan = parts.next().unwrap_or("");
+    match sub.as_str() {
+        "REGISTER" => {
+            let account = stg.find_by_id(id).and_then(|u| u.account.clone());
+            let Some(account) = account else {
+                chanserv_notice(stg, id, "You must be logged in (see NickServ) to register a channel.");
+                return;
+            };
+            if !valid_channel(chan) {
+                chanserv_notice(stg, id, "Syntax: REGISTER #channel");
+                return;
+            }
+            let key = chan.to_lowercase();
+            if stg.chanreg.is_registered(&key) {
+                chanserv_notice(stg, id, &format!("\x02{}\x02 is already registered.", chan));
+                return;
+            }
+            let is_op = stg.chan(&key).map(|c| c.is_op(id)).unwrap_or(false);
+            if !is_op {
+                chanserv_notice(stg, id, &format!("You must be a channel operator on \x02{}\x02 to register it.", chan));
+                return;
+            }
+            let display = stg.chan(&key).map(|c| c.display.clone()).unwrap_or_else(|| chan.to_string());
+            match stg.chanreg.register(&key, &display, &account) {
+                Ok(()) => {
+                    // Persist the current topic, if any, immediately.
+                    let topic_now = stg.chan(&key).map(|c| c.topic.clone()).unwrap_or_default();
+                    if !topic_now.is_empty() {
+                        stg.chanreg.set_topic(&key, &topic_now);
+                    }
+                    chanserv_notice(stg, id, &format!("Channel \x02{}\x02 registered to \x02{}\x02.", display, account));
+                }
+                Err(e) => chanserv_notice(stg, id, &format!("Registration failed: {}.", e)),
+            }
+        }
+        "DROP" => {
+            let account = stg.find_by_id(id).and_then(|u| u.account.clone()).unwrap_or_default();
+            if !stg.chanreg.is_registered(&chan.to_lowercase()) {
+                chanserv_notice(stg, id, "That channel is not registered.");
+                return;
+            }
+            if !stg.chanreg.is_founder(&chan.to_lowercase(), &account) {
+                chanserv_notice(stg, id, "Only the channel founder may drop it.");
+                return;
+            }
+            stg.chanreg.drop_channel(&chan.to_lowercase());
+            chanserv_notice(stg, id, &format!("Channel \x02{}\x02 dropped.", chan));
+        }
+        "INFO" => {
+            match stg.chanreg.get(&chan.to_lowercase()) {
+                Some(reg) => {
+                    let (disp, founder) = (reg.display.clone(), reg.founder_display.clone());
+                    chanserv_notice(stg, id, &format!("\x02{}\x02 -- founder: \x02{}\x02", disp, founder));
+                }
+                None => chanserv_notice(stg, id, "That channel is not registered."),
+            }
+        }
+        "" | "HELP" => {
+            chanserv_notice(stg, id, "ChanServ: REGISTER #channel | INFO #channel | DROP #channel");
+        }
+        _ => chanserv_notice(stg, id, "Unknown command. Try HELP."),
+    }
+}
+
+fn chanserv_notice(stg: &mut ServerState, id: usize, text: &str) {
+    services_notice(stg, id, "ChanServ", text);
+}
+
+/// Send one services NOTICE from `who!services@<server>` to a connection.
+fn services_notice(stg: &mut ServerState, id: usize, who: &str, text: &str) {
     let srv = stg.name.clone();
     let nick = sender_nick(stg, id);
     let line = proto::line(
-        &format!(":NickServ!services@{}", srv),
+        &format!(":{}!services@{}", who, srv),
         "NOTICE",
         &format!("{} :{}", nick, text),
     );
     deliver(stg, id, &line);
+}
+
+/// Grant channel-operator status to a founder who has joined a channel they own
+/// (their services account matches the ChanServ founder). Broadcasts a
+/// `MODE +o` from ChanServ so every member — and the founder's own client — sees
+/// the grant. No-op when the channel is unregistered or the user is not the
+/// founder or is already opped.
+fn apply_founder_status(stg: &mut ServerState, id: usize, norm_key: &str) {
+    let account = match stg.find_by_id(id).and_then(|u| u.account.clone()) {
+        Some(a) => a,
+        None => return,
+    };
+    if !stg.chanreg.is_founder(norm_key, &account) {
+        return;
+    }
+    let already = stg.chan(norm_key).map(|c| c.is_op(id)).unwrap_or(true);
+    if already {
+        return;
+    }
+    let (display, nick) = match (
+        stg.chan(norm_key).map(|c| c.display.clone()),
+        stg.find_by_id(id).map(|u| u.nick.clone()),
+    ) {
+        (Some(d), Some(n)) => (d, n),
+        _ => return,
+    };
+    if let Some(c) = stg.chan_mut(norm_key) {
+        c.grant(id, true);
+    }
+    let srv = stg.name.clone();
+    let line = proto::line(&format!(":ChanServ!services@{}", srv), "MODE", &format!("{} +o {}", display, nick));
+    let members: Vec<usize> = stg.chan(norm_key).map(|c| c.members.iter().copied().collect()).unwrap_or_default();
+    for mid in members {
+        relay_tagged(stg, mid, &line);
+    }
 }
 
 /// account-notify (IRCv3): tell shared-channel peers who negotiated the cap that
@@ -1604,10 +1782,15 @@ fn deliver_one_recipient(stg: &mut ServerState, id: usize, raw: &str, text: &str
         return;
     }
 
-    // Services pseudo-user: NickServ handles account registration / login. It is
-    // not a real connection, so it is answered here rather than relayed.
+    // Services pseudo-users: NickServ handles account registration / login and
+    // ChanServ handles channel registration. Neither is a real connection, so
+    // they are answered here rather than relayed.
     if norm_nick(raw) == "nickserv" {
         handle_nickserv(stg, id, text, is_priv);
+        return;
+    }
+    if norm_nick(raw) == "chanserv" {
+        handle_chanserv(stg, id, text, is_priv);
         return;
     }
 

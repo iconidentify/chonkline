@@ -15,6 +15,8 @@ the only runtime dependency is `tokio`.
 - `AWAY`, `OPER`, `WALLOPS`, `PING` / `PONG` keepalive
 - **Accounts**: `NickServ` `REGISTER` / `IDENTIFY`, PBKDF2-hashed passwords
   persisted to disk
+- **Channels**: `ChanServ` `REGISTER` / `INFO` / `DROP` — founders are
+  auto-opped and registered channels keep their topic across restarts
 - **SASL** `PLAIN` authentication at connection time
 - **IRCv3 capabilities**: `sasl`, `server-time`, `away-notify`, `extended-join`,
   `account-notify`, `multi-prefix` (proper `CAP LS 302` negotiation)
@@ -42,6 +44,7 @@ All configuration is via environment variables.
 | `IRC_OPER_USER`     | `oper`           | `OPER` username                               |
 | `IRC_OPER_PASS`     | `secret`         | `OPER` password                               |
 | `IRC_ACCOUNTS_PATH` | *(unset)*        | Account store file; unset = in-memory only    |
+| `IRC_CHANNELS_PATH` | *(unset)*        | Channel registry file; unset = in-memory only |
 | `IRC_CLOAK_SECRET`  | *(built-in)*     | HMAC key for host cloaks (set in production)   |
 | `IRC_CLOAK_SUFFIX`  | `chonkbase.net`  | Domain suffix appended to cloaked hosts       |
 

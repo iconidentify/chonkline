@@ -179,6 +179,33 @@ fn notice_and_ctcp_relay_between_users() {
 }
 
 #[test]
+fn chanserv_register_and_founder_autoop() {
+    let addr = start_server();
+    let mut a = client(&addr);
+    register(&mut a, "founder1");
+    send(&mut a, "PRIVMSG NickServ :REGISTER founderpass");
+    let _ = drain_until(&mut a, "registered", 3);
+
+    // Create the channel (creator-op), then register it with ChanServ.
+    send(&mut a, "JOIN #den");
+    let _ = drain_until(&mut a, "JOIN", 3);
+    send(&mut a, "PRIVMSG ChanServ :REGISTER #den");
+    let reg = drain_until(&mut a, "registered", 3);
+    assert!(reg.contains("ChanServ") && reg.contains("registered"), "ChanServ REGISTER failed: {reg:?}");
+
+    // Leave (the channel empties), then rejoin: the founder must be re-opped by
+    // ChanServ even though a fresh joiner would normally not be an operator.
+    send(&mut a, "PART #den");
+    let _ = drain_until(&mut a, "PART", 3);
+    send(&mut a, "JOIN #den");
+    let rejoin = drain_until(&mut a, "+o founder1", 3);
+    assert!(
+        rejoin.contains("ChanServ") && rejoin.contains("MODE #den +o founder1"),
+        "founder not auto-opped on rejoin: {rejoin:?}"
+    );
+}
+
+#[test]
 fn extended_join_carries_account_and_realname() {
     let addr = start_server();
 

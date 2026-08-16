@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod channels;
 pub mod cmds;
 pub mod crypto;
 pub mod ops;

@@ -425,6 +425,9 @@ pub struct ServerState {
 
     /// Registered services accounts (SASL / NickServ), persisted to disk.
     pub accounts: crate::accounts::AccountStore,
+
+    /// Registered channels (ChanServ): founder ownership + persisted topics.
+    pub chanreg: crate::channels::ChannelRegistry,
 }
 
 impl ServerState {
@@ -454,6 +457,7 @@ impl ServerState {
             ping_outstanding: HashMap::new(),
             grace_reclaim: HashMap::new(),
             accounts: crate::accounts::AccountStore::load(std::env::var("IRC_ACCOUNTS_PATH").ok()),
+            chanreg: crate::channels::ChannelRegistry::load(std::env::var("IRC_CHANNELS_PATH").ok()),
         }
     }
 
