@@ -157,6 +157,28 @@ fn server_time_tag_on_channel_message() {
 }
 
 #[test]
+fn notice_and_ctcp_relay_between_users() {
+    let addr = start_server();
+    let mut a = client(&addr);
+    register(&mut a, "nota");
+    let mut b = client(&addr);
+    register(&mut b, "notb");
+
+    // NOTICE user->user must be delivered (regression: NOTICE was dropped).
+    send(&mut a, "NOTICE notb :heads up");
+    let n = drain_until(&mut b, "heads up", 3);
+    assert!(n.contains("NOTICE notb :heads up"), "user NOTICE not delivered: {n:?}");
+
+    // CTCP request (PRIVMSG) and reply (NOTICE) must pass \x01 bytes through intact.
+    send(&mut a, "PRIVMSG notb :\u{1}VERSION\u{1}");
+    let req = drain_until(&mut b, "VERSION", 3);
+    assert!(req.contains("\u{1}VERSION\u{1}"), "CTCP request not relayed intact: {req:?}");
+    send(&mut b, "NOTICE nota :\u{1}VERSION chonkline\u{1}");
+    let rep = drain_until(&mut a, "VERSION", 3);
+    assert!(rep.contains("\u{1}VERSION chonkline\u{1}"), "CTCP reply (NOTICE) not relayed: {rep:?}");
+}
+
+#[test]
 fn extended_join_carries_account_and_realname() {
     let addr = start_server();
 

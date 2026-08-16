@@ -1437,9 +1437,13 @@ fn handle_privmsg(stg: &mut ServerState, id: usize, cmd: &Command, is_priv: bool
     let Some(recips_raw) = cmd.params.first() else { reply_missing_recipient(stg, id, is_priv); return };
 
     let text: Option<&str> = cmd.params.get(1).map(String::as_str);
-    match (is_priv, text) {
-        (true, Some(t)) if !t.is_empty() => {} // proceed to delivery below
-        _ => { reply_missing_text(stg, id); return; }
+    // Both PRIVMSG and NOTICE require non-empty text; on a missing body PRIVMSG
+    // answers 412 while NOTICE stays silent (RFC 4.4 forbids NOTICE error
+    // replies). NOTICE is the transport for CTCP replies and bot output, so it
+    // must reach the same delivery path as PRIVMSG.
+    match text {
+        Some(t) if !t.is_empty() => {} // proceed to delivery below
+        _ => { if is_priv { reply_missing_text(stg, id); } return; }
     }
 
     for raw in recips_raw.split(',').filter(|c| !c.is_empty()) {
