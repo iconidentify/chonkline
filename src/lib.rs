@@ -2,6 +2,7 @@ pub mod accounts;
 pub mod channels;
 pub mod cmds;
 pub mod crypto;
+pub mod http;
 pub mod ops;
 pub mod proto;
 pub mod state;
@@ -57,6 +58,15 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
         &cfg.admin_email,
         &listen_desc,
     )));
+
+    // Optional web property (status page + stats/release-notes API). Runs on its
+    // own listener; a bind failure never affects the IRC service.
+    if let Some(http_port) = std::env::var("IRC_HTTP_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+        if http_port != 0 {
+            let http_state = state.clone();
+            tokio::spawn(async move { http::serve_http(http_state, http_port).await });
+        }
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn(async move {

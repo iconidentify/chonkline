@@ -55,6 +55,8 @@ spec:
           ports:
             - name: irc
               containerPort: 6667
+            - name: http
+              containerPort: 8080
           volumeMounts:
             - name: data
               mountPath: /var/lib/chonkline

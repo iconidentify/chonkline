@@ -15,5 +15,9 @@ spec:
     - name: irc-tls
       port: 6697
       targetPort: irc-tls
-  # 6667 = plaintext IRC (rustircd). 6697 = TLS, terminated by the ghostunnel
-  # sidecar using the cert-manager chonkline-tls cert, forwarded to 6667.
+    - name: http
+      port: 8080
+      targetPort: http
+  # 6667 = plaintext IRC. 6697 = TLS (ghostunnel sidecar). 8080 = read-only web
+  # property (status page + stats/release-notes API); the existing ingress routes
+  # irc.chonkbase.net/ to this port with TLS via the chonkline-tls cert.

@@ -564,6 +564,8 @@ const MOTD: &[&str] = &[
     "        /msg ChanServ REGISTER #channel",
     "        /msg ChanServ INFO #channel",
     "",
+    "  Release notes & live stats:  https://irc.chonkbase.net",
+    "",
 ];
 
 /// The registration reply sequence (RFC 8.5): an unambiguous server identity,
@@ -1669,6 +1671,7 @@ fn handle_privmsg(stg: &mut ServerState, id: usize, cmd: &Command, is_priv: bool
     }
 
     for raw in recips_raw.split(',').filter(|c| !c.is_empty()) {
+        stg.note_message(); // lifetime relay counter for the stats page
         deliver_one_recipient(stg, id, raw, text.unwrap(), is_priv);
     }
 }

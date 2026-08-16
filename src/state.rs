@@ -479,6 +479,14 @@ pub struct ServerState {
 
     /// Registered channels (ChanServ): founder ownership + persisted topics.
     pub chanreg: crate::channels::ChannelRegistry,
+
+    // ---- lifetime statistics (surfaced by the web property) ----
+    pub total_connections: u64,  // accepted connections since start
+    pub peak_users: usize,       // high-water mark of concurrent registered users
+    pub messages_relayed: u64,   // PRIVMSG/NOTICE lines relayed
+
+    /// Path to the LLM-generated release-notes JSON served by the web property.
+    pub release_notes_path: Option<String>,
 }
 
 impl ServerState {
@@ -509,7 +517,26 @@ impl ServerState {
             grace_reclaim: HashMap::new(),
             accounts: crate::accounts::AccountStore::load(std::env::var("IRC_ACCOUNTS_PATH").ok()),
             chanreg: crate::channels::ChannelRegistry::load(std::env::var("IRC_CHANNELS_PATH").ok()),
+            total_connections: 0,
+            peak_users: 0,
+            messages_relayed: 0,
+            release_notes_path: std::env::var("IRC_RELEASE_NOTES_PATH").ok(),
         }
+    }
+
+    /// Seconds the server has been running.
+    pub fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
+    /// Record an accepted connection (lifetime counter).
+    pub fn note_connection(&mut self) {
+        self.total_connections = self.total_connections.saturating_add(1);
+    }
+
+    /// Record a relayed message and refresh the peak-users high-water mark.
+    pub fn note_message(&mut self) {
+        self.messages_relayed = self.messages_relayed.saturating_add(1);
     }
 
     /// Server name prefixed with the trailing-marker colon for reply lines.
@@ -600,6 +627,7 @@ impl ServerState {
         };
         let _ = &mut cx; // fields complete above; insert verbatim
         self.unreg.insert(id, cx);
+        self.note_connection();
     }
 
     /// Find where a connection currently lives (unregistered record or the
@@ -644,6 +672,7 @@ impl ServerState {
         cx.realname = realname.to_string();
         cx.registered = true;
         self.users.insert(inserted_key, cx);
+        self.peak_users = self.peak_users.max(self.users.len());
         self.users.get(&lookup_key)
     }
 

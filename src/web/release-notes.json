@@ -1,0 +1,63 @@
+{
+  "generated": "2026-08-16",
+  "model": "llm-nothink",
+  "releases": [
+    {
+      "title": "The Conformance Sprint",
+      "date": "2026-08-16",
+      "summary": "A major polish pass that resolves the P0-P2 issue backlog, ensuring Chonkline speaks the IRC protocol correctly for strict clients like BitchX.",
+      "highlights": [
+        "Fixed malformed MODE broadcasts for operator (+o) and voice (+v) to prevent client parsing errors",
+        "Added a proper MOTD with correct start codes (375) to stop BitchX from crashing",
+        "Corrected RPL_USERHOST (302) responses to include the full user@host format",
+        "Fixed NOTICE delivery and CTCP replies so private messages reach the right users",
+        "Trimmed unnecessary closing lines from the MOTD for a cleaner welcome experience"
+      ]
+    },
+    {
+      "title": "Identity & Accounts",
+      "date": "2026-08-16",
+      "summary": "Chonkline now supports modern user identification with SASL accounts, host cloaking, and proper server naming.",
+      "highlights": [
+        "Added SASL authentication and account support for persistent identity",
+        "Enabled host cloaking to protect user privacy",
+        "Introduced IRCv3 capabilities for better client feature detection",
+        "Added ChanServ channel registration for persistent channel management",
+        "Configurable server identity via IRC_SERVER_NAME and proper host reporting (002)"
+      ]
+    },
+    {
+      "title": "Secure & Stable Connections",
+      "date": "2026-08-16",
+      "summary": "Improved connection security and stability with TLS support and robust handling of MODE changes and queries.",
+      "highlights": [
+        "Enabled TLS connections on port 6697 via a ghostunnel sidecar",
+        "Fixed MODE ban-list queries to return accurate results",
+        "Ensured MODE changes are properly broadcast to channel members",
+        "Deployed fixes for strict client compatibility regarding numerics and server identity"
+      ]
+    },
+    {
+      "title": "Handshake & Reconnect Hardening",
+      "date": "2026-08-15",
+      "summary": "The initial connection and reconnection process is smoother, with better handling of capabilities, pings, and nicknames.",
+      "highlights": [
+        "Fixed CAP negotiation to prevent handshake timeouts",
+        "Added client PING/PONG handling to keep connections alive",
+        "Improved nick validation and fast nick reclaim after disconnects",
+        "Harden reconnect logic with keepalive signals and CAP-END gating"
+      ]
+    },
+    {
+      "title": "First Light",
+      "date": "2026-08-15",
+      "summary": "The initial release of Chonkline, establishing the core protocol behavior that makes channels feel right.",
+      "highlights": [
+        "Echoes your own JOIN and PART messages so client channel buffers open correctly",
+        "Fixed error numerics to target the correct user",
+        "Implemented ghost reaping to clean up stale user entries",
+        "Complete registration burst for a faster initial connection"
+      ]
+    }
+  ]
+}
