@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-pub const VERSION: &str = "RustIRC/1.0";
+pub const VERSION: &str = "chonkline-beta";
 pub const MAX_LINE_WITH_CRLF: usize = 512; // RFC 2.3: incl. trailing CR-LF
 pub const MAX_CONTENT_BYTES: usize = 510;
 pub const MAX_PARAMS: usize = 15;         // RFC 2.3: up to 15 parameters

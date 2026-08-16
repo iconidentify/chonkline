@@ -472,12 +472,11 @@ fn deliver_need_more_params(stg: &mut ServerState, id: usize, command: &str) {
 /// Built-in MOTD served both at registration (RFC 8.5) and on request. Lines are
 /// kept within the 80-character limit of RFC numeric-372 usage.
 const MOTD: &[&str] = &[
-    "Welcome to RustIRC, a reference IRC server implementing",
-    "the protocol specified by RFC 1459 with operational",
-    "clarifications drawn from its successor specification.",
+    "Welcome to Chonkline.",
+    "A lightweight IRC server speaking RFC 1459/2812 with the",
+    "common client extensions.",
     "",
-    "Server name: rustirc   Version: RustIRC/1.0",
-    "No MOTD file was configured; this built-in text stands in.",
+    "This is a beta service; no MOTD file is configured.",
 ];
 
 /// The registration reply sequence (RFC 8.5): an unambiguous server identity,
@@ -1603,8 +1602,12 @@ fn handle_userhost(stg: &mut ServerState, id: usize, cmd: &Command) {
                         };
 
                         let host_now: String = target_user_now.host.clone();
+                        let user_now: String = target_user_now.user.clone();
 
-                        Some(format!("{}={}{}", target_user_now.nick.clone(), away_flag_now[0..].to_string(), host_now))
+                        // RFC-shape reply: nick[*]=<+|-><user>@<host>. The user@ segment is
+                        // mandatory in practice — clients such as BitchX do strchr(reply,'@')
+                        // and dereference the result unconditionally, so a bare host segfaults them.
+                        Some(format!("{}={}{}@{}", target_user_now.nick.clone(), away_flag_now, user_now, host_now))
 
                     }
                 },

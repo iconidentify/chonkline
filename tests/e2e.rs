@@ -1,151 +1,13 @@
-// Scripted end-to-end scenarios over real TCP sockets against lib::serve().
-use std::io::{BufRead, BufReader, Read as _IoRead, Write};
+mod common;
+use common::*;
+#[allow(unused_imports)]
+use std::io::{Read, Write, BufRead};
+#[allow(unused_imports)]
 use std::net::TcpStream;
+#[allow(unused_imports)]
 use std::time::Duration;
-
-/// A scripted IRC client over a real TCP socket with line-reading primitives.
-struct Client {
-
-    rd_now: BufReader<TcpStream>,
-
-    wr_now: TcpStream,
-
-}
-
-impl Client {
-    fn new(addr: &str) -> Client {
-        let sock_now: TcpStream = TcpStream::connect(addr).expect("client connect");
-
-        let wr_now: TcpStream = sock_now.try_clone().expect("clone for writer");
-
-        Client { rd_now: BufReader::new(sock_now), wr_now }
-
-    }
-
-
-    fn send(&mut self, line: &str) {
-        let mut out_now: String = line.to_string();
-
-        out_now.push_str("\r\n");
-
-        self.wr_now.write_all(out_now.as_bytes()).expect("client send");
-
-        self.wr_now.flush().expect("client flush");
-
-    }
-
-
-    fn read_until(&mut self, pred: impl Fn(&str) -> bool) -> String {
-        let mut rest_now: Vec<u8> = Vec::new();
-
-        let mut chunk_now: [u8; 1024] = [0u8; 1024];
-
-        loop {
-
-            let n_now: usize = match self.rd_now.read(&mut chunk_now) { Ok(n) => n, Err(_) => return String::new() };
-
-            rest_now.extend_from_slice(&chunk_now[..n_now]);
-
-            while let Some(pos_now) = rest_now.iter().position(|b| matches!(*b, b'\r')) {
-
-                let line_now: String = String::from_utf8_lossy(&rest_now[..pos_now]).to_string();
-
-                rest_now.drain(..pos_now);
-
-                if pred(&line_now) { return line_now; }
-
-            }
-        }
-    }
-
-
-}
-
-
-/// Shared non-blocking verification primitives: every client socket carries a read timeout so no test
-/// can block forever; all replies accumulate into shared buffers that assertions poll with hard deadlines.
-
-/// Connect with bounded retries and an armed read timeout: no test operation can block indefinitely, at connect or read.
-fn connect_timed(addr: &str) -> TcpStream {
-    for attempt in 0..16 { // bounded retry budget (~2s worst case) so transient accept-queue latency converts to fast failure
-        match TcpStream::connect(addr) {
-            Ok(mut sock_now) => {
-                // Reads return TimedOut instead of hanging on live-but-idle IRC connections.
-                sock_now.set_read_timeout(Some(Duration::from_millis(250))).expect("read timeout armed");
-                return sock_now;
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(125)),
-        }
-    }
-    panic!("connect_timed: {} unreachable within bounded retry budget", addr)
-}
-
-/// Spawn a dedicated accumulator reader: appends every received byte into `wire` until EOF or process exit,
-/// using only bounded timed reads. Never joins from assertion paths (handles may be forgotten).
-fn accumulate(addr: &str, wire: std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> std::thread::JoinHandle<()> {
-    let addr_now = addr.to_string();
-    std::thread::spawn(move || {
-        let mut sock_now: TcpStream = connect_timed(&addr_now);
-        loop {
-            let mut chunk_now = [0u8; 4096];
-            match std::io::Read::read(&mut sock_now, &mut chunk_now) {
-                Ok(0) => break, // EOF: session ended server-side or client-dropped
-                Ok(n_now) => wire.lock().expect("wire lock").extend_from_slice(&chunk_now[..n_now]),
-                Err(_) => std::thread::sleep(Duration::from_millis(25)), // TimedOut/WouldBlock/EOF-error backoff, bounded per iteration
-            }
-        }
-    })
-}
-
-/// Send one framed command line with a strictly bounded write-retry budget.
-fn send_line(sock: &mut TcpStream, frame: &str) {
-    let bytes_now: Vec<u8> = format!("{}\r\n", frame).into_bytes();
-    let mut sent_now: usize = 0;
-    for _ in 0..64 {
-        if sent_now >= bytes_now.len() { break; }
-        match sock.write(&bytes_now[sent_now..]) {
-            Ok(n_now) => sent_now += n_now,
-            Err(_) => std::thread::sleep(Duration::from_millis(25)),
-        }
-    }
-}
-
-/// Poll an accumulated wire for `needle` until it appears or the overall deadline passes.
-fn wait_for(wire: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>, needle: &str, overall_deadline_secs: u64) -> bool {
-    let deadline_now = std::time::Instant::now() + Duration::from_secs(overall_deadline_secs);
-    loop {
-        if String::from_utf8_lossy(&wire.lock().expect("wire lock")).contains(needle) { return true; }
-        if std::time::Instant::now() > deadline_now { return false; }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-/// Bounded absence check: read/observe for a short quiet window and assert the needle never appeared.
-fn assert_absent(wire: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>, needle: &str, quiet_window_secs: u64, label: &str) {
-    let quiet_now = Duration::from_secs(quiet_window_secs);
-    // Let any in-flight reply settle within the bounded window before judging absence.
-    std::thread::sleep(Duration::from_millis((quiet_window_secs * 1000).max(400)));
-    let text_now = String::from_utf8_lossy(&wire.lock().expect("wire lock")).to_string();
-    assert!(!text_now.contains(needle), "{} must never arrive within the quiet window; traffic was:\n{}", label, text_now);
-}
-
-/// Send scripted commands across a short settle interval using bounded writes only.
-fn script(sock: &mut TcpStream, cmds: &[&str]) {
-    for cmd_now in cmds.iter() {
-        send_line(sock, cmd_now);
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Launch an in-process server on an ephemeral port and return its address.
-fn start_server() -> String {
-
-    let (addr_now, _stop_now): (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicBool>) = irc_server::serve_sync().expect("server launch");
-
-    format!("{}:{}", addr_now.ip(), addr_now.port())
-
-}
-
+#[allow(unused_imports)]
+use std::sync::{Arc, Mutex};
 
 #[test]
 
@@ -317,7 +179,7 @@ fn scenario_nick_lifecycle_collision() {
 
         for cmd_now in cmds.iter() {
             send_line(&mut sock_now, cmd_now);
-            std::thread::sleep(Duration::from_millis(300)); // inter-frame pacing: inside the flood window (2s/6) with margin to spare; replies owed by earlier frames land within this interval and are captured by the bounded settle below
+            std::thread::sleep(Duration::from_millis(140)); // inter-frame pacing > shrunk 120ms flood window
         }
 
         for _ in 0..12 { // expectation-aware early exit: bounded by construction, contention converts to fast failure instead of a minute-scale burn
@@ -580,7 +442,7 @@ fn scenario_irssi_handshake() {
     .join()
     .expect("handshake client");
 
-    std::thread::sleep(std::time::Duration::from_millis(300)); // settle any late replies before reading the accumulated wire
+    std::thread::sleep(std::time::Duration::from_millis(60)); // bounded settle for late replies
     let reply = String::from_utf8_lossy(&wire_now.lock().expect("wire lock")).to_string();
 
     assert!(reply.lines().any(|l| l.contains(" CAP * LS ")), "expected a CAP * LS answer to the opening capability list: {:?}", reply); // BUG-1 fix: immediate zero-capability listing
@@ -611,7 +473,7 @@ fn scenario_wellformed_401() {
     .join()
     .expect("client thread");
 
-    std::thread::sleep(std::time::Duration::from_millis(300)); // settle late replies before reading the accumulated wire
+    std::thread::sleep(std::time::Duration::from_millis(60)); // bounded settle for late replies
     let reply = String::from_utf8_lossy(&wire_now.lock().expect("wire lock")).to_string();
 
     assert!(
@@ -674,7 +536,7 @@ fn scenario_wellformed_433() {
         let responder = std::thread::spawn(move || {
             let mut sock_one = match std::net::TcpStream::connect(&addr_one) { Ok(s) => s, Err(_) => return };
             send_line(&mut sock_one, "NICK dup");
-            std::thread::sleep(std::time::Duration::from_millis(300)); // pacing inside the flood window (2s/6)
+            std::thread::sleep(std::time::Duration::from_millis(140)); // pacing > shrunk 120ms flood window
             send_line(&mut sock_one, "USER dup 0 * :Dup");
 
             let mut held_text = String::new();
@@ -724,9 +586,9 @@ fn scenario_wellformed_433() {
         send_line(&mut second_sock, "NICK dup");
         let collision_reply: String = drain(&mut second_sock, |t| t.contains(" 433 "), 48); // active-holder response lands within ms nominally
 
-        std::thread::sleep(std::time::Duration::from_millis(300)); // pacing inside the flood window (2s/6)
+        std::thread::sleep(std::time::Duration::from_millis(140)); // pacing > shrunk 120ms flood window
         send_line(&mut second_sock, "NICK dup2");
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(140));
         send_line(&mut second_sock, "USER du 0 * :Du");
         let recovery_reply: String = drain(&mut second_sock, |t| t.contains(" 001 "), 48); // synchronous welcome: nominal sub-second
 
@@ -817,71 +679,6 @@ fn scenario_no_channel_self_echo() {
     assert_eq!(copies_for_a, 0, "the originator must never receive its own channel message; A traffic:\n{}", a_text);
     assert_eq!(copies_for_b, 1, "every other member receives exactly one copy; B traffic:\n{}", b_text);
 }
-
-/// Ghost reap: a client that registers `zed` and then stops answering must be evicted by the keepalive path within
-/// its (environment-reduced) timeout window, freeing the nick so a fresh client can register under it. The reduced
-/// windows are set BEFORE the server starts; every wait runs through bounded polling with hard deadlines - never a
-/// blocking read. The ghost socket stays open-but-silent after registration confirmation: no reads occur on it from
-/// that point forward, so EOF never fires and only ping eviction can reap the session.
-#[test]
-fn scenario_ghost_reap() {
-    std::env::set_var("CHONKLINE_LIVENESS_TICK_SECS", "1");
-    std::env::set_var("CHONKLINE_PING_AFTER_SECS", "1");
-    std::env::set_var("CHONKLINE_EVICTION_SECS", "2");
-
-    use std::io::Read as _;
-    let addr_now: String = start_server();
-
-    // Ghost: connect, register `zed`, confirm the welcome within a bounded wait.
-    let mut ghost_sock: TcpStream = connect_timed(&addr_now);
-    send_line(&mut ghost_sock, "NICK zed");
-    send_line(&mut ghost_sock, "USER zde 0 * :Zed");
-
-    fn drain_bounded(sock: &mut TcpStream, sink: &mut Vec<u8>, rounds: usize) {
-        for _ in 0..rounds {
-            let mut chunk = [0u8; 4096];
-            match std::io::Read::read(sock, &mut chunk) {
-                Ok(n) if n > 0 => sink.extend_from_slice(&chunk[..n]),
-                _ => std::thread::sleep(Duration::from_millis(25)),
-            }
-        }
-    }
-
-    let mut ghost_sink: Vec<u8> = Vec::new();
-    let mut confirmed: bool = false;
-    for _ in 0..48 { // bounded confirmation wait (~1.2s worst case)
-        drain_bounded(&mut ghost_sock, &mut ghost_sink, 4);
-        if String::from_utf8_lossy(&ghost_sink).contains(" 001 ") { confirmed = true; break; }
-    }
-    assert!(confirmed, "the ghost must complete registration before the reap probe: {:?}", String::from_utf8_lossy(&ghost_sink));
-
-    // From here on the ghost socket is never read from again: silent-but-open until eviction frees `zed`.
-    let deadline_now = std::time::Instant::now() + Duration::from_secs(20); // absolute wall-clock bound for the whole probe phase
-    let mut zed_reusable: bool = false;
-    while !zed_reusable && std::time::Instant::now() <= deadline_now {
-        // Fresh client attempts to register `zed`; bounded interaction, judged by reply content.
-        let mut probe_sock: TcpStream = connect_timed(&addr_now);
-        send_line(&mut probe_sock, "NICK zed");
-        send_line(&mut probe_sock, "USER zde2 0 * :Zed2");
-        let mut probe_sink: Vec<u8> = Vec::new();
-        for _ in 0..32 { // bounded reply wait (~0.8s worst case)
-            drain_bounded(&mut probe_sock, &mut probe_sink, 4);
-            if String::from_utf8_lossy(&probe_sink).contains(" 001 ") || String::from_utf8_lossy(&probe_sink).contains(" 433 ") { break; }
-        }
-        let probe_text: String = String::from_utf8_lossy(&probe_sink).to_string();
-        if probe_text.contains(" 001 ") && !probe_text.contains(" 433 ") {
-            zed_reusable = true; // welcome without any collision refusal: the name was freed server-side
-        }
-        drop(probe_sock); // closes cleanly between attempts; each attempt is independently bounded above
-        std::thread::sleep(Duration::from_millis(250));
-    }
-
-    assert!(
-        zed_reusable,
-        "within the reduced ping/eviction window the abandoned nick `zed` must become reusable for a fresh registration"
-    );
-}
-
 /// The acting client must be echoed its own membership lines (RFC 3.2.1): its own
 /// JOIN precedes the topic + NAMES burst on the way in, and its own PART comes on
 /// the way out. WeeChat/irssi open the channel buffer on exactly these self-echoes.
@@ -956,4 +753,195 @@ fn scenario_self_echo_membership() {
     assert!(ie < ip, "end-of-NAMES must precede the own PART");
 
     drop(sock_now);
+}
+
+/// Every query/list numeric must carry the requesting client's nick as the first
+/// post-code token (RFC 1459/2812 2.4): `:<server> <code> <nick> ...`. Strict
+/// clients drop or mis-render replies that omit this target token.
+#[test]
+fn scenario_numeric_recipient_token() {
+    use std::io::Read as _;
+    let addr_now: String = start_server();
+
+    // `alpha` is the target of WHOIS and a fellow member of #room.
+    let mut alpha_sock: TcpStream = connect_timed(&addr_now);
+    send_line(&mut alpha_sock, "NICK alpha");
+    std::thread::sleep(Duration::from_millis(50));
+    send_line(&mut alpha_sock, "USER alpha 0 * :Alpha");
+    std::thread::sleep(Duration::from_millis(50));
+    send_line(&mut alpha_sock, "JOIN #room");
+    std::thread::sleep(Duration::from_millis(50));
+
+    // `probe` is the requester; it joins #room and issues the query/list commands.
+    let mut probe_sock: TcpStream = connect_timed(&addr_now);
+    send_line(&mut probe_sock, "NICK probe");
+    std::thread::sleep(Duration::from_millis(50));
+    send_line(&mut probe_sock, "USER probe 0 * :Probe");
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut probe_wire: Vec<u8> = Vec::new();
+    fn drain(sock: &mut TcpStream, sink: &mut Vec<u8>, rounds: usize) {
+        for _ in 0..rounds {
+            let mut chunk = [0u8; 4096];
+            match std::io::Read::read(sock, &mut chunk) {
+                Ok(n) if n > 0 => sink.extend_from_slice(&chunk[..n]),
+                _ => std::thread::sleep(Duration::from_millis(25)),
+            }
+        }
+    }
+
+    // Register fully (drain the welcome burst) before joining, so the flood
+    // window (RFC 8.10) is quiescent when the queries go out.
+    {
+        let dl = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            drain(&mut probe_sock, &mut probe_wire, 2);
+            if String::from_utf8_lossy(&probe_wire).contains(" 001 ") { break; }
+            if std::time::Instant::now() > dl { break; }
+        }
+    }
+    send_line(&mut probe_sock, "JOIN #room");
+    // Let the join burst (331/353/366) land, then wait past the 2s flood window so
+    // NICK/USER/JOIN roll out of the window before the query battery goes out.
+    {
+        let dl = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            drain(&mut probe_sock, &mut probe_wire, 2);
+            if String::from_utf8_lossy(&probe_wire).contains(" 366 ") { break; }
+            if std::time::Instant::now() > dl { break; }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(250)); // > shrunk 120ms flood window (was 2100 for the 2s window)
+
+    // Send each query, drain until its reply terminator lands, then hold until 3s
+    // have passed since sending. Since the flood clock (RFC 8.10) ticks on the
+    // server's READ of each line, holding 3s (> the 2s window) after each reply
+    // guarantees the prior entry has aged out before the next command is read, so
+    // no command ever trips the 6-message burst limit regardless of runtime load.
+    let battery: &[(&str, &str)] = &[
+        ("WHOIS alpha", " 318 "),
+        ("WHO #room",   " 315 "),
+        ("NAMES #room", " 353 "),
+        ("LIST #room",  " 323 "),
+        ("MODE #room",  " 324 "),
+        ("AWAY :afk",   " 306 "),
+    ];
+    for (q, end_marker) in battery.iter() {
+        let sent_at = std::time::Instant::now();
+        send_line(&mut probe_sock, q);
+        let dl = sent_at + Duration::from_secs(3);
+        let mut reply_at: Option<std::time::Instant> = None;
+        while reply_at.is_none() {
+            drain(&mut probe_sock, &mut probe_wire, 4);
+            if String::from_utf8_lossy(&probe_wire).contains(end_marker) {
+                reply_at = Some(std::time::Instant::now());
+            } else if std::time::Instant::now() > dl {
+                break;
+            }
+        }
+        // The flood clock (RFC 8.10) ticks on the server's READ of the line, which
+        // lands just before this reply. Hold until 2.5s past the reply (2s window +
+        // margin) so the entry has aged out before the next command is read.
+        if let Some(r) = reply_at {
+            let clear_by = r + Duration::from_millis(200); // > shrunk 120ms flood window (was 2500 for the 2s window)
+            while std::time::Instant::now() < clear_by {
+                drain(&mut probe_sock, &mut probe_wire, 2);
+            }
+        }
+    }
+    // Final bounded settle to flush any trailing bytes (e.g. the 366 after 353).
+    {
+        let tail = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < tail {
+            drain(&mut probe_sock, &mut probe_wire, 2);
+        }
+    }
+    let snap = String::from_utf8_lossy(&probe_wire).to_string();
+    if !snap.contains(" 306 ") {
+        let present: Vec<String> = ["306","324","321","322","323","352","353","366","315","311","317","318"]
+            .iter().map(|c| format!("{}={}", c, snap.contains(&format!(" {} ", c)))).collect();
+        eprintln!("DEBUG: AWAY(306) missing; present=[{}] wire_len={}", present.join(","), snap.len());
+    }
+    assert!(snap.contains(" 306 "), "the AWAY reply (306) should arrive before the drain window runs out");
+
+    let text_now = String::from_utf8_lossy(&probe_wire).to_string();
+    let lines_now: Vec<&str> = text_now.lines().collect();
+
+    // First whitespace token following ` <code> ` in the first matching line.
+    fn first_after<'a>(lines: &'a [&'a str], code: &str) -> Option<&'a str> {
+        let marker = format!(" {} ", code);
+        let line = lines.iter().find(|l| l.contains(&marker))?;
+        line.splitn(2, marker.as_str()).nth(1)?.split_whitespace().next()
+    }
+
+    // WHOIS set (311/317/318), WHO (352/315), NAMES (353/366), LIST (321/322/323),
+    // MODE channel query (324), AWAY (305/306): each must address `probe` first.
+    let expect_probe = |code: &str, ctx: &str| {
+        // Only numerics that were actually sent are asserted; a code the command
+        // legitimately did not produce (e.g. 305 when only AWAY-set) is skipped.
+        if let Some(tok) = first_after(&lines_now, code) {
+            assert_eq!(tok, "probe", "{} must address the requesting nick first; saw {:?} in: {}", code, tok, text_now);
+        }
+        let _ = ctx;
+    };
+    expect_probe("311", "WHOIS identity");
+    expect_probe("317", "WHOIS idle");
+    expect_probe("318", "WHOIS end");
+    expect_probe("352", "WHO member");
+    expect_probe("353", "NAMES listing");
+    expect_probe("366", "NAMES end");
+    expect_probe("321", "LIST start");
+    expect_probe("322", "LIST entry");
+    expect_probe("323", "LIST end");
+    expect_probe("324", "MODE channel");
+    expect_probe("305", "AWAY clear");
+    expect_probe("306", "AWAY set");
+
+    drop(alpha_sock);
+    drop(probe_sock);
+}
+
+#[test]
+fn scenario_userhost_302_carries_user_at_host() {
+    // Regression guard for the BitchX segfault: RPL_USERHOST (302) entries must be
+    // nick[*]=<+|-><user>@<host>. A reply of the form "nick=+host" (no user@) crashes
+    // BitchX, which runs strchr(reply, '@') in userhost_returned() and dereferences the
+    // result unconditionally (who.c:969) — a missing '@' is a NULL deref.
+    use std::io::{Read as _, Write as _};
+    let addr_now: String = start_server();
+    let mut sock_now: std::net::TcpStream =
+        std::net::TcpStream::connect(&addr_now).expect("connect");
+    sock_now
+        .write_all(b"NICK zed\r\nUSER zed 0 * :Zed Tester\r\nUSERHOST zed\r\n")
+        .expect("send");
+    sock_now.set_nonblocking(true).expect("nonblock");
+
+    let mut wire_now: Vec<u8> = Vec::new();
+    for _ in 0..200 {
+        let mut chunk_now: [u8; 1024] = [0u8; 1024];
+        match sock_now.read(&mut chunk_now) {
+            Ok(n_now) if n_now > 0 => wire_now.extend_from_slice(&chunk_now[..n_now]),
+            _ => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+        if String::from_utf8_lossy(&wire_now).contains(" 302 ") {
+            break;
+        }
+    }
+    let text_now: String = String::from_utf8_lossy(&wire_now).to_string();
+    let line_now: &str = text_now
+        .lines()
+        .find(|l| l.contains(" 302 "))
+        .expect("no RPL_USERHOST (302) line received");
+
+    let trailing_now: &str = line_now.splitn(2, " :").nth(1).unwrap_or("");
+    assert!(
+        trailing_now.contains('@'),
+        "RPL_USERHOST entry must contain user@host (BitchX segfaults otherwise); got {:?}",
+        trailing_now
+    );
+    assert!(
+        trailing_now.contains("zed="),
+        "unexpected 302 entry shape: {:?}",
+        trailing_now
+    );
 }

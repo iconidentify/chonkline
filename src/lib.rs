@@ -23,7 +23,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            name: env_or("IRC_SERVER_NAME", "rustirc"),
+            name: env_or("IRC_SERVER_NAME", "chonkline"),
             oper_user: env_or("IRC_OPER_USER", "oper"),
             oper_pass: env_or("IRC_OPER_PASS", "secret"),
             admin_loc1: env_or("IRC_ADMIN_LOC1", "Nowhere"),
