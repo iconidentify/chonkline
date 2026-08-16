@@ -42,7 +42,7 @@ pub fn dispatch(stg: &mut ServerState, id: usize, cmd: &Command) -> bool {
         "TRACE" => { handle_trace(stg, id, cmd); false }
         "REHASH" | "RESTART" => { handle_rehash_restart(stg, id, cmd); false }
         "CONNECT" | "SQUIT" => { handle_connect_squit(stg, id, cmd); false }
-        "MOTD" | "LUSER(S)" | "STATS" | "VERSION" | "INFO" | "TIME" => { handle_info_reply(stg, id, cmd); false }
+        "MOTD" | "LUSERS" | "STATS" | "VERSION" | "INFO" | "TIME" => { handle_info_reply(stg, id, cmd); false }
 
         _ => { deliver_unknown_command(stg, id, cmd); false }
 
@@ -496,6 +496,12 @@ fn welcome_sequence(stg: &mut ServerState, id: usize, _nick_snapshot_at_completi
         &[&format!("Welcome to the {} Internet Relay Chat Network", stg.name)],
     );
     numeric(stg, id, "002", &[&format!("Your host is {}, running {}", host_of(stg, id), stg.version)]);
+    numeric(stg, id, "003", &["This server is continuously created"]);
+    // RPL_MYINFO: servername, version, user modes, channel modes actually supported.
+    let myinfo_srv = stg.name.clone();
+    numeric(stg, id, "004", &[&myinfo_srv, stg.version, "iow", "biklmnotv"]);
+    // RPL_ISUPPORT: advertise only tokens the server genuinely honors.
+    numeric(stg, id, "005", &["CHANTYPES=#", "PREFIX=(ov)@+", "CHANMODES=b,k,l,imnt", "CASEMAPPING=rfc1459", "NICKLEN=30", "CHANNELLEN=50", "TOPICLEN=390", "NETWORK=Chonkbase", ":are supported by this server"]);
 
     let users = stg.user_count();
     let invis = stg.invis_count();
@@ -658,13 +664,9 @@ fn joiner_replies(stg: &mut ServerState, id: usize, display: &str) {
     let topic_now = stg.chan(&display.to_lowercase()).map(|c| c.topic.clone()).unwrap_or_default();
 
     if topic_now.is_empty() {
-        deliver(stg, id, &proto::line(&stg.prefix(), "331", &format!("{} :No topic is set", display))); // RFC numeric 331
+        numeric(stg, id, "331", &[display, "No topic is set"]); // RFC numeric 331
     } else {
-        deliver(
-            stg,
-            id,
-            &proto::line(&stg.prefix(), "332", &format!("{} :{}", display, topic_now)), // RFC numeric 332
-        );
+        numeric(stg, id, "332", &[display, &format!(":{}", topic_now)]); // RFC numeric 332
     }
 
     let mut nicks: Vec<String> = Vec::new();
@@ -677,16 +679,8 @@ fn joiner_replies(stg: &mut ServerState, id: usize, display: &str) {
         }
     }
     let listing: String = nicks.join(" ");
-    deliver(
-        stg,
-        id,
-        &proto::line(&stg.prefix(), "353", &format!("{} :{}", display, listing)), // RFC numeric 353 (single chunk)
-    );
-    deliver(
-        stg,
-        id,
-        &proto::line(&stg.prefix(), "366", &format!("{} :End of /NAMES list", display)), // RFC numeric 366
-    );
+    numeric(stg, id, "353", &["=", display, &format!(":{}", listing)]); // RFC 353: =/*/@ visibility symbol then channel
+    numeric(stg, id, "366", &[display, "End of /NAMES list"]); // RFC numeric 366
 }
 
 /// Resolve a member connection id to its registered user record.
@@ -806,14 +800,8 @@ fn handle_topic(stg: &mut ServerState, id: usize, cmd: &Command) {
             }
         }
         None => match stg.chan(&norm).map(|c| c.topic.clone()).unwrap_or_default() {
-            topic if topic.is_empty() => deliver( // RFC numeric 331
-                stg, id,
-                &proto::line(&stg.prefix(), "331", &format!("{} :No topic is set", raw)),
-            ),
-            topic => deliver( // RFC numeric 332
-                stg, id,
-                &proto::line(&stg.prefix(), "332", &format!("{} :{}", raw, topic)),
-            ),
+            topic if topic.is_empty() => numeric(stg, id, "331", &[raw, "No topic is set"]), // RFC numeric 331
+            topic => numeric(stg, id, "332", &[raw, &format!(":{}", topic)]), // RFC numeric 332
         },
     }
 }
@@ -1042,24 +1030,12 @@ fn mode_channel_query(stg: &mut ServerState, id: usize, raw: &str) {
     let banmasks: Vec<String> = stg.chan(&norm).map(|c| c.ban_mask_list().to_vec()).unwrap_or_default();
 
     if let Some(ms) = modestring {
-        deliver(
-            stg,
-            id,
-            &proto::line(&stg.prefix(), "324", &format!("{} {}", raw, ms)), // RFC numeric 324 shape: channel + mode string
-        );
+        numeric(stg, id, "324", &[raw, &ms]); // RFC numeric 324 shape: channel + mode string
     }
     for mask in banmasks.iter() {
-        deliver(
-            stg,
-            id,
-            &proto::line(&stg.prefix(), "367", &format!("{} {}", raw, mask)), // RFC numeric 367: channel + banid
-        );
+        numeric(stg, id, "367", &[raw, mask]); // RFC numeric 367: channel + banid
     }
-    deliver(
-        stg,
-        id,
-        &proto::line(&stg.prefix(), "368", &format!("{} :End of channel ban list", raw)),
-    );
+    numeric(stg, id, "368", &[raw, "End of channel ban list"]); // RFC numeric 368
 }
 
 /// INVITE (RFC 4.2.5): the inviter must be on the channel (ERR_NOTONCHANNEL, RFC
@@ -1113,11 +1089,7 @@ fn handle_invite(stg: &mut ServerState, id: usize, cmd: &Command) {
     }
 
     // Numeric-341 (RPL_INVITING): the inviter hears confirmation, target first.
-    deliver(
-        stg,
-        id,
-        &proto::line(&stg.prefix(), "341", &format!("{} {}", raw_chan, target_param)), // RFC numeric 341: channel + nick
-    );
+    numeric(stg, id, "341", &[raw_chan, target_param]); // RFC numeric 341: channel + nick
 
     // The invited user receives the INVITE line with their own nick as parameter.
     let comment_tail = match relay_comment { Some(cmt) if !cmt.is_empty() => format!(" :{}", cmt), _ => String::new() };
@@ -1214,27 +1186,19 @@ fn handle_names(stg: &mut ServerState, id: usize, cmd: &Command) {
                 .collect::<Vec<String>>())
         });
         if let Some(nicks) = markers_now {
-            deliver(
-                stg, id,
-                &proto::line(&stg.prefix(), "353", &format!("{} :{}", raw, nicks.join(" "))), // RFC numeric 353: single chunk per spec convention here
-            );
+            numeric(stg, id, "353", &["=", raw, &format!(":{}", nicks.join(" "))]); // RFC 353: visibility symbol then channel
         }
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "366", &format!("{} :End of /NAMES list", raw)), // listing-grammar trailing preserved verbatim; artifact marker excised per round-4 cleanup
-        );
+        numeric(stg, id, "366", &[raw, "End of /NAMES list"]); // RFC numeric 366
     }
 }
 
 /// Numeric-321/323 shapes opening and closing a LIST enumeration.
 fn deliver_list_start(stg: &mut ServerState, id: usize) {
-    let p = stg.prefix();
-    deliver(stg, id, &proto::line(&p, "321", ":Start of /LIST command")); // RFC numeric 321 trailing shape
+    numeric(stg, id, "321", &["Start of /LIST command"]); // RFC numeric 321 trailing shape
 }
 
 fn deliver_list_end(stg: &mut ServerState, id: usize) {
-    let p = stg.prefix();
-    deliver(stg, id, &proto::line(&p, "323", ":End of /LIST command")); // RFC numeric 323 trailing shape
+    numeric(stg, id, "323", &["End of /LIST command"]); // RFC numeric 323 trailing shape
 }
 
 /// LIST (RFC 4.2.7): enumerates channels matching the optional mask with their
@@ -1259,10 +1223,8 @@ fn handle_list(stg: &mut ServerState, id: usize, cmd: &Command) {
 
     for (display_now, topic_now, member_ids) in summaries.iter() {
         let count_now = visible_member_count(stg, id, member_ids);
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "322", &format!("{} {} :{}", display_now, count_now, if topic_now.is_empty() { "*" } else { topic_now.as_str() })), // RFC numeric 322: channel + user count + topic (asterisk when unset)
-        );
+        let topic_text_now = if topic_now.is_empty() { "*".to_string() } else { topic_now.clone() };
+        numeric(stg, id, "322", &[display_now, &count_now.to_string(), &format!(":{}", topic_text_now)]); // RFC numeric 322: channel + user count + topic (asterisk when unset)
     }
 
     deliver_list_end(stg, id); // RFC numeric 323 bracket closes the enumeration
@@ -1362,20 +1324,14 @@ fn handle_kick(stg: &mut ServerState, id: usize, cmd: &Command) {
 fn handle_away(stg: &mut ServerState, id: usize, cmd: &Command) {
     let Some(note) = cmd.params.first().map(String::as_str).filter(|s| !s.is_empty()) else {
         if let Some(u) = stg.find_by_id_mut(id) { u.away = None; }
-        deliver(
-            stg, id,
-            &proto::line(&stg.prefix(), "305", ":You are no longer marked as being away"), // RFC numeric 305: trailing shape for clearing away status
-        );
+        numeric(stg, id, "305", &["You are no longer marked as being away"]); // RFC numeric 305: trailing shape for clearing away status
         return;
     };
 
     if let Some(u) = stg.find_by_id_mut(id) {
         u.away = Some(note.chars().take(100).collect::<String>()); // conventional cap, truncation not error
     }
-    deliver(
-        stg, id,
-        &proto::line(&stg.prefix(), "306", ":You have been marked as being away"), // RFC numeric 306: trailing shape for setting away status
-    );
+    numeric(stg, id, "306", &["You have been marked as being away"]); // RFC numeric 306: trailing shape for setting away status
 }
 
 
@@ -1475,7 +1431,7 @@ fn relay_user_message(
         let nick_now: String = stg.find_by_id(target_id_now).map(|u| u.nick.clone()).unwrap_or_default();
 
         if let Some(note) = away_now {
-            deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note[0..].to_string())));
+            numeric(stg, id, "301", &[&nick_now, &format!(":{}", note)]);
         }
     }
 }
@@ -1582,7 +1538,7 @@ fn deliver_to_userhost(
         let nick_now: String = stg.find_by_id(target_id_now).map(|u| u.nick.clone()).unwrap_or_default();
         if let Some(note) = away_now {
 
-            deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note[0..].to_string())));
+            numeric(stg, id, "301", &[&nick_now, &format!(":{}", note)]);
         }
     }
 }
@@ -1627,9 +1583,7 @@ fn handle_userhost(stg: &mut ServerState, id: usize, cmd: &Command) {
             }
         }).collect::<Vec<String>>();
 
-    deliver(
-        stg, id, &proto::line(&stg.prefix(), "302", &format!("{} :{}", sender_nick(stg, id), entries_now.join(" "))),
-    );
+    numeric(stg, id, "302", &[&format!(":{}", entries_now.join(" "))]);
 }
 
 
@@ -1656,7 +1610,7 @@ fn handle_ison(stg: &mut ServerState, id: usize, cmd: &Command) {
             }
         }).collect::<Vec<String>>();
 
-    deliver(stg, id, &proto::line(&stg.prefix(), "303", &format!("{} :{}", sender_nick(stg, id), present_now.join(" "))));
+    numeric(stg, id, "303", &[&format!(":{}", present_now.join(" "))]);
 }
 
 
@@ -1688,28 +1642,20 @@ fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) {
             if !visible_now { deliver_nosuch_nick(stg, id, target_param_now); return; }
 
 
-            deliver(
-                stg, id, &proto::line(&stg.prefix(), "311", &format!("{} {} {} * :{}", nick_now[0..].to_string(), user_now[0..].to_string(), host_now[0..].to_string(), &stg.name)),
-
-            );
+            numeric(stg, id, "311", &[&nick_now, &user_now, &host_now, "*", &format!(":{}", stg.name)]);
 
 
             if oper_now {
-                deliver(stg, id, &proto::line(&stg.prefix(), "313", &format!("{} is operating as an IRC Operator", nick_now[0..].to_string())));
-
+                numeric(stg, id, "313", &[&format!("{} is operating as an IRC Operator", nick_now)]);
             }
 
 
             if let Some(note_now) = away_now.clone() {
-
-                deliver(stg, id, &proto::line(&stg.prefix(), "301", &format!("{} :{}", nick_now[0..].to_string(), note_now[0..].to_string())));
+                numeric(stg, id, "301", &[&nick_now, &format!(":{}", note_now)]);
             }
 
 
-            deliver(
-                stg, id, &proto::line(&stg.prefix(), "317", &format!("{} {} :seconds idle", nick_now[0..].to_string(), idle_now)),
-
-            );
+            numeric(stg, id, "317", &[&nick_now, &idle_now.to_string(), "seconds idle"]);
 
 
             let chans_now: Vec<String> = chans_now_raw.iter()
@@ -1717,17 +1663,11 @@ fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) {
                 .filter_map(|ck| stg.chan(ck).map(|c| c.display.clone())).collect::<Vec<String>>();
 
             for chunk_now in chans_now.chunks(10) {
-
-                deliver(
-                    stg, id, &proto::line(&stg.prefix(), "319", &format!("{} {} is on :{}", nick_now[0..].to_string(), chans_now.len().to_string(), chunk_now.join(" "))),
-
-                );
+                numeric(stg, id, "319", &[&nick_now, &chans_now.len().to_string(), &format!("is on :{}", chunk_now.join(" "))]);
             }
 
 
-            deliver(
-                stg, id, &proto::line(&stg.prefix(), "318", &format!("{} :End of /WHOIS list", nick_now[0..].to_string())),
-            );
+            numeric(stg, id, "318", &[&nick_now, "End of /WHOIS list"]);
         }
     }
 }
@@ -1766,19 +1706,17 @@ fn handle_whowas(stg: &mut ServerState, id: usize, cmd: &Command) {
 
 
     if hits_now.is_empty() {
-        deliver(stg, id, &proto::line(&stg.prefix(), "406", &format!("{} {} :No such nick", sender_nick(stg, id), nick_raw_now))); // WASNOSUCHNICK: mandatory recipient token then the referenced name
+        numeric(stg, id, "406", &[nick_raw_now, "No such nick"]); // WASNOSUCHNICK: mandatory recipient token then the referenced name
         return;
     }
 
 
     for (nick_now, trailing_now) in hits_now.iter() {
-        deliver(stg, id, &proto::line(&stg.prefix(), "314", &format!("{} * :{}", nick_now[0..].to_string(), trailing_now)));
+        numeric(stg, id, "314", &[nick_now, "*", trailing_now]);
     }
 
 
-    deliver(
-        stg, id, &proto::line(&stg.prefix(), "369", &format!("{} :End of /WHOWAS list", nick_raw_now[0..].to_string())),
-    );
+    numeric(stg, id, "369", &[nick_raw_now, "End of /WHOWAS list"]);
 }
 
 
@@ -1835,38 +1773,36 @@ fn handle_who(stg: &mut ServerState, id: usize, cmd: &Command) {
 
 
     if visible_ids_now.is_empty() {
-        deliver(stg, id, &proto::line(&stg.prefix(), "315", &format!("{} :End of /WHO list", mask_raw_now[0..].to_string())));
+        numeric(stg, id, "315", &[mask_raw_now, "End of /WHO list"]);
         return;
     }
 
 
-    let replies_now: Vec<(String, String)> = visible_ids_now
-
+    let who_chan_now: String = if is_channel_name_now { mask_raw_now.clone() } else { "*".to_string() };
+    let server_name_now: String = stg.name.clone();
+    let replies_now: Vec<[String; 7]> = visible_ids_now
         .iter()
-
         .filter_map(|mid| match stg.find_by_id(*mid) {
-
             None => None,
+            // RFC 2812 352: <channel> <user> <host> <server> <nick> <flags> :<hop> <realname>
+            Some(u) => Some([
+                who_chan_now.clone(),
+                u.user.clone(),
+                host_of_user(stg, u.id),
+                server_name_now.clone(),
+                u.nick.clone(),
+                who_marker_for(stg, id, u),
+                format!(":0 {}", u.realname),
+            ]),
+        })
+        .collect();
 
-            Some(u) => {
-
-                let marker_now: String = who_marker_for(stg, id, u);
-
-                Some((u.nick.clone(), format!("{} {} {}", u.user.clone(), host_of_user(stg, u.id), marker_now)))
-
-            }
-        }).collect::<Vec<(String, String)>>();
-
-
-    for (nick_now, trailing_now) in replies_now.iter() {
-
-        deliver(stg, id, &proto::line(&stg.prefix(), "352", &format!("{} * :{}", nick_now[0..].to_string(), trailing_now)));
+    for r in replies_now.iter() {
+        numeric(stg, id, "352", &[&r[0], &r[1], &r[2], &r[3], &r[4], &r[5], &r[6]]);
     }
 
 
-    deliver(
-        stg, id, &proto::line(&stg.prefix(), "315", &format!("{} :End of /WHO list", mask_raw_now[0..].to_string())),
-    );
+    numeric(stg, id, "315", &[mask_raw_now, "End of /WHO list"]);
 }
 
 
@@ -1992,11 +1928,11 @@ fn handle_info_reply(stg: &mut ServerState, id: usize, cmd: &Command) {
 
         "LUSER(S)" | "LUSERS" => {
 
-            numeric(stg, id, "251", &["LUSER IS HCAP 10 NCHN 10 NLOC 10 TCHAN 99 TSILE 0"]); // recipient token first via the shared chokepoint
+            numeric(stg, id, "251", &[&format!("There are {} users and {} invisible on 1 servers", stg.user_count(), stg.invis_count())]);
 
-            numeric(stg, id, "254", &[&format!("- {} users, {} identical", 0, 0)]); // normalized trailing shape through the shared chokepoint
+            numeric(stg, id, "254", &[&stg.chan_count().to_string(), "channels formed"]);
 
-            numeric(stg, id, "255", &[&format!("- {} operator(s), {} unknown", 0, 0)]); // normalized trailing shape through the shared chokepoint
+            numeric(stg, id, "255", &[&format!("I have {} clients and 0 servers", stg.user_count())]);
 
         }
 

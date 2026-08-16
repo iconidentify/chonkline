@@ -17,8 +17,13 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 /// Per-connection flood window (RFC 8.10): one message per two seconds is the
 /// sustainable rate; bursts above six messages within two seconds have the
 /// excess lines silently dropped.
-const FLOOD_WINDOW: Duration = Duration::from_secs(2);
 const FLOOD_BURST: usize = 6;
+/// Env-tunable (CHONKLINE_FLOOD_WINDOW_MS, default 2000ms) so the test suite can
+/// shrink it; production keeps the 2-second default.
+fn flood_window() -> Duration {
+    let ms: u64 = std::env::var("CHONKLINE_FLOOD_WINDOW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+    Duration::from_millis(ms.max(1))
+}
 
 fn find_terminator(buf: &[u8]) -> Option<usize> {
     for (i, &b) in buf.iter().enumerate() {
@@ -190,9 +195,10 @@ fn route(
 
         // Flood control (RFC 8.10): excess over the burst is dropped silently.
         let now = Instant::now();
+        let fw = flood_window();
         flood.push_back(now);
         while let Some(front) = flood.front() {
-            if now.duration_since(*front) > FLOOD_WINDOW {
+            if now.duration_since(*front) > fw {
                 flood.pop_front();
             } else {
                 break;
