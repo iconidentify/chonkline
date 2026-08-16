@@ -25,6 +25,8 @@ spec:
           env:
             - name: IRC_PORT
               value: "6667"
+            - name: IRC_SERVER_NAME
+              value: "irc.chonkbase.net"
           ports:
             - name: irc
               containerPort: 6667

@@ -495,7 +495,7 @@ fn welcome_sequence(stg: &mut ServerState, id: usize, _nick_snapshot_at_completi
         "001",
         &[&format!("Welcome to the {} Internet Relay Chat Network", stg.name)],
     );
-    numeric(stg, id, "002", &[&format!("Your host is {}, running {}", host_of(stg, id), stg.version)]);
+    numeric(stg, id, "002", &[&format!("Your host is {}, running {}", stg.name, stg.version)]); // RPL_YOURHOST: server name, not client peer
     numeric(stg, id, "003", &["This server is continuously created"]);
     // RPL_MYINFO: servername, version, user modes, channel modes actually supported.
     let myinfo_srv = stg.name.clone();
@@ -854,6 +854,13 @@ fn mode_channel(stg: &mut ServerState, id: usize, raw: &str, terms_in: &[String]
         return;
     }
 
+    // Bare list-mode query (MODE #chan b, or +b with no mask): list the bans
+    // (367/368), available to any user without chanop.
+    if terms.len() == 1 && terms[0].trim_start_matches(['+', '-']) == "b" {
+        mode_ban_list(stg, id, raw);
+        return;
+    }
+
     let is_op = stg.chan(&norm).map(|c| c.is_op(id)).unwrap_or(false);
     let sender_prefix = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
     let mut member_changes: Vec<String> = Vec::new(); // privilege-mutation broadcasts queued here
@@ -1030,8 +1037,15 @@ fn mode_channel_query(stg: &mut ServerState, id: usize, raw: &str) {
     let banmasks: Vec<String> = stg.chan(&norm).map(|c| c.ban_mask_list().to_vec()).unwrap_or_default();
 
     if let Some(ms) = modestring {
-        numeric(stg, id, "324", &[raw, &ms]); // RFC numeric 324 shape: channel + mode string
+        numeric(stg, id, "324", &[raw, &ms]); // RFC numeric 324: channel + mode string only
     }
+    let _ = banmasks; // the ban list is emitted only for an explicit `MODE #chan b` query
+}
+
+/// RPL_BANLIST (367) for each active ban, closed by RPL_ENDOFBANLIST (368).
+fn mode_ban_list(stg: &mut ServerState, id: usize, raw: &str) {
+    let norm = raw.to_lowercase();
+    let banmasks: Vec<String> = stg.chan(&norm).map(|c| c.ban_mask_list().to_vec()).unwrap_or_default();
     for mask in banmasks.iter() {
         numeric(stg, id, "367", &[raw, mask]); // RFC numeric 367: channel + banid
     }
