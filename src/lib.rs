@@ -101,6 +101,23 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
         None => None,
     };
 
+    // HTTPS for the web property, sharing the IRC certificate. Only starts when
+    // both a port and a usable certificate are configured; a failure here never
+    // affects the IRC listeners.
+    if let Some(https_port) = std::env::var("IRC_HTTPS_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+        if https_port != 0 {
+            if let Some((_, cert, key)) = tls::configured() {
+                match tls::acceptor_from_files(&cert, &key) {
+                    Ok(acceptor) => {
+                        let https_state = state.clone();
+                        tokio::spawn(async move { http::serve_https(https_state, https_port, acceptor).await });
+                    }
+                    Err(e) => log::event(log::ERROR, "https.config_failed", &[("error", &e)]),
+                }
+            }
+        }
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn(async move {
         // A dedicated task owns the listener; the supervisor below consumes

@@ -99,52 +99,88 @@ pub async fn serve_http(state: Arc<Mutex<ServerState>>, port: u16) {
     serve_http_loop(state, listener).await;
 }
 
-/// Accept loop over an already-bound listener (split out for testing).
-pub async fn serve_http_loop(state: Arc<Mutex<ServerState>>, listener: TcpListener) {
+/// Serve the web property over TLS, reusing the certificate the IRC listener
+/// uses. Needed once the daemon sits behind its own load balancer rather than
+/// the shared ingress: nothing else is left to terminate HTTPS for this host.
+pub async fn serve_https(state: Arc<Mutex<ServerState>>, port: u16, acceptor: tokio_rustls::TlsAcceptor) {
+    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            crate::log::event(crate::log::ERROR, "https.bind_failed", &[("port", &port.to_string()), ("error", &e.to_string())]);
+            return;
+        }
+    };
+    crate::log::event(crate::log::INFO, "https.listening", &[("port", &port.to_string())]);
+
     loop {
-        let (mut sock, _) = match listener.accept().await {
+        let (sock, _) = match listener.accept().await {
             Ok(p) => p,
             Err(_) => continue,
         };
         let state = state.clone();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            // Read headers (bounded); we only need the request line.
-            let mut buf = [0u8; 4096];
-            let mut got = Vec::new();
-            loop {
-                match sock.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        got.extend_from_slice(&buf[..n]);
-                        if got.windows(4).any(|w| w == b"\r\n\r\n") || got.len() > 16 * 1024 {
-                            break;
-                        }
-                    }
-                    Err(_) => return,
-                }
+            match acceptor.accept(sock).await {
+                Ok(stream) => handle_conn(state, stream).await,
+                Err(_) => {} // failed handshake: nothing to serve
             }
-            let head = String::from_utf8_lossy(&got);
-            let mut parts = head.split_whitespace();
-            let _method = parts.next().unwrap_or("");
-            let target = parts.next().unwrap_or("/");
-            let path = target.split('?').next().unwrap_or("/");
-
-            let resp = {
-                let stg = state.lock().unwrap();
-                route(path, &stg)
-            };
-            let payload = format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
-                resp.status,
-                if resp.status == 200 { "OK" } else if resp.status == 404 { "Not Found" } else { "Error" },
-                resp.content_type,
-                resp.body.as_bytes().len(),
-                resp.body,
-            );
-            let _ = sock.write_all(payload.as_bytes()).await;
-            let _ = sock.flush().await;
         });
     }
+}
+
+/// Accept loop over an already-bound listener (split out for testing).
+pub async fn serve_http_loop(state: Arc<Mutex<ServerState>>, listener: TcpListener) {
+    loop {
+        let (sock, _) = match listener.accept().await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let state = state.clone();
+        tokio::spawn(async move { handle_conn(state, sock).await });
+    }
+}
+
+/// Serve one request. Generic over the stream so the plaintext and TLS
+/// listeners share a single implementation and cannot drift apart.
+async fn handle_conn<S>(state: Arc<Mutex<ServerState>>, mut sock: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Read headers (bounded); we only need the request line.
+    let mut buf = [0u8; 4096];
+    let mut got = Vec::new();
+    loop {
+        match sock.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") || got.len() > 16 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+    let head = String::from_utf8_lossy(&got);
+    let mut parts = head.split_whitespace();
+    let _method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("/");
+    let path = target.split('?').next().unwrap_or("/");
+
+    let resp = {
+        let stg = state.lock().unwrap();
+        route(path, &stg)
+    };
+    let payload = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
+        resp.status,
+        if resp.status == 200 { "OK" } else if resp.status == 404 { "Not Found" } else { "Error" },
+        resp.content_type,
+        resp.body.as_bytes().len(),
+        resp.body,
+    );
+    let _ = sock.write_all(payload.as_bytes()).await;
+    let _ = sock.flush().await;
 }
 
 /// The single-page web property. Fetches /api/stats (auto-refreshing) and

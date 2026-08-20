@@ -1,0 +1,52 @@
+# Dedicated NodeBalancer for chonkline, replacing the shared ingress path.
+#
+# Why this exists: ingress-nginx forwards a PROXY header on the TCP ports but
+# does not apply real_ip handling in its `stream` context, so the address it
+# forwards is the SNAT'd node address rather than the client. That is fixable
+# only by changing the controller's template or enabling snippets globally --
+# on a controller shared by every other service in the cluster, to solve a
+# problem only IRC has.
+#
+# Talking to the NodeBalancer directly avoids that entirely: it sends PROXY v1
+# with the true client address straight to this pod. v1 rather than v2 because
+# the daemon implements v1 and rejects v2 rather than guessing at it.
+#
+# The web property moves here too (443 -> 8443, terminated in-process) so
+# irc.chonkbase.net keeps serving its page once DNS points at this balancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: chonkline-lb
+  namespace: chonkline
+  labels:
+    app.kubernetes.io/name: chonkline
+  annotations:
+    service.beta.kubernetes.io/linode-loadbalancer-default-protocol: "tcp"
+    # PROXY protocol only on the IRC ports: those are the ones that need real
+    # client addresses for cloaks, bans and per-source limits. The HTTP ports
+    # are left plain so the web property needs no header handling.
+    service.beta.kubernetes.io/linode-loadbalancer-port-6667: '{"proxy-protocol": "v1"}'
+    service.beta.kubernetes.io/linode-loadbalancer-port-6697: '{"proxy-protocol": "v1"}'
+    service.beta.kubernetes.io/linode-loadbalancer-throttle: "20"
+spec:
+  type: LoadBalancer
+  # Cluster, not Local. Local would preserve the source address at the node,
+  # but the PROXY header already carries it -- so Local buys nothing here and
+  # costs resilience: with a single replica only the node running the pod would
+  # pass the balancer's health check, making every pod move a brief outage.
+  externalTrafficPolicy: Cluster
+  selector:
+    app.kubernetes.io/name: chonkline
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: https
+      port: 443
+      targetPort: https
+    - name: irc
+      port: 6667
+      targetPort: irc
+    - name: irc-tls
+      port: 6697
+      targetPort: irc-tls

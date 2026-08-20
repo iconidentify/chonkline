@@ -77,6 +77,11 @@ spec:
               value: "/certs/tls.crt"
             - name: IRC_TLS_KEY
               value: "/certs/tls.key"
+            # HTTPS for the web property, sharing the same certificate. Behind
+            # the dedicated load balancer there is no ingress left to terminate
+            # TLS for irc.chonkbase.net, so the daemon does it.
+            - name: IRC_HTTPS_PORT
+              value: "8443"
             # Admission control.
             #
             # The GLOBAL ceiling is always safe and always on: it does not care
@@ -130,6 +135,8 @@ spec:
               containerPort: 6697
             - name: http
               containerPort: 8080
+            - name: https
+              containerPort: 8443
           volumeMounts:
             - name: data
               mountPath: /var/lib/chonkline
