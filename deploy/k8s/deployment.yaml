@@ -63,10 +63,16 @@ spec:
             # its own header a client can forge one and choose its apparent
             # address. Afterwards a forged line lands after the real one and is
             # parsed harmlessly as an IRC command.
+            # Now "required": both remaining paths prepend a header -- the
+            # dedicated NodeBalancer (PROXY v1, per-port) and, while it is still
+            # in place as a fallback, the shared ingress (":PROXY:PROXY"). A
+            # forged header from a client therefore lands after the real one and
+            # is parsed harmlessly as an IRC command rather than setting the
+            # client's apparent address.
             - name: IRC_PROXY_PROTOCOL
-              value: "optional"
+              value: "1"
             - name: IRC_TLS_PROXY_PROTOCOL
-              value: "optional"
+              value: "1"
             # TLS is terminated in-process so the PROXY header arrives ahead of
             # the handshake and TLS clients get their real address, exactly like
             # plaintext ones. The certificate is the same cert-manager secret the
@@ -104,9 +110,11 @@ spec:
             # address -- so a per-source cap of 5 would not admit 5 connections
             # per user, it would admit 5 for the entire network.
             #
-            # Setting them explicitly would override that interlock and cause
-            # exactly that outage. Add them in the same change that flips
-            # IRC_PROXY_PROTOCOL to "1", not before:
+            # They stay unset for one more step: while the shared ingress remains
+            # as a fallback, connections arriving that way still carry a SNAT'd
+            # node address, so only a handful of distinct sources exist on that
+            # path. Enable these once the ingress entries are removed and every
+            # client arrives via the dedicated balancer:
             #
             #   IRC_MAX_CLONES_PER_IP: "5"
             #   IRC_MAX_CONNECTS_PER_MIN: "30"
