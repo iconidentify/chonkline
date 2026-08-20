@@ -35,6 +35,13 @@ impl Client {
     }
 
 
+    /// Read lines until `pred` matches one, returning it (empty string on EOF or
+    /// socket error).
+    ///
+    /// Consumed lines are drained *past* their terminator. Draining only up to
+    /// it leaves the terminator at the head of the buffer, so the next scan
+    /// finds a zero-length line and spins forever — which only shows up when
+    /// the sought line is not the first one received.
     pub fn read_until(&mut self, pred: impl Fn(&str) -> bool) -> String {
         let mut rest_now: Vec<u8> = Vec::new();
 
@@ -42,17 +49,26 @@ impl Client {
 
         loop {
 
-            let n_now: usize = match self.rd_now.read(&mut chunk_now) { Ok(n) => n, Err(_) => return String::new() };
+            let n_now: usize = match self.rd_now.read(&mut chunk_now) {
+                Ok(0) => return String::new(), // EOF: the peer closed, no line will arrive
+                Ok(n) => n,
+                Err(_) => return String::new(),
+            };
 
             rest_now.extend_from_slice(&chunk_now[..n_now]);
 
-            while let Some(pos_now) = rest_now.iter().position(|b| matches!(*b, b'\r')) {
+            while let Some(pos_now) = rest_now.iter().position(|b| matches!(*b, b'\r' | b'\n')) {
 
                 let line_now: String = String::from_utf8_lossy(&rest_now[..pos_now]).to_string();
 
-                rest_now.drain(..pos_now);
+                // Drop the line and its terminator, including a CR-LF pair.
+                let mut cut_now: usize = pos_now + 1;
+                if rest_now.get(pos_now) == Some(&b'\r') && rest_now.get(cut_now) == Some(&b'\n') {
+                    cut_now += 1;
+                }
+                rest_now.drain(..cut_now);
 
-                if pred(&line_now) { return line_now; }
+                if !line_now.is_empty() && pred(&line_now) { return line_now; }
 
             }
         }

@@ -214,6 +214,7 @@ pub struct Chn {
     secret: bool,        // +s
     op_topic: bool,      // +t
     moderated: bool,     // +m
+    regonly: bool,       // +R (registered accounts only)
     pub key_limit: i32,  // +l; 0 = unlimited
     chan_key: Option<String>, // +k
     bans: Vec<String>,   // +b masks (lowercased)
@@ -242,6 +243,7 @@ impl Chn {
             secret: false,
             op_topic: false,
             moderated: false,
+            regonly: false,
             key_limit: 0,
             chan_key: None,
             bans: Vec::new(),
@@ -260,6 +262,10 @@ impl Chn {
     pub fn nomsg(&self) -> bool { self.nomsg }
     pub fn op_topic(&self) -> bool { self.op_topic }
     pub fn moderated(&self) -> bool { self.moderated }
+    /// +R: only clients authenticated to a services account may join. This is
+    /// the one admission control that works without trustworthy addresses,
+    /// which makes it the usable lever during an identity outage.
+    pub fn regonly(&self) -> bool { self.regonly }
     pub fn chan_key(&self) -> Option<&str> { self.chan_key.as_deref() }
 
     pub fn is_member(&self, cx_id: usize) -> bool { self.members.contains(&cx_id) }
@@ -305,6 +311,7 @@ impl Chn {
             'p' => self.private = on,
             's' => self.secret = on,
             't' => self.op_topic = on,
+            'R' => self.regonly = on,
             'm' => self.moderated = on,
             _ => {}
         }
@@ -487,6 +494,15 @@ pub struct ServerState {
 
     /// Path to the LLM-generated release-notes JSON served by the web property.
     pub release_notes_path: Option<String>,
+
+    /// Admission-control bounds and live per-source accounting. Both are keyed
+    /// on the client's real address, so they are only meaningful when the PROXY
+    /// header is parsed (see `crate::proxyproto`).
+    pub limits: crate::limits::Limits,
+    pub sources: crate::limits::SourceTable,
+
+    /// Server-wide address bans (K-lines), persisted across restarts.
+    pub bans: crate::bans::BanStore,
 }
 
 impl ServerState {
@@ -517,6 +533,9 @@ impl ServerState {
             grace_reclaim: HashMap::new(),
             accounts: crate::accounts::AccountStore::load(std::env::var("IRC_ACCOUNTS_PATH").ok()),
             chanreg: crate::channels::ChannelRegistry::load(std::env::var("IRC_CHANNELS_PATH").ok()),
+            limits: crate::limits::Limits::default(),
+            sources: crate::limits::SourceTable::new(),
+            bans: crate::bans::BanStore::load(std::env::var("IRC_BANS_PATH").ok()),
             total_connections: 0,
             peak_users: 0,
             messages_relayed: 0,
@@ -789,13 +808,6 @@ impl ServerState {
     pub fn invis_count(&self) -> usize { self.users.values().filter(|u| u.invis).count() }
 
     pub fn oper_count(&self) -> usize { self.users.values().filter(|u| u.oper).count() }
-
-    /// Iteration over registered users (mutable) for broadcasts.
-    pub(crate) fn each_user_mut<F: FnMut(&mut Cx)>(&mut self, mut f: F) {
-        for (_, u) in self.users.iter_mut() {
-            f(u);
-        }
-    }
 
     /// Iteration over registered users (shared) for broadcasts.
     pub fn each_user(&self) -> impl Iterator<Item = &Cx> + '_ {

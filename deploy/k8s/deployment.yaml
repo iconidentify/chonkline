@@ -42,6 +42,39 @@ spec:
                   key: key
             - name: IRC_CLOAK_SUFFIX
               value: "users.chonkbase.net"
+            # Client addresses arrive in a PROXY protocol v1 header from the
+            # ingress. Without parsing it every client is cloaked from the
+            # ingress pod's own address, so all users share one cloak and no
+            # ban, limit, or attribution is possible. Fails closed: a missing or
+            # malformed header drops the connection rather than silently
+            # falling back and reintroducing the shared cloak.
+            - name: IRC_PROXY_PROTOCOL
+              value: "1"
+            # The TLS sidecar forwards over loopback without a header (see the
+            # note on the tls container below), so loopback stays exempt.
+            - name: IRC_PROXY_PROTOCOL_EXEMPT
+              value: "127.0.0.1,::1"
+            # Admission control. The per-source bounds are only meaningful with
+            # real addresses above; they self-disable if PROXY parsing is off,
+            # so a shared address can never be capped as though it were one user.
+            - name: IRC_MAX_CLONES_PER_IP
+              value: "5"
+            - name: IRC_MAX_CLIENTS
+              value: "1024"
+            - name: IRC_MAX_CONNECTS_PER_MIN
+              value: "30"
+            # Aggregate per-source message budget, above the per-connection
+            # burst window, so spreading traffic across connections no longer
+            # multiplies the allowance.
+            - name: IRC_MAX_MESSAGES_PER_10S
+              value: "60"
+            - name: IRC_MAX_FLOOD_VIOLATIONS
+              value: "10"
+            # Persistent operator bans (KLINE), alongside the other stores.
+            - name: IRC_BANS_PATH
+              value: "/var/lib/chonkline/bans.db"
+            - name: IRC_LOG_LEVEL
+              value: "info"
             - name: IRC_OPER_USER
               valueFrom:
                 secretKeyRef:
@@ -86,7 +119,23 @@ spec:
             capabilities:
               drop: ["ALL"]
         # TLS on 6697: terminates TLS with the cert-manager cert, forwards plaintext
-        # to the daemon on 6667. (ingress does not send PROXY protocol to this backend.)
+        # to the daemon on 6667 over loopback.
+        #
+        # The ingress DOES send PROXY protocol, on both 6667 and 6697 — the
+        # tcp-services map marks each with ":PROXY" and the controller runs with
+        # use-proxy-protocol: "true". An earlier comment here claimed the
+        # opposite, which is why the discarded-client-address bug went unnoticed.
+        #
+        # ghostunnel cannot consume that header: its --proxy-protocol flag EMITS
+        # v2 to a backend, it does not accept one inbound. So while 6697 stays
+        # mapped with ":PROXY" it reads the header as a TLS record and the
+        # handshake fails. Removing ":PROXY" from the 6697 mapping in
+        # ingress-nginx/tcp-services (managed out-of-band) is the fix.
+        #
+        # Consequence to be aware of: ghostunnel forwards over loopback without
+        # a header, so TLS users are exempt from PROXY parsing and all share one
+        # cloak. Only 6667 gets real per-client attribution until TLS terminates
+        # in-process.
         - name: tls
           image: ghostunnel/ghostunnel:v1.8.2
           args:

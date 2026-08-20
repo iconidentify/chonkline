@@ -47,6 +47,65 @@ All configuration is via environment variables.
 | `IRC_CHANNELS_PATH` | *(unset)*        | Channel registry file; unset = in-memory only |
 | `IRC_CLOAK_SECRET`  | *(built-in)*     | HMAC key for host cloaks (set in production)   |
 | `IRC_CLOAK_SUFFIX`  | `chonkbase.net`  | Domain suffix appended to cloaked hosts       |
+| `IRC_BANS_PATH`     | *(unset)*        | K-line store file; unset = in-memory only     |
+| `IRC_LOG_LEVEL`     | `info`           | `error` / `warn` / `info` / `debug` / `silent` |
+
+### Behind a proxy
+
+| Env var                      | Default           | Meaning                                        |
+|------------------------------|-------------------|------------------------------------------------|
+| `IRC_PROXY_PROTOCOL`         | *(off)*           | Parse a PROXY protocol v1 header per connection |
+| `IRC_PROXY_PROTOCOL_EXEMPT`  | `127.0.0.1,::1`   | Peers admitted without a header                |
+
+A proxy terminates the client's connection and opens its own, so `peer_addr()`
+reports the proxy rather than the client. Behind a single ingress that address
+is identical for every client — which collapses cloaks, bans and per-source
+limits onto one value for the entire network. With `IRC_PROXY_PROTOCOL=1` the
+original address is read from the header the proxy prepends.
+
+It **fails closed**: a missing or malformed header drops the connection. Falling
+back to `peer_addr()` would silently restore the shared-address behaviour, which
+is precisely the failure this guards against. Loopback is exempt by default so a
+TLS sidecar in the same pod keeps working.
+
+### Limits
+
+| Env var                    | Default | Meaning                                          |
+|----------------------------|---------|--------------------------------------------------|
+| `IRC_MAX_CLONES_PER_IP`    | `5`     | Concurrent connections from one address          |
+| `IRC_MAX_CLIENTS`          | `1024`  | Concurrent connections server-wide               |
+| `IRC_MAX_CONNECTS_PER_MIN` | `30`    | New connections per minute from one address      |
+| `IRC_MAX_MESSAGES_PER_10S` | `60`    | Aggregate messages per 10s from one address      |
+| `IRC_MAX_FLOOD_VIOLATIONS` | `10`    | Budget violations tolerated before disconnect    |
+| `IRC_LIMIT_EXEMPT`         | *(none)*| Comma-separated addresses exempt from all limits |
+
+The per-source bounds default to **off** unless `IRC_PROXY_PROTOCOL` is enabled.
+A per-source cap applied to a shared address is not a per-user limit, it is a
+global one — enabling it in that state would be an outage rather than a
+protection. The server-wide ceiling always applies.
+
+Flood control runs in two tiers: a per-connection burst window, then the
+aggregate per-source budget above. Without the second tier, spreading traffic
+across N connections multiplies the allowance by N. Persistent offenders are
+disconnected with `ERROR :Excess flood` rather than throttled indefinitely.
+
+## Operator commands
+
+| Command                                | Effect                                        |
+|----------------------------------------|-----------------------------------------------|
+| `KILL <nick> [:reason]`                | Disconnect a user                             |
+| `KLINE <mask> [secs] [:reason]`        | Persistent address ban; `0`/omitted = forever |
+| `UNKLINE <mask>`                       | Remove a ban by exact mask                    |
+
+K-line masks are globs (`*`, `?`) matched against the client's **real address**,
+never the cloak — a cloak match would ban every user at once behind a proxy that
+does not forward client addresses. Bans persist to `IRC_BANS_PATH` and survive a
+restart. Setting one also kills anyone already connected from a matching address.
+
+Channel mode `+R` restricts a channel to clients authenticated to a services
+account. It is the one admission control that does not depend on trustworthy
+addresses, which makes it the usable lever when cloaking or proxy handling is
+misconfigured.
 
 ## Test
 

@@ -38,6 +38,32 @@ pub(crate) fn cloak_host(real: &str) -> String {
     format!("{}.{}", crate::crypto::hex(&mac[..4]), suffix)
 }
 
+/// Whether the client listener sits behind a proxy that prefixes each
+/// connection with a PROXY protocol v1 header (IRC_PROXY_PROTOCOL=1).
+fn proxy_protocol_enabled() -> bool {
+    matches!(
+        std::env::var("IRC_PROXY_PROTOCOL").unwrap_or_default().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Peers permitted to connect without a PROXY header while the feature is on.
+///
+/// The TLS sidecar terminates in the same pod and forwards over loopback
+/// without emitting a header, so requiring one on every connection would fail
+/// every TLS user closed. Loopback is exempt by default; the list is
+/// configurable via IRC_PROXY_PROTOCOL_EXEMPT.
+///
+/// Note this exemption is why TLS users currently share one cloak: ghostunnel
+/// cannot forward the original address, so the daemon only ever sees loopback
+/// for them. Giving them real attribution means terminating TLS in-process.
+fn proxy_exempt_peer(peer: &str) -> bool {
+    match std::env::var("IRC_PROXY_PROTOCOL_EXEMPT") {
+        Ok(list) => list.split(',').map(str::trim).any(|e| !e.is_empty() && e == peer),
+        Err(_) => peer == "127.0.0.1" || peer == "::1",
+    }
+}
+
 fn find_terminator(buf: &[u8]) -> Option<usize> {
     for (i, &b) in buf.iter().enumerate() {
         if b == b'\n' || b == b'\r' {
@@ -47,31 +73,12 @@ fn find_terminator(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Strip a CR-LF / LF / CR terminator; returns the content length.
-fn strip_terminator(seg: &mut [u8]) -> usize {
-    let mut n = seg.len();
-    if n > 0 && seg[n - 1] == b'\n' {
-        n -= 1;
-    }
-    if n > 0 && seg[n - 1] == b'\r' {
-        n -= 1;
-    }
-    n
-}
-
 /// Accept one client connection, run its read/write tasks, return the id.
 pub fn spawn_connection(
     state: &Arc<Mutex<ServerState>>,
     sock: TcpStream,
 ) -> usize {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    // Peer address stands in for the client-supplied hostname and any ident/
-    // reverse-DNS lookups, which are unavailable in this deployment.
-    let real_host = sock
-        .peer_addr()
-        .map(|a| a.ip().to_string())
-        .unwrap_or("0.0.0.0".into());
-    let host = cloak_host(&real_host);
 
     // OS-level keepalive on every accepted socket: dead peers behind a load
     // balancer surface as half-open connections that no application-layer ping
@@ -81,7 +88,80 @@ pub fn spawn_connection(
         .with_interval(Duration::from_secs(10));
     let _ = SockRef::from(&sock).set_tcp_keepalive(&ka); // best effort: capability-less platforms keep the connection
 
-    let (mut rd, mut wr) = sock.into_split();
+    let st_owned = state.clone();
+    tokio::spawn(async move {
+        admit_and_run(st_owned, id, sock).await;
+    });
+
+    id
+}
+
+/// Resolve the client's real address, apply admission control, then run the
+/// session. Everything here is async because the PROXY header has to be read
+/// off the socket before the address — and therefore the cloak, the ban check
+/// and the per-source limits — can be known.
+async fn admit_and_run(state: Arc<Mutex<ServerState>>, id: usize, mut sock: TcpStream) {
+    let peer = sock
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "0.0.0.0".into());
+
+    // The proxy sends its header before anything else. Fail closed when the
+    // feature is on: silently falling back to peer_addr() would reintroduce the
+    // shared-cloak bug invisibly, which is precisely what this guards against.
+    let real_host = if proxy_protocol_enabled() && !proxy_exempt_peer(&peer) {
+        match crate::proxyproto::read_v1(&mut sock).await {
+            crate::proxyproto::Header::Source(addr) => addr,
+            crate::proxyproto::Header::Unknown => peer.clone(),
+            crate::proxyproto::Header::Invalid => {
+                crate::log::proxy_rejected(&peer);
+                let _ = sock.write_all(b"ERROR :Bad or missing PROXY protocol header\r\n").await;
+                return;
+            }
+        }
+    } else {
+        peer.clone()
+    };
+
+    // Bans and admission control are both keyed on that resolved address.
+    // Both decisions are taken under one short lock, and every socket write
+    // happens after it is released.
+    enum Deny {
+        Banned(String),
+        Limited(crate::limits::Refusal),
+    }
+
+    let deny = {
+        let mut guard = state.lock().unwrap();
+        let stg = &mut *guard;
+        match stg.bans.matching(&real_host) {
+            Some(ban) => Some(Deny::Banned(ban.reason.clone())),
+            None => stg
+                .sources
+                .try_admit(&stg.limits, &real_host, Instant::now())
+                .err()
+                .map(Deny::Limited),
+        }
+    };
+
+    match deny {
+        Some(Deny::Banned(reason)) => {
+            crate::log::counted("conn.banned", &real_host);
+            let _ = sock.write_all(format!("ERROR :Banned: {}\r\n", reason).as_bytes()).await;
+            return;
+        }
+        Some(Deny::Limited(why)) => {
+            crate::log::refused(why.as_str());
+            let _ = sock.write_all(format!("ERROR :{}\r\n", why.message()).as_bytes()).await;
+            return;
+        }
+        None => {}
+    }
+
+    let host = cloak_host(&real_host);
+    crate::log::conn_open(id, &real_host, &host, if proxy_protocol_enabled() { "proxy" } else { "direct" });
+
+    let (rd, mut wr) = sock.into_split();
 
     // Writer task: drain queued replies into the socket. Exits when its queue
     // closes (reader gone) or a write fails; dropping `wr` half-closes then.
@@ -96,13 +176,18 @@ pub fn spawn_connection(
     });
 
     let notify = Arc::new(Notify::new());
-    park_unregistered(&state, id, host, real_host, tx.clone(), notify.clone());
-    let st_owned = state.clone(); // owned copy: async-move captures by value only own values here
-    tokio::spawn(async move {
-        run_reader(st_owned, id, rd, notify).await;
-    });
+    park_unregistered(&state, id, host, real_host.clone(), tx.clone(), notify.clone());
 
-    id
+    run_reader(state.clone(), id, rd, notify, real_host.clone()).await;
+
+    // Release the admission slot this connection reserved, and record the close
+    // with whatever identity it had reached.
+    let nick = {
+        let mut stg = state.lock().unwrap();
+        stg.sources.release(&real_host, Instant::now());
+        stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()
+    };
+    crate::log::conn_close(id, &real_host, &nick, "closed");
 }
 
 /// Read loop: frames lines out of the byte stream (CR-LF / LF / CR per current
@@ -114,6 +199,7 @@ async fn run_reader(
     id: usize,
     mut rd: tokio::net::tcp::OwnedReadHalf,
     notify: Arc<Notify>,
+    src: String,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(proto::MAX_LINE_WITH_CRLF * 2);
     let mut flood: VecDeque<Instant> = VecDeque::new();
@@ -144,7 +230,7 @@ async fn run_reader(
             let content: Vec<u8> = buf[..pos].to_vec();
             buf.drain(..term_end);
 
-            if process_segment(&state, id, &mut flood, &content) {
+            if process_segment(&state, id, &mut flood, &content, &src) {
                 cleanup_on_eof(&state, id); // idempotent: no-ops when the session left cleanly via QUIT
                 return;
             }
@@ -164,6 +250,7 @@ fn process_segment(
     id: usize,
     flood: &mut VecDeque<Instant>,
     seg: &[u8],
+    src: &str,
 ) -> bool {
     if seg.is_empty() {
         return false; // empty messages are silently ignored (RFC 2.3.1)
@@ -171,7 +258,7 @@ fn process_segment(
     let text = String::from_utf8_lossy(seg);
     match proto::parse(&text) {
         None => false, // grammar violations: dropped silently
-        Some(cmd) => route(state, id, flood, &cmd),
+        Some(cmd) => route(state, id, flood, &cmd, src),
     }
 }
 
@@ -183,6 +270,7 @@ fn route(
     id: usize,
     flood: &mut VecDeque<Instant>,
     cmd: &proto::Command,
+    src: &str,
 ) -> bool {
     if cmd.name.len() == 3 && cmd.name.chars().all(|c| c.is_ascii_digit()) {
         return false; // numeric replies from clients are dropped (RFC 2.4)
@@ -207,7 +295,8 @@ fn route(
             u.last_rx = Instant::now(); // liveness bookkeeping (RFC 8.4)
         }
 
-        // Flood control (RFC 8.10): excess over the burst is dropped silently.
+        // Flood control (RFC 8.10), tier 1: the per-connection burst window.
+        // Excess over the burst is dropped silently.
         let now = Instant::now();
         let fw = flood_window();
         flood.push_back(now);
@@ -219,7 +308,32 @@ fn route(
             }
         }
         if flood.len() > FLOOD_BURST {
+            crate::log::flood("dropped");
             return false;
+        }
+
+        // Tier 2: the per-source aggregate budget. Without this, spreading
+        // traffic across N connections multiplies the tier-1 allowance by N —
+        // the limiter weakens in exact proportion to the abuse.
+        {
+            let stg_ref = &mut *stg;
+            match stg_ref.sources.charge_message(&stg_ref.limits, src, now) {
+                Ok(()) => {}
+                Err(false) => {
+                    crate::log::flood("dropped");
+                    return false;
+                }
+                Err(true) => {
+                    // Persistent offenders are closed rather than throttled
+                    // forever, which is what clients expect from an ircd.
+                    crate::log::flood("disconnected");
+                    let line = proto::line("", "ERROR", ":Excess flood");
+                    if let Some(u) = stg_ref.find_by_id(id) {
+                        let _ = u.tx.send(line);
+                    }
+                    return true;
+                }
+            }
         }
 
         // Registration gate: everything but the pairing commands requires a

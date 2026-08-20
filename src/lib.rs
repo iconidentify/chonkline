@@ -1,10 +1,14 @@
 pub mod accounts;
+pub mod bans;
 pub mod channels;
 pub mod cmds;
 pub mod crypto;
 pub mod http;
+pub mod limits;
+pub mod log;
 pub mod ops;
 pub mod proto;
+pub mod proxyproto;
 pub mod state;
 
 use std::net::SocketAddr;
@@ -13,6 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
+
+/// Depth of the accepted-connection handoff queue (see the accept task below).
+const ACCEPT_QUEUE: usize = 256;
 
 /// Server identity and operational configuration.
 pub struct Config {
@@ -78,10 +85,14 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
         // Round-4: fast-reconnect reclaim expiries resolve on a short cadence,
         // independently of the slow liveness interval above.
         let mut fast_iv = tokio::time::interval(Duration::from_millis(200));
-        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::unbounded_channel::<tokio::net::TcpStream>();
-        let accept_task = tokio::spawn(async move {
+        // Bounded queue: an unbounded one lets a connect flood accumulate live
+        // sockets (each an fd) faster than the supervisor can drain them. At the
+        // bound, backpressure reaches the listener and the kernel's own accept
+        // backlog absorbs the burst instead of this process.
+        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(ACCEPT_QUEUE);
+        let _accept_task = tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
-                if conn_tx.send(sock).is_err() {
+                if conn_tx.send(sock).await.is_err() {
                     break; // supervisor gone: stop accepting
                 }
             }
@@ -96,7 +107,15 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
                     Some(sock) => { ops::spawn_connection(&state, sock); }
                     None => break, // accept task ended: stop serving
                 },
-                _ = iv.tick() => { ops::liveness_tick(&state); },
+                _ = iv.tick() => {
+                    ops::liveness_tick(&state);
+                    // Aggregated refusal/flood counters surface here rather than
+                    // one line per event, so a flood cannot flood the log.
+                    log::flush_counters();
+                    if let Ok(stg) = state.lock() {
+                        log::heartbeat(stg.user_count(), stg.chan_count(), stg.sources.active_total(), stg.sources.tracked_sources());
+                    }
+                },
                 _ = fast_iv.tick() => { ops::reclaim_tick(&state); },
             }
         }
