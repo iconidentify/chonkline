@@ -42,14 +42,31 @@ spec:
                   key: key
             - name: IRC_CLOAK_SUFFIX
               value: "users.chonkbase.net"
-            # Client addresses arrive in a PROXY protocol v1 header from the
-            # ingress. Without parsing it every client is cloaked from the
-            # ingress pod's own address, so all users share one cloak and no
-            # ban, limit, or attribution is possible. Fails closed: a missing or
-            # malformed header drops the connection rather than silently
-            # falling back and reintroducing the shared cloak.
+            # Client addresses arrive in a PROXY protocol v1 header. Without it
+            # every client is cloaked from the ingress pod's own address, so all
+            # users share one cloak and no ban, limit or attribution is possible.
+            #
+            # CUTOVER: "optional" uses a header when present and falls back to
+            # the peer address when absent. It is set this way because the
+            # ingress does not send the header yet -- ingress-nginx tcp-services
+            # needs a SECOND ":PROXY" suffix for that:
+            #
+            #   "6667": chonkline/chonkline:6667:PROXY:PROXY
+            #   "6697": chonkline/chonkline:6697:PROXY:PROXY
+            #
+            # (the first controls decoding the inbound connection, the second
+            # sending upstream to us).
+            #
+            # Once that is applied and the logs show no "proxy.absent" events,
+            # change both values below to "1" to require it. Do not leave this
+            # on "optional" longer than the cutover: until the ingress prepends
+            # its own header a client can forge one and choose its apparent
+            # address. Afterwards a forged line lands after the real one and is
+            # parsed harmlessly as an IRC command.
             - name: IRC_PROXY_PROTOCOL
-              value: "1"
+              value: "optional"
+            - name: IRC_TLS_PROXY_PROTOCOL
+              value: "optional"
             # TLS is terminated in-process so the PROXY header arrives ahead of
             # the handshake and TLS clients get their real address, exactly like
             # plaintext ones. The certificate is the same cert-manager secret the

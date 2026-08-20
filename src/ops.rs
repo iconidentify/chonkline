@@ -38,13 +38,43 @@ pub(crate) fn cloak_host(real: &str) -> String {
     format!("{}.{}", crate::crypto::hex(&mac[..4]), suffix)
 }
 
-/// Whether the client listener sits behind a proxy that prefixes each
-/// connection with a PROXY protocol v1 header (IRC_PROXY_PROTOCOL=1).
-fn proxy_protocol_enabled() -> bool {
-    matches!(
-        std::env::var("IRC_PROXY_PROTOCOL").unwrap_or_default().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+/// How a listener treats the PROXY protocol header.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProxyMode {
+    /// Never look for a header; `peer_addr()` is the client.
+    Off,
+    /// Use a header when present, fall back to `peer_addr()` when absent.
+    ///
+    /// Only for cutover, and only briefly: while the proxy is not yet
+    /// prepending its own header a client can send a forged one and choose its
+    /// own apparent address. Once the proxy sends the header first, any forged
+    /// line arrives after it and is parsed harmlessly as an IRC command.
+    Optional,
+    /// Require a header; refuse the connection without one.
+    Required,
+}
+
+fn parse_mode(raw: &str) -> ProxyMode {
+    match raw {
+        "1" | "true" | "yes" | "on" | "required" => ProxyMode::Required,
+        "optional" | "detect" => ProxyMode::Optional,
+        _ => ProxyMode::Off,
+    }
+}
+
+/// Mode for the plaintext listener (IRC_PROXY_PROTOCOL).
+fn proxy_mode() -> ProxyMode {
+    parse_mode(&std::env::var("IRC_PROXY_PROTOCOL").unwrap_or_default())
+}
+
+/// Mode for the TLS listener (IRC_TLS_PROXY_PROTOCOL), defaulting to the
+/// plaintext setting. Separate because the two ports are configured
+/// independently at the proxy and can be cut over one at a time.
+fn tls_proxy_mode() -> ProxyMode {
+    match std::env::var("IRC_TLS_PROXY_PROTOCOL") {
+        Ok(v) => parse_mode(&v),
+        Err(_) => proxy_mode(),
+    }
 }
 
 /// Peers permitted to connect without a PROXY header while the feature is on.
@@ -131,18 +161,35 @@ async fn admit_and_run(
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|_| "0.0.0.0".into());
 
-    // The proxy sends its header before anything else. Fail closed when the
-    // feature is on: silently falling back to peer_addr() would reintroduce the
-    // shared-cloak bug invisibly, which is precisely what this guards against.
-    let real_host = if proxy_protocol_enabled() && !proxy_exempt_peer(&peer) {
-        match crate::proxyproto::read_v1(&mut sock).await {
-            crate::proxyproto::Header::Source(addr) => addr,
-            crate::proxyproto::Header::Unknown => peer.clone(),
-            crate::proxyproto::Header::Empty => return, // probe or hang-up: close quietly
-            crate::proxyproto::Header::Invalid => {
-                crate::log::proxy_rejected(&peer);
-                refuse(&mut sock, is_tls, "Bad or missing PROXY protocol header").await;
-                return;
+    // Resolve the client's real address from the PROXY header the proxy
+    // prepends. The stream is *peeked* first: a TLS ClientHello must not be
+    // consumed by a header read, so bytes are only taken once they are known to
+    // begin a header. That also makes Optional mode safe on the TLS port.
+    let mode = if is_tls { tls_proxy_mode() } else { proxy_mode() };
+    let real_host = if mode != ProxyMode::Off && !proxy_exempt_peer(&peer) {
+        match crate::proxyproto::peek_is_header(&sock).await {
+            crate::proxyproto::Peek::Header => match crate::proxyproto::read_v1(&mut sock).await {
+                crate::proxyproto::Header::Source(addr) => addr,
+                crate::proxyproto::Header::Unknown => peer.clone(),
+                crate::proxyproto::Header::Empty => return, // hung up mid-header
+                crate::proxyproto::Header::Invalid => {
+                    crate::log::proxy_rejected(&peer);
+                    refuse(&mut sock, is_tls, "Malformed PROXY protocol header").await;
+                    return;
+                }
+            },
+            crate::proxyproto::Peek::Closed => return, // probe or hang-up: close quietly
+            crate::proxyproto::Peek::Other => {
+                if mode == ProxyMode::Required {
+                    // Fail closed: falling back here would silently restore the
+                    // shared-address behaviour this exists to prevent.
+                    crate::log::proxy_rejected(&peer);
+                    refuse(&mut sock, is_tls, "PROXY protocol header required").await;
+                    return;
+                }
+                // Optional: proceed, but make the gap visible in the logs.
+                crate::log::counted("proxy.absent", &peer);
+                peer.clone()
             }
         }
     } else {
@@ -185,7 +232,7 @@ async fn admit_and_run(
     }
 
     let host = cloak_host(&real_host);
-    crate::log::conn_open(id, &real_host, &host, if is_tls { "tls" } else if proxy_protocol_enabled() { "proxy" } else { "direct" });
+    crate::log::conn_open(id, &real_host, &host, if is_tls { "tls" } else { "plain" });
 
     // The handshake happens only after admission, so a refused connection never
     // costs a key exchange — which matters precisely when refusals are frequent.

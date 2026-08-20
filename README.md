@@ -80,7 +80,8 @@ plaintext ones.
 
 | Env var                      | Default           | Meaning                                        |
 |------------------------------|-------------------|------------------------------------------------|
-| `IRC_PROXY_PROTOCOL`         | *(off)*           | Parse a PROXY protocol v1 header per connection |
+| `IRC_PROXY_PROTOCOL`         | *(off)*           | `1`/`required`, `optional`, or off              |
+| `IRC_TLS_PROXY_PROTOCOL`     | *(as above)*      | Same, for the TLS listener only                |
 | `IRC_PROXY_PROTOCOL_EXEMPT`  | *(none)*          | Peers admitted without a header                |
 
 A proxy terminates the client's connection and opens its own, so `peer_addr()`
@@ -89,11 +90,36 @@ is identical for every client — which collapses cloaks, bans and per-source
 limits onto one value for the entire network. With `IRC_PROXY_PROTOCOL=1` the
 original address is read from the header the proxy prepends.
 
-It **fails closed**: a missing or malformed header drops the connection. Falling
-back to `peer_addr()` would silently restore the shared-address behaviour, which
-is precisely the failure this guards against. A peer that connects and closes
-without sending anything — a TCP health probe — is closed silently rather than
-counted as a rejection.
+In `required` mode it **fails closed**: a missing or malformed header drops the
+connection. Falling back would silently restore the shared-address behaviour,
+which is precisely the failure this guards against. A peer that connects and
+closes without sending anything — a TCP health probe — is closed silently rather
+than counted as a rejection.
+
+`optional` mode is for cutover only: a header is used when present and the peer
+address is used when absent, with an aggregated `proxy.absent` counter making
+the gap visible. Until the proxy prepends its own header a client can forge one
+and choose its apparent address, so move to `required` as soon as the counter
+reaches zero. Once the proxy sends the header first, a forged line arrives after
+it and is parsed harmlessly as an IRC command.
+
+The listener is **peeked** before any header is read, so a stream that turns out
+to be a TLS ClientHello is never partially consumed. That is what allows the TLS
+port to use the same code path, and each port to be cut over independently via
+`IRC_TLS_PROXY_PROTOCOL`.
+
+### Configuring the proxy
+
+ingress-nginx does not forward client addresses by default. In its
+`tcp-services` ConfigMap the entry needs a **second** `:PROXY`:
+
+```
+"6667": chonkline/chonkline:6667:PROXY:PROXY
+```
+
+The first controls decoding the inbound connection; the second controls sending
+the header upstream. With only one, nginx decodes but does not forward, and
+every client reaches the daemon wearing the ingress pod's address.
 
 The exemption list is empty by default. It exists for deployments that still
 front the daemon with a local terminator unable to emit a header; such peers

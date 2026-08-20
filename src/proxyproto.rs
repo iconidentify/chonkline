@@ -94,6 +94,51 @@ pub fn parse_v1(line: &[u8]) -> Header {
     Header::Source(src.to_string())
 }
 
+/// What the head of a connection looks like, without consuming it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Peek {
+    /// Begins with the v1 signature: safe to read a header.
+    Header,
+    /// Something else — a TLS ClientHello, or an IRC command.
+    Other,
+    /// The peer closed without sending anything. A TCP health probe does
+    /// exactly this, so it is a silent close rather than a rejection.
+    Closed,
+}
+
+/// Inspect the first bytes of `sock` without consuming them.
+///
+/// This is what makes header handling safe on a TLS listener: reading a header
+/// from a stream that turns out to carry a ClientHello would eat the handshake.
+/// Peeking first means bytes are only taken when they really are a header.
+pub async fn peek_is_header(sock: &tokio::net::TcpStream) -> Peek {
+    const SIG: &[u8] = b"PROXY ";
+    let mut buf = [0u8; 6];
+    let mut seen = 0usize;
+
+    // A short read is normal: loop until enough bytes to decide, or the peer
+    // diverges from the signature, or it closes.
+    for _ in 0..64 {
+        match sock.peek(&mut buf[..]).await {
+            Ok(0) => return if seen == 0 { Peek::Closed } else { Peek::Other },
+            Ok(n) => {
+                seen = n;
+                let checked = n.min(SIG.len());
+                if buf[..checked] != SIG[..checked] {
+                    return Peek::Other; // diverged: definitely not a header
+                }
+                if n >= SIG.len() {
+                    return Peek::Header;
+                }
+                // Matching so far but short; yield and look again.
+                tokio::task::yield_now().await;
+            }
+            Err(_) => return if seen == 0 { Peek::Closed } else { Peek::Other },
+        }
+    }
+    Peek::Other
+}
+
 /// Read and consume a v1 header from the head of `sock`.
 ///
 /// Reads one byte at a time up to the CR-LF: the header must not be

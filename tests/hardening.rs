@@ -179,3 +179,22 @@ fn kill_requires_operator_privilege() {
     );
 }
 
+
+#[test]
+fn a_client_that_is_not_a_header_is_refused_without_its_bytes_being_eaten() {
+    // Detection peeks before reading. A stream that is not a header must be
+    // recognised as such rather than having its first line consumed as one --
+    // that distinction is what makes this safe to enable on the TLS port, where
+    // the first bytes are a ClientHello.
+    let addr = start_proxied_server();
+
+    let mut c = Client::new(&addr);
+    c.send("NICK notaheader");
+    c.send("USER notaheader 0 * :Plain");
+
+    let line = c.read_until(|l| l.contains("ERROR") || l.contains(" 001 "));
+    assert!(
+        line.contains("ERROR"),
+        "required mode must refuse a stream with no header, got {line:?}"
+    );
+}
