@@ -77,20 +77,35 @@ spec:
               value: "/certs/tls.crt"
             - name: IRC_TLS_KEY
               value: "/certs/tls.key"
-            # Admission control. The per-source bounds are only meaningful with
-            # real addresses above; they self-disable if PROXY parsing is off,
-            # so a shared address can never be capped as though it were one user.
-            - name: IRC_MAX_CLONES_PER_IP
-              value: "5"
+            # Admission control.
+            #
+            # The GLOBAL ceiling is always safe and always on: it does not care
+            # whose address a connection came from. During cutover it is the
+            # ONLY bound in force, and it is what stops a connect flood from
+            # exhausting memory -- which is not hypothetical: the pod was
+            # OOMKilled (exit 137) six times on 2026-08-20 before this shipped.
+            #
+            # Sized against the 256Mi limit below: each connection can hold up
+            # to ~128Ki of read buffer plus a rustls session, so 512 tops out
+            # near 100Mi and leaves real headroom. Observed legitimate peak
+            # outside the flood is single digits.
             - name: IRC_MAX_CLIENTS
-              value: "1024"
-            - name: IRC_MAX_CONNECTS_PER_MIN
-              value: "30"
-            # Aggregate per-source message budget, above the per-connection
-            # burst window, so spreading traffic across connections no longer
-            # multiplies the allowance.
-            - name: IRC_MAX_MESSAGES_PER_10S
-              value: "60"
+              value: "512"
+            #
+            # The PER-SOURCE bounds (clones, connect rate, message budget) are
+            # deliberately NOT set here during cutover. They self-disable while
+            # IRC_PROXY_PROTOCOL is not "required", because until the ingress
+            # forwards client addresses every user shares the ingress pod's
+            # address -- so a per-source cap of 5 would not admit 5 connections
+            # per user, it would admit 5 for the entire network.
+            #
+            # Setting them explicitly would override that interlock and cause
+            # exactly that outage. Add them in the same change that flips
+            # IRC_PROXY_PROTOCOL to "1", not before:
+            #
+            #   IRC_MAX_CLONES_PER_IP: "5"
+            #   IRC_MAX_CONNECTS_PER_MIN: "30"
+            #   IRC_MAX_MESSAGES_PER_10S: "60"
             - name: IRC_MAX_FLOOD_VIOLATIONS
               value: "10"
             # Persistent operator bans (KLINE), alongside the other stores.
@@ -133,8 +148,8 @@ spec:
             periodSeconds: 20
           # The sidecar's allocation (20m/16Mi req, 500m/64Mi lim) folds in here
           # now that TLS terminates in-process. The memory limit is raised
-          # because rustls holds per-session buffers: at IRC_MAX_CLIENTS=1024
-          # those alone can approach the old 128Mi ceiling.
+          # because rustls holds per-session buffers; with IRC_MAX_CLIENTS=512
+          # the worst case tops out near 100Mi, well inside this limit.
           resources:
             requests:
               cpu: 75m
