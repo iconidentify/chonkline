@@ -49,18 +49,15 @@ fn proxy_protocol_enabled() -> bool {
 
 /// Peers permitted to connect without a PROXY header while the feature is on.
 ///
-/// The TLS sidecar terminates in the same pod and forwards over loopback
-/// without emitting a header, so requiring one on every connection would fail
-/// every TLS user closed. Loopback is exempt by default; the list is
-/// configurable via IRC_PROXY_PROTOCOL_EXEMPT.
-///
-/// Note this exemption is why TLS users currently share one cloak: ghostunnel
-/// cannot forward the original address, so the daemon only ever sees loopback
-/// for them. Giving them real attribution means terminating TLS in-process.
+/// Empty by default: TLS is terminated in-process, so nothing legitimately
+/// reaches the daemon over loopback and every connection should carry a header.
+/// An exemption list exists for deployments that still front the daemon with a
+/// local terminator which cannot emit one — note that such peers necessarily
+/// share a single cloak, since their real address never arrives.
 fn proxy_exempt_peer(peer: &str) -> bool {
     match std::env::var("IRC_PROXY_PROTOCOL_EXEMPT") {
         Ok(list) => list.split(',').map(str::trim).any(|e| !e.is_empty() && e == peer),
-        Err(_) => peer == "127.0.0.1" || peer == "::1",
+        Err(_) => false,
     }
 }
 
@@ -73,24 +70,46 @@ fn find_terminator(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Accept one client connection, run its read/write tasks, return the id.
+/// Apply the OS-level keepalive every accepted socket gets: dead peers behind a
+/// load balancer surface as half-open connections that no application-layer
+/// ping can reach; TCP detects them in ~30s instead of lingering forever.
+fn arm_keepalive(sock: &TcpStream) {
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    let _ = SockRef::from(sock).set_tcp_keepalive(&ka); // best effort: capability-less platforms keep the connection
+}
+
+/// Accept one plaintext client connection, run its read/write tasks, return the id.
 pub fn spawn_connection(
     state: &Arc<Mutex<ServerState>>,
     sock: TcpStream,
 ) -> usize {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-
-    // OS-level keepalive on every accepted socket: dead peers behind a load
-    // balancer surface as half-open connections that no application-layer ping
-    // can reach; TCP keeps them detected in ~30s instead of lingering forever.
-    let ka = TcpKeepalive::new()
-        .with_time(Duration::from_secs(30))
-        .with_interval(Duration::from_secs(10));
-    let _ = SockRef::from(&sock).set_tcp_keepalive(&ka); // best effort: capability-less platforms keep the connection
+    arm_keepalive(&sock);
 
     let st_owned = state.clone();
     tokio::spawn(async move {
-        admit_and_run(st_owned, id, sock).await;
+        admit_and_run(st_owned, id, sock, None).await;
+    });
+
+    id
+}
+
+/// Accept one TLS client connection. The PROXY header and admission control are
+/// handled on the raw stream first, so the real client address is known before
+/// the handshake and feeds the same cloak, ban and limit paths as plaintext.
+pub fn spawn_tls_connection(
+    state: &Arc<Mutex<ServerState>>,
+    sock: TcpStream,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> usize {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    arm_keepalive(&sock);
+
+    let st_owned = state.clone();
+    tokio::spawn(async move {
+        admit_and_run(st_owned, id, sock, Some(acceptor)).await;
     });
 
     id
@@ -100,7 +119,13 @@ pub fn spawn_connection(
 /// session. Everything here is async because the PROXY header has to be read
 /// off the socket before the address — and therefore the cloak, the ban check
 /// and the per-source limits — can be known.
-async fn admit_and_run(state: Arc<Mutex<ServerState>>, id: usize, mut sock: TcpStream) {
+async fn admit_and_run(
+    state: Arc<Mutex<ServerState>>,
+    id: usize,
+    mut sock: TcpStream,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
+) {
+    let is_tls = acceptor.is_some();
     let peer = sock
         .peer_addr()
         .map(|a| a.ip().to_string())
@@ -113,9 +138,10 @@ async fn admit_and_run(state: Arc<Mutex<ServerState>>, id: usize, mut sock: TcpS
         match crate::proxyproto::read_v1(&mut sock).await {
             crate::proxyproto::Header::Source(addr) => addr,
             crate::proxyproto::Header::Unknown => peer.clone(),
+            crate::proxyproto::Header::Empty => return, // probe or hang-up: close quietly
             crate::proxyproto::Header::Invalid => {
                 crate::log::proxy_rejected(&peer);
-                let _ = sock.write_all(b"ERROR :Bad or missing PROXY protocol header\r\n").await;
+                refuse(&mut sock, is_tls, "Bad or missing PROXY protocol header").await;
                 return;
             }
         }
@@ -147,21 +173,64 @@ async fn admit_and_run(state: Arc<Mutex<ServerState>>, id: usize, mut sock: TcpS
     match deny {
         Some(Deny::Banned(reason)) => {
             crate::log::counted("conn.banned", &real_host);
-            let _ = sock.write_all(format!("ERROR :Banned: {}\r\n", reason).as_bytes()).await;
+            refuse(&mut sock, is_tls, &format!("Banned: {}", reason)).await;
             return;
         }
         Some(Deny::Limited(why)) => {
             crate::log::refused(why.as_str());
-            let _ = sock.write_all(format!("ERROR :{}\r\n", why.message()).as_bytes()).await;
+            refuse(&mut sock, is_tls, why.message()).await;
             return;
         }
         None => {}
     }
 
     let host = cloak_host(&real_host);
-    crate::log::conn_open(id, &real_host, &host, if proxy_protocol_enabled() { "proxy" } else { "direct" });
+    crate::log::conn_open(id, &real_host, &host, if is_tls { "tls" } else if proxy_protocol_enabled() { "proxy" } else { "direct" });
 
-    let (rd, mut wr) = sock.into_split();
+    // The handshake happens only after admission, so a refused connection never
+    // costs a key exchange — which matters precisely when refusals are frequent.
+    match acceptor {
+        Some(acc) => match acc.accept(sock).await {
+            Ok(stream) => run_session(&state, id, stream, &host, &real_host).await,
+            Err(e) => {
+                crate::log::counted("tls.handshake_failed", &real_host);
+                let _ = e;
+            }
+        },
+        None => run_session(&state, id, sock, &host, &real_host).await,
+    }
+
+    // Release the admission slot this connection reserved, and record the close
+    // with whatever identity it had reached.
+    let nick = {
+        let mut stg = state.lock().unwrap();
+        stg.sources.release(&real_host, Instant::now());
+        stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()
+    };
+    crate::log::conn_close(id, &real_host, &nick, "closed");
+}
+
+/// Write a refusal and close. On the TLS port the stream is not encrypted yet,
+/// so an IRC line would reach the client as protocol garbage; there the socket
+/// is simply closed.
+async fn refuse(sock: &mut TcpStream, is_tls: bool, reason: &str) {
+    if !is_tls {
+        let _ = sock.write_all(format!("ERROR :{}\r\n", reason).as_bytes()).await;
+    }
+    let _ = sock.shutdown().await;
+}
+
+/// Run one client session over an established stream, plaintext or TLS.
+async fn run_session<S>(
+    state: &Arc<Mutex<ServerState>>,
+    id: usize,
+    stream: S,
+    host: &str,
+    real_host: &str,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let (rd, mut wr) = tokio::io::split(stream);
 
     // Writer task: drain queued replies into the socket. Exits when its queue
     // closes (reader gone) or a write fails; dropping `wr` half-closes then.
@@ -176,31 +245,24 @@ async fn admit_and_run(state: Arc<Mutex<ServerState>>, id: usize, mut sock: TcpS
     });
 
     let notify = Arc::new(Notify::new());
-    park_unregistered(&state, id, host, real_host.clone(), tx.clone(), notify.clone());
+    park_unregistered(state, id, host.to_string(), real_host.to_string(), tx.clone(), notify.clone());
 
-    run_reader(state.clone(), id, rd, notify, real_host.clone()).await;
-
-    // Release the admission slot this connection reserved, and record the close
-    // with whatever identity it had reached.
-    let nick = {
-        let mut stg = state.lock().unwrap();
-        stg.sources.release(&real_host, Instant::now());
-        stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()
-    };
-    crate::log::conn_close(id, &real_host, &nick, "closed");
+    run_reader(state.clone(), id, rd, notify, real_host.to_string()).await;
 }
 
 /// Read loop: frames lines out of the byte stream (CR-LF / LF / CR per current
 /// implementation practice), enforces the message-size limit (RFC 2.3) and
 /// flood control (RFC 8.10), routes parsed commands to the dispatcher under
 /// the state lock, and performs EOF cleanup on exit.
-async fn run_reader(
+async fn run_reader<R>(
     state: Arc<Mutex<ServerState>>,
     id: usize,
-    mut rd: tokio::net::tcp::OwnedReadHalf,
+    mut rd: R,
     notify: Arc<Notify>,
     src: String,
-) {
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut buf: Vec<u8> = Vec::with_capacity(proto::MAX_LINE_WITH_CRLF * 2);
     let mut flood: VecDeque<Instant> = VecDeque::new();
 

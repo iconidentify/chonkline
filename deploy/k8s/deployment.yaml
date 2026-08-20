@@ -50,10 +50,16 @@ spec:
             # falling back and reintroducing the shared cloak.
             - name: IRC_PROXY_PROTOCOL
               value: "1"
-            # The TLS sidecar forwards over loopback without a header (see the
-            # note on the tls container below), so loopback stays exempt.
-            - name: IRC_PROXY_PROTOCOL_EXEMPT
-              value: "127.0.0.1,::1"
+            # TLS is terminated in-process so the PROXY header arrives ahead of
+            # the handshake and TLS clients get their real address, exactly like
+            # plaintext ones. The certificate is the same cert-manager secret the
+            # ghostunnel sidecar used to mount.
+            - name: IRC_TLS_PORT
+              value: "6697"
+            - name: IRC_TLS_CERT
+              value: "/certs/tls.crt"
+            - name: IRC_TLS_KEY
+              value: "/certs/tls.key"
             # Admission control. The per-source bounds are only meaningful with
             # real addresses above; they self-disable if PROXY parsing is off,
             # so a shared address can never be capped as though it were one user.
@@ -88,11 +94,16 @@ spec:
           ports:
             - name: irc
               containerPort: 6667
+            - name: irc-tls
+              containerPort: 6697
             - name: http
               containerPort: 8080
           volumeMounts:
             - name: data
               mountPath: /var/lib/chonkline
+            - name: tls-cert
+              mountPath: /certs
+              readOnly: true
           readinessProbe:
             tcpSocket:
               port: irc
@@ -103,67 +114,17 @@ spec:
               port: irc
             initialDelaySeconds: 10
             periodSeconds: 20
+          # The sidecar's allocation (20m/16Mi req, 500m/64Mi lim) folds in here
+          # now that TLS terminates in-process. The memory limit is raised
+          # because rustls holds per-session buffers: at IRC_MAX_CLIENTS=1024
+          # those alone can approach the old 128Mi ceiling.
           resources:
             requests:
-              cpu: 50m
-              memory: 32Mi
-            limits:
-              cpu: "1"
-              memory: 128Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
-            runAsGroup: 65532
-            capabilities:
-              drop: ["ALL"]
-        # TLS on 6697: terminates TLS with the cert-manager cert, forwards plaintext
-        # to the daemon on 6667 over loopback.
-        #
-        # The ingress DOES send PROXY protocol, on both 6667 and 6697 — the
-        # tcp-services map marks each with ":PROXY" and the controller runs with
-        # use-proxy-protocol: "true". An earlier comment here claimed the
-        # opposite, which is why the discarded-client-address bug went unnoticed.
-        #
-        # ghostunnel cannot consume that header: its --proxy-protocol flag EMITS
-        # v2 to a backend, it does not accept one inbound. So while 6697 stays
-        # mapped with ":PROXY" it reads the header as a TLS record and the
-        # handshake fails. Removing ":PROXY" from the 6697 mapping in
-        # ingress-nginx/tcp-services (managed out-of-band) is the fix.
-        #
-        # Consequence to be aware of: ghostunnel forwards over loopback without
-        # a header, so TLS users are exempt from PROXY parsing and all share one
-        # cloak. Only 6667 gets real per-client attribution until TLS terminates
-        # in-process.
-        - name: tls
-          image: ghostunnel/ghostunnel:v1.8.2
-          args:
-            - server
-            - --listen=0.0.0.0:6697
-            - --target=127.0.0.1:6667
-            - --cert=/certs/tls.crt
-            - --key=/certs/tls.key
-            - --disable-authentication
-          ports:
-            - name: irc-tls
-              containerPort: 6697
-          volumeMounts:
-            - name: tls-cert
-              mountPath: /certs
-              readOnly: true
-          readinessProbe:
-            tcpSocket:
-              port: irc-tls
-            initialDelaySeconds: 3
-            periodSeconds: 10
-          resources:
-            requests:
-              cpu: 20m
-              memory: 16Mi
-            limits:
-              cpu: "500m"
+              cpu: 75m
               memory: 64Mi
+            limits:
+              cpu: "1500m"
+              memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -2,7 +2,7 @@
 
 A standalone IRC server written in Rust (async, `tokio`), implementing the client
 protocol of RFC 1459 / RFC 2812 as it is practiced today. It is dependency-light:
-the only runtime dependency is `tokio`.
+`tokio` for the runtime and `rustls` for TLS.
 
 ## Features
 
@@ -22,9 +22,19 @@ the only runtime dependency is `tokio`.
   `account-notify`, `multi-prefix` (proper `CAP LS 302` negotiation)
 - **Host cloaking**: users' real addresses are hidden behind a stable HMAC cloak
   (revealed to operators via `WHOIS`)
+- **TLS** terminated in-process, sharing the cloak and limit paths with plaintext
+- **Operator tooling**: `KILL`, persistent `KLINE`/`UNKLINE` address bans
+- **Admission control**: per-source connection caps and aggregate flood limits
 
-The only runtime dependency is `tokio`; the cryptography (SHA-256, HMAC, PBKDF2,
-base64) is implemented in-tree and checked against published test vectors.
+Runtime dependencies are `tokio` and `rustls` (via `tokio-rustls`, built on the
+`ring` provider so the image needs no C toolchain). Everything else — SHA-256,
+HMAC, PBKDF2, base64, and the PEM parsing that loads the certificate — is
+implemented in-tree and checked against published test vectors.
+
+TLS was previously terminated by a ghostunnel sidecar. That sidecar could not
+forward the original client address, so every TLS user reached the daemon as
+`127.0.0.1` and shared one cloak. Terminating in-process is what lets a TLS
+client's real address reach the cloak, ban and limit paths.
 
 ## Quick start
 
@@ -50,12 +60,28 @@ All configuration is via environment variables.
 | `IRC_BANS_PATH`     | *(unset)*        | K-line store file; unset = in-memory only     |
 | `IRC_LOG_LEVEL`     | `info`           | `error` / `warn` / `info` / `debug` / `silent` |
 
+### TLS
+
+| Env var         | Default          | Meaning                                  |
+|-----------------|------------------|------------------------------------------|
+| `IRC_TLS_PORT`  | *(off)*          | TLS listener port; unset or `0` disables |
+| `IRC_TLS_CERT`  | `/certs/tls.crt` | PEM certificate (chain supported)        |
+| `IRC_TLS_KEY`   | `/certs/tls.key` | PEM private key (PKCS#8, PKCS#1 or SEC1) |
+
+A TLS bind or certificate failure is logged and leaves the plaintext port
+running rather than taking the server down.
+
+Where a proxy is also in front, the PROXY header arrives on the raw stream
+*ahead of* the TLS handshake, so the real client address is known before
+anything is decrypted and TLS clients are cloaked and limited exactly like
+plaintext ones.
+
 ### Behind a proxy
 
 | Env var                      | Default           | Meaning                                        |
 |------------------------------|-------------------|------------------------------------------------|
 | `IRC_PROXY_PROTOCOL`         | *(off)*           | Parse a PROXY protocol v1 header per connection |
-| `IRC_PROXY_PROTOCOL_EXEMPT`  | `127.0.0.1,::1`   | Peers admitted without a header                |
+| `IRC_PROXY_PROTOCOL_EXEMPT`  | *(none)*          | Peers admitted without a header                |
 
 A proxy terminates the client's connection and opens its own, so `peer_addr()`
 reports the proxy rather than the client. Behind a single ingress that address
@@ -65,8 +91,13 @@ original address is read from the header the proxy prepends.
 
 It **fails closed**: a missing or malformed header drops the connection. Falling
 back to `peer_addr()` would silently restore the shared-address behaviour, which
-is precisely the failure this guards against. Loopback is exempt by default so a
-TLS sidecar in the same pod keeps working.
+is precisely the failure this guards against. A peer that connects and closes
+without sending anything — a TCP health probe — is closed silently rather than
+counted as a rejection.
+
+The exemption list is empty by default. It exists for deployments that still
+front the daemon with a local terminator unable to emit a header; such peers
+necessarily share one cloak, since their real address never arrives.
 
 ### Limits
 
@@ -131,8 +162,8 @@ namespace, ingress, TLS certificate and config are reused as-is.
 1. Push to `main` — the **Image** workflow builds `ghcr.io/iconidentify/chonkline`.
 2. Run the **Deploy** workflow (manual) with the image tag to ship.
 
-Plaintext IRC is served on `6667`. TLS on `6697` is terminated by a sidecar using
-the cluster certificate and forwarded to the daemon.
+Plaintext IRC is served on `6667` and TLS on `6697`, both by the daemon itself,
+using the cert-manager certificate mounted at `/certs`.
 
 ## License
 

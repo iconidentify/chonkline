@@ -8,10 +8,11 @@ FROM gcr.io/distroless/cc-debian12
 COPY --from=build /src/target/release/irc-server /usr/local/bin/chonkline
 # LLM-generated release notes served by the web property (read at runtime).
 COPY --from=build /src/src/web/release-notes.json /usr/local/share/chonkline/release-notes.json
-# Plain-TCP IRC on 6667; read-only web property on 8080.
+# Plain-TCP IRC on 6667; TLS on 6697 when a certificate is mounted; read-only
+# web property on 8080. TLS stays off unless IRC_TLS_PORT is set at runtime.
 ENV IRC_PORT=6667
 ENV IRC_HTTP_PORT=8080
 ENV IRC_RELEASE_NOTES_PATH=/usr/local/share/chonkline/release-notes.json
-EXPOSE 6667 8080
+EXPOSE 6667 6697 8080
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/chonkline"]

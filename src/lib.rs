@@ -10,6 +10,7 @@ pub mod ops;
 pub mod proto;
 pub mod proxyproto;
 pub mod state;
+pub mod tls;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,6 +76,31 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
         }
     }
 
+    // Optional TLS listener. Terminating in-process (rather than behind a
+    // sidecar) is what lets a TLS client's real address reach the cloak and
+    // limit paths: the PROXY header arrives ahead of the handshake on the raw
+    // stream, so it is read before anything is decrypted.
+    let tls_listener = match tls::configured() {
+        Some((port, cert, key)) => match tls::acceptor_from_files(&cert, &key) {
+            Ok(acceptor) => match TcpListener::bind((addr.ip(), port)).await {
+                Ok(l) => {
+                    log::event(log::INFO, "tls.listening", &[("port", &port.to_string())]);
+                    Some((l, acceptor))
+                }
+                Err(e) => {
+                    // A TLS bind failure must not take the plaintext port down.
+                    log::event(log::ERROR, "tls.bind_failed", &[("port", &port.to_string()), ("error", &e.to_string())]);
+                    None
+                }
+            },
+            Err(e) => {
+                log::event(log::ERROR, "tls.config_failed", &[("error", &e)]);
+                None
+            }
+        },
+        None => None,
+    };
+
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn(async move {
         // A dedicated task owns the listener; the supervisor below consumes
@@ -98,6 +124,20 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
             }
         });
 
+        // The TLS port gets its own bounded queue, so a flood on one port
+        // cannot starve the other of accept slots.
+        let (tls_tx, mut tls_rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(ACCEPT_QUEUE);
+        let tls_acceptor = tls_listener.map(|(l, acceptor)| {
+            tokio::spawn(async move {
+                while let Ok((sock, _)) = l.accept().await {
+                    if tls_tx.send(sock).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            acceptor
+        });
+
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -106,6 +146,11 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
                 conn = conn_rx.recv() => match conn {
                     Some(sock) => { ops::spawn_connection(&state, sock); }
                     None => break, // accept task ended: stop serving
+                },
+                tls_conn = tls_rx.recv(), if tls_acceptor.is_some() => {
+                    if let (Some(sock), Some(acc)) = (tls_conn, tls_acceptor.as_ref()) {
+                        ops::spawn_tls_connection(&state, sock, acc.clone());
+                    }
                 },
                 _ = iv.tick() => {
                     ops::liveness_tick(&state);

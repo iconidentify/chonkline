@@ -30,6 +30,10 @@ pub enum Header {
     Unknown,
     /// Not a PROXY header, or one that cannot be trusted.
     Invalid,
+    /// The peer closed without sending anything. A TCP health probe does
+    /// exactly this, so it is a silent close rather than a rejection worth
+    /// logging thousands of times a day.
+    Empty,
 }
 
 /// Parse a complete v1 header line (without its CR-LF).
@@ -103,9 +107,11 @@ where
     let mut byte = [0u8; 1];
     loop {
         match sock.read(&mut byte).await {
-            Ok(0) => return Header::Invalid, // EOF before the header completed
+            // EOF before the header completed. With nothing received at all this
+            // is a health probe opening and closing, not a bad client.
+            Ok(0) => return if line.is_empty() { Header::Empty } else { Header::Invalid },
             Ok(_) => {}
-            Err(_) => return Header::Invalid,
+            Err(_) => return if line.is_empty() { Header::Empty } else { Header::Invalid },
         }
         line.push(byte[0]);
 
@@ -167,6 +173,20 @@ mod tests {
         assert_eq!(h, Header::Source("203.0.113.7".to_string()));
         // Everything after the header must remain for the IRC parser.
         assert_eq!(src, b"NICK bob\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_sends_nothing_is_not_an_error() {
+        // kubelet tcpSocket probes connect and close immediately; treating that
+        // as a rejection would emit thousands of log events a day.
+        let mut src: &[u8] = b"";
+        assert_eq!(read_v1(&mut src).await, Header::Empty);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_header_is_still_invalid() {
+        let mut src: &[u8] = b"PROXY TCP4 203.0.113.7";
+        assert_eq!(read_v1(&mut src).await, Header::Invalid);
     }
 
     #[tokio::test]
