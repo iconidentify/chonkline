@@ -1,11 +1,16 @@
 pub mod accounts;
+pub mod bans;
 pub mod channels;
 pub mod cmds;
 pub mod crypto;
 pub mod http;
+pub mod limits;
+pub mod log;
 pub mod ops;
 pub mod proto;
+pub mod proxyproto;
 pub mod state;
+pub mod tls;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
+
+/// Depth of the accepted-connection handoff queue (see the accept task below).
+const ACCEPT_QUEUE: usize = 256;
 
 /// Server identity and operational configuration.
 pub struct Config {
@@ -68,6 +76,31 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
         }
     }
 
+    // Optional TLS listener. Terminating in-process (rather than behind a
+    // sidecar) is what lets a TLS client's real address reach the cloak and
+    // limit paths: the PROXY header arrives ahead of the handshake on the raw
+    // stream, so it is read before anything is decrypted.
+    let tls_listener = match tls::configured() {
+        Some((port, cert, key)) => match tls::acceptor_from_files(&cert, &key) {
+            Ok(acceptor) => match TcpListener::bind((addr.ip(), port)).await {
+                Ok(l) => {
+                    log::event(log::INFO, "tls.listening", &[("port", &port.to_string())]);
+                    Some((l, acceptor))
+                }
+                Err(e) => {
+                    // A TLS bind failure must not take the plaintext port down.
+                    log::event(log::ERROR, "tls.bind_failed", &[("port", &port.to_string()), ("error", &e.to_string())]);
+                    None
+                }
+            },
+            Err(e) => {
+                log::event(log::ERROR, "tls.config_failed", &[("error", &e)]);
+                None
+            }
+        },
+        None => None,
+    };
+
     let stop = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn(async move {
         // A dedicated task owns the listener; the supervisor below consumes
@@ -78,13 +111,31 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
         // Round-4: fast-reconnect reclaim expiries resolve on a short cadence,
         // independently of the slow liveness interval above.
         let mut fast_iv = tokio::time::interval(Duration::from_millis(200));
-        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::unbounded_channel::<tokio::net::TcpStream>();
-        let accept_task = tokio::spawn(async move {
+        // Bounded queue: an unbounded one lets a connect flood accumulate live
+        // sockets (each an fd) faster than the supervisor can drain them. At the
+        // bound, backpressure reaches the listener and the kernel's own accept
+        // backlog absorbs the burst instead of this process.
+        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(ACCEPT_QUEUE);
+        let _accept_task = tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
-                if conn_tx.send(sock).is_err() {
+                if conn_tx.send(sock).await.is_err() {
                     break; // supervisor gone: stop accepting
                 }
             }
+        });
+
+        // The TLS port gets its own bounded queue, so a flood on one port
+        // cannot starve the other of accept slots.
+        let (tls_tx, mut tls_rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(ACCEPT_QUEUE);
+        let tls_acceptor = tls_listener.map(|(l, acceptor)| {
+            tokio::spawn(async move {
+                while let Ok((sock, _)) = l.accept().await {
+                    if tls_tx.send(sock).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            acceptor
         });
 
         loop {
@@ -96,7 +147,20 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
                     Some(sock) => { ops::spawn_connection(&state, sock); }
                     None => break, // accept task ended: stop serving
                 },
-                _ = iv.tick() => { ops::liveness_tick(&state); },
+                tls_conn = tls_rx.recv(), if tls_acceptor.is_some() => {
+                    if let (Some(sock), Some(acc)) = (tls_conn, tls_acceptor.as_ref()) {
+                        ops::spawn_tls_connection(&state, sock, acc.clone());
+                    }
+                },
+                _ = iv.tick() => {
+                    ops::liveness_tick(&state);
+                    // Aggregated refusal/flood counters surface here rather than
+                    // one line per event, so a flood cannot flood the log.
+                    log::flush_counters();
+                    if let Ok(stg) = state.lock() {
+                        log::heartbeat(stg.user_count(), stg.chan_count(), stg.sources.active_total(), stg.sources.tracked_sources());
+                    }
+                },
                 _ = fast_iv.tick() => { ops::reclaim_tick(&state); },
             }
         }

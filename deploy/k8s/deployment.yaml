@@ -42,6 +42,62 @@ spec:
                   key: key
             - name: IRC_CLOAK_SUFFIX
               value: "users.chonkbase.net"
+            # Client addresses arrive in a PROXY protocol v1 header. Without it
+            # every client is cloaked from the ingress pod's own address, so all
+            # users share one cloak and no ban, limit or attribution is possible.
+            #
+            # CUTOVER: "optional" uses a header when present and falls back to
+            # the peer address when absent. It is set this way because the
+            # ingress does not send the header yet -- ingress-nginx tcp-services
+            # needs a SECOND ":PROXY" suffix for that:
+            #
+            #   "6667": chonkline/chonkline:6667:PROXY:PROXY
+            #   "6697": chonkline/chonkline:6697:PROXY:PROXY
+            #
+            # (the first controls decoding the inbound connection, the second
+            # sending upstream to us).
+            #
+            # Once that is applied and the logs show no "proxy.absent" events,
+            # change both values below to "1" to require it. Do not leave this
+            # on "optional" longer than the cutover: until the ingress prepends
+            # its own header a client can forge one and choose its apparent
+            # address. Afterwards a forged line lands after the real one and is
+            # parsed harmlessly as an IRC command.
+            - name: IRC_PROXY_PROTOCOL
+              value: "optional"
+            - name: IRC_TLS_PROXY_PROTOCOL
+              value: "optional"
+            # TLS is terminated in-process so the PROXY header arrives ahead of
+            # the handshake and TLS clients get their real address, exactly like
+            # plaintext ones. The certificate is the same cert-manager secret the
+            # ghostunnel sidecar used to mount.
+            - name: IRC_TLS_PORT
+              value: "6697"
+            - name: IRC_TLS_CERT
+              value: "/certs/tls.crt"
+            - name: IRC_TLS_KEY
+              value: "/certs/tls.key"
+            # Admission control. The per-source bounds are only meaningful with
+            # real addresses above; they self-disable if PROXY parsing is off,
+            # so a shared address can never be capped as though it were one user.
+            - name: IRC_MAX_CLONES_PER_IP
+              value: "5"
+            - name: IRC_MAX_CLIENTS
+              value: "1024"
+            - name: IRC_MAX_CONNECTS_PER_MIN
+              value: "30"
+            # Aggregate per-source message budget, above the per-connection
+            # burst window, so spreading traffic across connections no longer
+            # multiplies the allowance.
+            - name: IRC_MAX_MESSAGES_PER_10S
+              value: "60"
+            - name: IRC_MAX_FLOOD_VIOLATIONS
+              value: "10"
+            # Persistent operator bans (KLINE), alongside the other stores.
+            - name: IRC_BANS_PATH
+              value: "/var/lib/chonkline/bans.db"
+            - name: IRC_LOG_LEVEL
+              value: "info"
             - name: IRC_OPER_USER
               valueFrom:
                 secretKeyRef:
@@ -55,11 +111,16 @@ spec:
           ports:
             - name: irc
               containerPort: 6667
+            - name: irc-tls
+              containerPort: 6697
             - name: http
               containerPort: 8080
           volumeMounts:
             - name: data
               mountPath: /var/lib/chonkline
+            - name: tls-cert
+              mountPath: /certs
+              readOnly: true
           readinessProbe:
             tcpSocket:
               port: irc
@@ -70,51 +131,17 @@ spec:
               port: irc
             initialDelaySeconds: 10
             periodSeconds: 20
+          # The sidecar's allocation (20m/16Mi req, 500m/64Mi lim) folds in here
+          # now that TLS terminates in-process. The memory limit is raised
+          # because rustls holds per-session buffers: at IRC_MAX_CLIENTS=1024
+          # those alone can approach the old 128Mi ceiling.
           resources:
             requests:
-              cpu: 50m
-              memory: 32Mi
-            limits:
-              cpu: "1"
-              memory: 128Mi
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
-            runAsGroup: 65532
-            capabilities:
-              drop: ["ALL"]
-        # TLS on 6697: terminates TLS with the cert-manager cert, forwards plaintext
-        # to the daemon on 6667. (ingress does not send PROXY protocol to this backend.)
-        - name: tls
-          image: ghostunnel/ghostunnel:v1.8.2
-          args:
-            - server
-            - --listen=0.0.0.0:6697
-            - --target=127.0.0.1:6667
-            - --cert=/certs/tls.crt
-            - --key=/certs/tls.key
-            - --disable-authentication
-          ports:
-            - name: irc-tls
-              containerPort: 6697
-          volumeMounts:
-            - name: tls-cert
-              mountPath: /certs
-              readOnly: true
-          readinessProbe:
-            tcpSocket:
-              port: irc-tls
-            initialDelaySeconds: 3
-            periodSeconds: 10
-          resources:
-            requests:
-              cpu: 20m
-              memory: 16Mi
-            limits:
-              cpu: "500m"
+              cpu: 75m
               memory: 64Mi
+            limits:
+              cpu: "1500m"
+              memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

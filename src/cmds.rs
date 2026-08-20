@@ -38,6 +38,9 @@ pub fn dispatch(stg: &mut ServerState, id: usize, cmd: &Command) -> bool {
         "PING" => { handle_misc_stub(stg, id, cmd); false }
         "PONG" => { let _ = stg.find_by_id(id).is_some(); false } // inbound client PONG: accepted silently (liveness stamped upstream)
         "OPER" => { handle_oper(stg, id, cmd); false }
+        "KILL" => { handle_kill(stg, id, cmd); false }
+        "KLINE" => { handle_kline(stg, id, cmd); false }
+        "UNKLINE" => { handle_unkline(stg, id, cmd); false }
         "ADMIN" => { handle_admin(stg, id, cmd); false }
         "PASS" => { handle_pass(stg, id, cmd); false }
         "LINKS" | "LINK" => { handle_links(stg, id, cmd); false }
@@ -93,14 +96,124 @@ fn handle_oper(stg: &mut ServerState, id: usize, cmd: &Command) {
         return;
     };
     if pass.as_str() != stg.oper_pass {
+        let src = stg.find_by_id(id).map(|u| u.real_host.clone()).unwrap_or_default();
+        crate::log::auth(id, &src, user_now, "OPER", false);
         numeric(stg, id, "464", &[user_now, "Password is incorrect"]); // ERR_PASSWDMISMATCH: recipient token then the referenced user name
         return;
+    }
+    {
+        let src = stg.find_by_id(id).map(|u| u.real_host.clone()).unwrap_or_default();
+        crate::log::auth(id, &src, user_now, "OPER", true);
     }
     if let Some(u) = stg.find_by_id_mut(id) { u.oper = true; }
     numeric(stg, id, "381", &["You are now an IRC operator"]); // RPL_YOUREOPER (381), not 379 (RPL_WHOISOPERATOR)
     // Reflect the new +o user mode back to the client (MODE self-echo).
     let nick = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
     deliver(stg, id, &proto::line(&stg.prefix(), "MODE", &format!("{} +o", nick)));
+}
+
+/// Reject a command from a non-operator with ERR_NOPRIVILEGES (481). Returns
+/// true when the caller lacks privilege and the command must not proceed.
+fn refuse_non_oper(stg: &mut ServerState, id: usize) -> bool {
+    if stg.find_by_id(id).map(|u| u.oper).unwrap_or(false) {
+        return false;
+    }
+    numeric(stg, id, "481", &["Permission Denied- You're not an IRC operator"]);
+    true
+}
+
+/// KILL <nick> [:reason] (RFC 2812 3.7.1) — operator-only forced disconnect.
+///
+/// Until this existed an operator who had correctly identified an attacker had
+/// no way to remove them; the only lever was a channel ban on a mask, which is
+/// useless when every client shares one cloak.
+fn handle_kill(stg: &mut ServerState, id: usize, cmd: &Command) {
+    if refuse_non_oper(stg, id) {
+        return;
+    }
+    let Some(target) = cmd.params.first() else {
+        deliver_need_more_params(stg, id, "KILL");
+        return;
+    };
+    let reason = cmd.params.get(1).filter(|r| !r.is_empty()).map(String::as_str).unwrap_or("Killed by operator");
+
+    let Some(target_id) = stg.lookup(&norm_nick(target)).map(|u| u.id) else {
+        numeric(stg, id, "401", &[target, "No such nick/channel"]); // ERR_NOSUCHNICK
+        return;
+    };
+
+    let actor = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
+    let target_nick = stg.find_by_id(target_id).map(|u| u.nick.clone()).unwrap_or_default();
+    crate::log::oper_action(&actor, "KILL", &target_nick, reason);
+
+    let notice = proto::line(&stg.prefix(), "NOTICE", &format!("{} :Killed by {}: {}", target_nick, actor, reason));
+    deliver(stg, target_id, &notice);
+    crate::ops::announce_loss_and_evict(stg, target_id, &format!("Killed by {}: {}", actor, reason));
+    numeric(stg, id, "NOTICE", &[&format!("Killed {}", target_nick)]);
+}
+
+/// KLINE <mask> [duration-secs] [:reason] — operator-only persistent address ban.
+///
+/// Masks match the client's real address (glob syntax), never the cloak: a
+/// cloak match would ban every user at once behind a proxy that does not
+/// forward client addresses. Duration 0, or omitted, means permanent. Any
+/// connected client matching the mask is killed immediately.
+fn handle_kline(stg: &mut ServerState, id: usize, cmd: &Command) {
+    if refuse_non_oper(stg, id) {
+        return;
+    }
+    let Some(mask) = cmd.params.first().filter(|m| !m.is_empty()) else {
+        deliver_need_more_params(stg, id, "KLINE");
+        return;
+    };
+    let mask = mask.clone();
+    let duration: u64 = cmd.params.get(1).and_then(|d| d.parse().ok()).unwrap_or(0);
+    let reason = cmd
+        .params
+        .get(2)
+        .filter(|r| !r.is_empty())
+        .map(String::as_str)
+        .unwrap_or("Banned")
+        .to_string();
+
+    let actor = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
+    stg.bans.add(&mask, duration, &actor, &reason);
+    crate::log::oper_action(&actor, "KLINE", &mask, &reason);
+
+    // Remove anyone already connected from a matching address.
+    let hits: Vec<usize> = stg
+        .each_user()
+        .filter(|u| crate::bans::glob_match(&mask, &u.real_host))
+        .map(|u| u.id)
+        .collect();
+    for hit in &hits {
+        crate::ops::announce_loss_and_evict(stg, *hit, &format!("Banned: {}", reason));
+    }
+
+    let summary = format!("Added K-line for {} ({} killed)", mask, hits.len());
+    deliver(stg, id, &proto::line(&stg.prefix(), "NOTICE", &format!("{} :{}", actor, summary)));
+}
+
+/// UNKLINE <mask> — operator-only removal of a persistent ban by exact mask.
+fn handle_unkline(stg: &mut ServerState, id: usize, cmd: &Command) {
+    if refuse_non_oper(stg, id) {
+        return;
+    }
+    let Some(mask) = cmd.params.first().filter(|m| !m.is_empty()) else {
+        deliver_need_more_params(stg, id, "UNKLINE");
+        return;
+    };
+    let removed = stg.bans.remove(mask);
+    let actor = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
+    if removed {
+        crate::log::oper_action(&actor, "UNKLINE", mask, "");
+    }
+    let text = if removed {
+        format!("Removed K-line for {}", mask)
+    } else {
+        format!("No K-line for {}", mask)
+    };
+    deliver(stg, id, &proto::line(&stg.prefix(), "NOTICE", &format!("{} :{}", actor, text)));
 }
 
 /// ADMIN (RFC): reply the server's administrative information via RPL_ADMINME /
@@ -177,7 +290,7 @@ fn handle_trace(stg: &mut ServerState, id: usize, cmd: &Command) {
 /// REHASH/RESTART (RFC): operator-only administrative commands. Non-operators are
 /// answered with the no-privileges shape; operators receive a minimal
 /// acknowledgement preserving process integrity for single-node deployments.
-fn handle_rehash_restart(stg: &mut ServerState, id: usize, cmd: &Command) {
+fn handle_rehash_restart(stg: &mut ServerState, id: usize, _cmd: &Command) {
     let oper = stg.find_by_id(id).map(|u| u.oper).unwrap_or(false);
     if !oper {
         numeric(stg, id, "481", &["Permission Denied- You're not an IRC operator"]); // ERR_NOPRIVILEGES (481)
@@ -189,7 +302,7 @@ fn handle_rehash_restart(stg: &mut ServerState, id: usize, cmd: &Command) {
 /// commands. Single-node deployments answer with the no-privileges shape for
 /// non-operators and a minimal administrative acknowledgement otherwise, without
 /// mutating process or topology state.
-fn handle_connect_squit(stg: &mut ServerState, id: usize, cmd: &Command) {
+fn handle_connect_squit(stg: &mut ServerState, id: usize, _cmd: &Command) {
     let oper = stg.find_by_id(id).map(|u| u.oper).unwrap_or(false);
     if !oper {
         numeric(stg, id, "481", &["Permission Denied- You're not an IRC operator"]); // ERR_NOPRIVILEGES (481)
@@ -589,7 +702,7 @@ fn welcome_sequence(stg: &mut ServerState, id: usize, _nick_snapshot_at_completi
     let myinfo_srv = stg.name.clone();
     numeric(stg, id, "004", &[&myinfo_srv, stg.version, "iow", "biklmnotv"]);
     // RPL_ISUPPORT: advertise only tokens the server genuinely honors.
-    numeric(stg, id, "005", &["CHANTYPES=#", "PREFIX=(ov)@+", "CHANMODES=beI,k,l,imnt", "STATUSMSG=@+", "EXCEPTS=e", "INVEX=I", "CASEMAPPING=rfc1459", "NICKLEN=30", "CHANNELLEN=50", "TOPICLEN=390", "NETWORK=Chonkbase", ":are supported by this server"]);
+    numeric(stg, id, "005", &["CHANTYPES=#", "PREFIX=(ov)@+", "CHANMODES=beI,k,l,imntR", "STATUSMSG=@+", "EXCEPTS=e", "INVEX=I", "CASEMAPPING=rfc1459", "NICKLEN=30", "CHANNELLEN=50", "TOPICLEN=390", "NETWORK=Chonkbase", ":are supported by this server"]);
 
     let users = stg.user_count();
     let invis = stg.invis_count();
@@ -622,10 +735,6 @@ fn welcome_sequence(stg: &mut ServerState, id: usize, _nick_snapshot_at_completi
         numeric(stg, id, "372", &[shown]);
     }
     numeric(stg, id, "376", &["End of /MOTD command"]);
-}
-
-fn host_of(stg: &ServerState, id: usize) -> String {
-    stg.find_by_id(id).map(|u| u.host.clone()).unwrap_or_else(|| "?".into())
 }
 
 /// Channel-name grammar (RFC BNF): leading '#' or '&', printable remainder, no
@@ -729,6 +838,19 @@ fn join_existing(stg: &mut ServerState, id: usize, norm: &str, key: &str) {
         && !invex_ok
     {
         deliver_join_denied(stg, id, 473, &display); // RFC numeric 473 (+i)
+        return;
+    }
+
+    // +R (registered only): the one channel admission control that does not
+    // depend on trustworthy client addresses, so it stays usable even while
+    // cloaks or PROXY handling are misconfigured.
+    let regonly_block = match (stg.find_by_id(id), stg.chan(norm)) {
+        (Some(u), Some(c)) => c.regonly() && u.account.is_none(),
+        _ => false,
+    };
+    if regonly_block {
+        // ERR_NEEDREGGEDNICK: the conventional numeric for "authenticate first".
+        numeric(stg, id, "477", &[&display, "You must be identified to a registered account to join this channel"]);
         return;
     }
 
@@ -1012,11 +1134,6 @@ fn deliver_users_dont_match(stg: &mut ServerState, id: usize) {
     numeric(stg, id, "502", &["Cant change mode for other users"]); // recipient token first via the shared chokepoint
 }
 
-/// ERR_UMODEUNKNOWNFLAG (RFC numeric 501).
-fn deliver_umode_unknown_flag(stg: &mut ServerState, id: usize, flag: char) {
-    numeric(stg, id, "501", &[&flag.to_string(), "is unknown mode char to me"]); // recipient token first via the shared chokepoint
-}
-
 /// MODE (RFC 4.2.3): dual-purpose. A single nickname parameter addresses user
 /// modes (self only); a channel name plus mode terms addresses channel and member
 /// modes under chanop privileges. Unknown flags are refused per numerics-501/502.
@@ -1088,7 +1205,7 @@ fn mode_channel(stg: &mut ServerState, id: usize, raw: &str, terms_in: &[String]
         let mut extra_consumed = 0usize;
         for flag in term[1..].chars() {
             match flag {
-                'i' | 'n' | 'p' | 's' | 't' | 'm' => { if let Some(c) = stg.chan_mut(&norm) { c.set_flag(flag, on); } }
+                'i' | 'n' | 'p' | 's' | 't' | 'm' | 'R' => { if let Some(c) = stg.chan_mut(&norm) { c.set_flag(flag, on); } }
                 _ => {} // remaining classes handled below by positional scans over `term`
             }
         }
@@ -2481,7 +2598,7 @@ fn handle_who(stg: &mut ServerState, id: usize, cmd: &Command) {
     if !is_channel_name_now {
         for cand in stg.each_user() {
 
-            let nick_key_now: String = cand.nick_key.clone();
+            let _nick_key_now: String = cand.nick_key.clone();
 
             let matched_now: bool = crate::state::wildcard_match(&masked_now, &cand.nick)
 
