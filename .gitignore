@@ -2,3 +2,4 @@
 .DS_Store
 tests/interop/logs/
 tests/interop/data/
+tests/interop/*.log

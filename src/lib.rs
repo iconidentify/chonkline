@@ -5,7 +5,9 @@ pub mod cmds;
 pub mod crypto;
 pub mod http;
 pub mod limits;
+pub mod link;
 pub mod log;
+pub mod network;
 pub mod ops;
 pub mod proto;
 pub mod proxyproto;
@@ -115,6 +117,37 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
                     Err(e) => log::event(log::ERROR, "https.config_failed", &[("error", &e)]),
                 }
             }
+        }
+    }
+
+    // Server linking. Off unless IRC_SID is set, so an unlinked deployment is
+    // unchanged. A link failure never affects the client listeners.
+    if let Some((link_cfg, listen_port, peers)) = link::configured() {
+        {
+            let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
+            stg.network.sid = link_cfg.sid.clone();
+        }
+        if let Some(port) = listen_port {
+            let st = state.clone();
+            let c = link::LinkConfig {
+                sid: link_cfg.sid.clone(),
+                name: link_cfg.name.clone(),
+                desc: link_cfg.desc.clone(),
+                send_password: link_cfg.send_password.clone(),
+                recv_password: link_cfg.recv_password.clone(),
+            };
+            tokio::spawn(async move { link::serve_links(st, port, c).await });
+        }
+        for peer in peers {
+            let st = state.clone();
+            let c = link::LinkConfig {
+                sid: link_cfg.sid.clone(),
+                name: link_cfg.name.clone(),
+                desc: link_cfg.desc.clone(),
+                send_password: link_cfg.send_password.clone(),
+                recv_password: link_cfg.recv_password.clone(),
+            };
+            tokio::spawn(async move { link::maintain_peer(st, peer, c).await });
         }
     }
 

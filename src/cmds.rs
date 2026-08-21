@@ -734,6 +734,23 @@ fn maybe_complete(stg: &mut ServerState, id: usize, realname_this_call: &str) {
             crate::log::session_registered(id, &u.real_host, &u.host, &u.nick);
         }
         crate::log::counted("session.new", "");
+        // Introduce the user to every linked server. Minting the UUID here is
+        // what makes the user addressable across the network at all.
+        if !stg.links.is_empty() {
+            let sid = stg.network.sid.clone();
+            let uuid = stg.network.uuid_for_local(id);
+            if let Some(u) = stg.find_by_id(id) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let line = crate::link::uid_line(
+                    &sid, &uuid, now, &u.nick, &u.real_host, &u.host, &u.user,
+                    &u.real_host, now, "+", &u.realname,
+                );
+                to_links(stg, &line);
+            }
+        }
     }
     match completed {
         Some(nick_display) => {
@@ -923,6 +940,10 @@ fn handle_join(stg: &mut ServerState, id: usize, cmd: &Command) {
         if let Some(u) = stg.find_by_id_mut(id) {
             u.chans.insert(chan_key_norm.clone());
         }
+        relay_join_to_links(stg, id, &chan_key_norm, &display);
+        if let Some(u) = stg.find_by_id_mut(id) {
+            let _ = &u.nick;
+        }
         joiner_replies(stg, id, &display);
         if registered {
             apply_founder_status(stg, id, &chan_key_norm);
@@ -1005,6 +1026,10 @@ fn join_existing(stg: &mut ServerState, id: usize, norm: &str, key: &str) {
         c.admit_plain(id);
         c.consume_invite(id);
     }
+    // Both join paths must announce to the network, not just channel creation:
+    // a peer routes channel traffic only to servers it believes hold a member,
+    // so missing this here made the channel work in one direction only.
+    relay_join_to_links(stg, id, norm, &display);
 
     let members: Vec<usize> = stg.chan(norm).map(|c| c.members.iter().copied().collect()).unwrap_or_default();
     broadcast_join(stg, id, &members, &sender_prefix, &display);
@@ -2296,6 +2321,9 @@ fn deliver_one_recipient(stg: &mut ServerState, id: usize, raw: &str, text: &str
 
     if valid_channel(raw) {
         deliver_to_channel(stg, id, raw, text, is_priv);
+        // A channel may hold members on other servers. Relaying after local
+        // delivery keeps the local view authoritative if the link is down.
+        relay_to_links(stg, id, raw, text, is_priv);
         return;
     }
 
@@ -2308,9 +2336,51 @@ fn deliver_one_recipient(stg: &mut ServerState, id: usize, raw: &str, text: &str
 
     if let Some(target_id_now) = resolved_id {
         relay_user_message(stg, id, raw, text, is_priv, target_id_now);
-    } else if is_priv {
+        return;
+    }
+
+    // Not local: the nickname may belong to a user on another server, in which
+    // case the message is addressed to their UUID rather than their nickname.
+    let remote_uuid = stg.network.by_nick(&norm_nick(raw)).map(|u| u.uuid.clone());
+    if let Some(uuid) = remote_uuid {
+        relay_to_links(stg, id, &uuid, text, is_priv);
+        stg.note_message();
+        return;
+    }
+
+    if is_priv {
         deliver_nosuch_nick(stg, id, raw);
     }
+}
+
+/// Tell every link that a local user joined a channel.
+///
+/// Must fire on BOTH join paths. A peer routes channel traffic only to servers
+/// it believes hold a member, so missing this on the already-exists path means
+/// the channel silently works in one direction only.
+pub(crate) fn relay_join_to_links(stg: &mut ServerState, id: usize, chan_key: &str, display: &str) {
+    if stg.links.is_empty() {
+        return;
+    }
+    let sid = stg.network.sid.clone();
+    let uuid = stg.network.uuid_for_local(id);
+    let ts = stg.chan(chan_key).map(|c| c.created_at).unwrap_or(0);
+    let is_op = stg.chan(chan_key).map(|c| c.is_op(id)).unwrap_or(false);
+    let prefix = if is_op { "o".to_string() } else { String::new() };
+    let line = crate::link::fjoin_line(&sid, display, ts, "+nt", &[(prefix, uuid)]);
+    to_links(stg, &line);
+}
+
+/// Send a locally-originated message out over every link, sourced from the
+/// sender's UUID as the protocol requires.
+fn relay_to_links(stg: &mut ServerState, id: usize, target: &str, text: &str, is_priv: bool) {
+    if stg.links.is_empty() {
+        return;
+    }
+    let uuid = stg.network.uuid_for_local(id);
+    let verb = if is_priv { "PRIVMSG" } else { "NOTICE" };
+    let line = format!(":{} {} {} :{}", uuid, verb, target, text);
+    to_links(stg, &line);
 }
 
 /// Scalar snapshot of the sender extended prefix per RFC 2.3 note 6.
@@ -3239,3 +3309,150 @@ fn local_clock_now() -> String {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// Remote (linked) users, as seen by local clients
+// ---------------------------------------------------------------------------
+
+/// Client-visible prefix for a user owned by another server.
+fn remote_prefix(stg: &ServerState, uuid: &str) -> Option<String> {
+    stg.network
+        .user(uuid)
+        .map(|u| format!(":{}!{}@{}", u.nick, u.user, u.host))
+}
+
+/// Send one pre-formed line to every local member of a channel.
+fn to_local_members(stg: &mut ServerState, chan_key: &str, line: &str) {
+    for id in stg.local_members(chan_key) {
+        deliver(stg, id, line);
+    }
+}
+
+/// A remote user joined a channel: local members must see the JOIN.
+pub(crate) fn announce_remote_join(stg: &mut ServerState, chan: &str, uuid: &str) {
+    let key = chan.to_lowercase();
+    if let Some(pfx) = remote_prefix(stg, uuid) {
+        let line = proto::line(&pfx, "JOIN", chan);
+        to_local_members(stg, &key, &line);
+    }
+}
+
+pub(crate) fn announce_remote_part(stg: &mut ServerState, chan: &str, uuid: &str, reason: &str) {
+    let key = chan.to_lowercase();
+    if let Some(pfx) = remote_prefix(stg, uuid) {
+        let tail = if reason.is_empty() { chan.to_string() } else { format!("{} :{}", chan, reason) };
+        let line = proto::line(&pfx, "PART", &tail);
+        to_local_members(stg, &key, &line);
+    }
+}
+
+/// A remote user left the network. Only channel peers witness a quit, matching
+/// how local quits are announced.
+pub(crate) fn announce_remote_quit(stg: &mut ServerState, u: &crate::network::RemoteUser, reason: &str) {
+    let pfx = format!(":{}!{}@{}", u.nick, u.user, u.host);
+    let line = proto::line(&pfx, "QUIT", &format!(":{}", reason));
+    let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for chan in &u.chans {
+        for id in stg.local_members(chan) {
+            seen.insert(id);
+        }
+    }
+    for id in seen {
+        deliver(stg, id, &line);
+    }
+}
+
+/// Adopt a channel introduced over a link.
+///
+/// The timestamp rule is the protocol's conflict resolution: the OLDER channel
+/// wins. A losing side must discard every mode it holds and take the winner's
+/// timestamp; the winner ignores the loser's modes entirely. Getting this
+/// backwards is how two servers end up disagreeing about who holds ops.
+pub(crate) fn adopt_remote_channel(
+    stg: &mut ServerState,
+    chan: &str,
+    ts: u64,
+    members: &[(String, String)],
+) {
+    let key = chan.to_lowercase();
+    let ours = stg.chan(&key).map(|c| c.created_at);
+    match ours {
+        Some(our_ts) if our_ts > ts => {
+            // We lose: drop every mode and adopt their timestamp.
+            if let Some(c) = stg.chan_mut(&key) {
+                c.created_at = ts;
+                c.clear_all_modes();
+            }
+            crate::log::counted("link.ts_lost", &key);
+        }
+        Some(our_ts) if our_ts < ts => {
+            // We win: keep ours, ignore their modes. Members still join.
+            crate::log::counted("link.ts_won", &key);
+        }
+        _ => {}
+    }
+    if stg.chan(&key).is_none() {
+        stg.chan_or_create(&key, chan.to_string());
+        if let Some(c) = stg.chan_mut(&key) {
+            c.created_at = ts;
+        }
+    }
+    for (_, uuid) in members {
+        announce_remote_join(stg, chan, uuid);
+    }
+}
+
+pub(crate) fn adopt_remote_topic(stg: &mut ServerState, chan: &str, ts: u64, setter: &str, topic: &str) {
+    let key = chan.to_lowercase();
+    if let Some(c) = stg.chan_mut(&key) {
+        c.topic = topic.to_string();
+        c.topic_setter = setter.to_string();
+        c.topic_time = ts;
+    }
+    let line = proto::line(&format!(":{}", setter), "TOPIC", &format!("{} :{}", chan, topic));
+    to_local_members(stg, &key, &line);
+}
+
+/// Deliver a message that arrived over a link to whichever local clients it is
+/// addressed to. The source is a UUID; the target may be a channel, a UUID, or
+/// a nickname.
+pub(crate) fn deliver_remote_message(
+    stg: &mut ServerState,
+    from: &str,
+    target: &str,
+    text: &str,
+    notice: bool,
+) {
+    let Some(pfx) = remote_prefix(stg, from) else { return };
+    let verb = if notice { "NOTICE" } else { "PRIVMSG" };
+
+    if valid_channel(target) {
+        let key = target.to_lowercase();
+        let line = proto::line(&pfx, verb, &format!("{} :{}", target, text));
+        to_local_members(stg, &key, &line);
+        stg.note_message();
+        return;
+    }
+
+    // A UUID target names one of our own users; otherwise fall back to a nick.
+    let local_id = if crate::network::valid_uuid(target) {
+        stg.network.local_uuid_owner(target)
+    } else {
+        stg.lookup(&norm_nick(target)).map(|u| u.id)
+    };
+    if let Some(id) = local_id {
+        let nick = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
+        let line = proto::line(&pfx, verb, &format!("{} :{}", nick, text));
+        deliver(stg, id, &line);
+        stg.note_message();
+    }
+}
+
+/// Relay a locally-originated line to every live link.
+pub(crate) fn to_links(stg: &ServerState, line: &str) {
+    for l in &stg.links {
+        if l.tx.try_send(line.to_string()).is_err() {
+            crate::log::counted("link.output_dropped", &l.sid);
+        }
+    }
+}

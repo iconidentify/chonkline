@@ -301,6 +301,27 @@ impl Chn {
 
     // Mutators used by the MODE command handler.
 
+    /// Drop every mode. Used when this side loses a timestamp conflict: the
+    /// protocol requires the younger channel to discard all of its modes,
+    /// including prefixes, bans and every list mode, before taking the
+    /// winner's.
+    pub(crate) fn clear_all_modes(&mut self) {
+        self.invite_only = false;
+        self.nomsg = false;
+        self.private = false;
+        self.secret = false;
+        self.op_topic = false;
+        self.moderated = false;
+        self.regonly = false;
+        self.key_limit = 0;
+        self.chan_key = None;
+        self.bans.clear();
+        self.excepts.clear();
+        self.invex.clear();
+        self.ops.clear();
+        self.voices.clear();
+    }
+
     pub(crate) fn set_flag(&mut self, ch: char, on: bool) {
         match ch {
             'i' => self.invite_only = on,
@@ -500,6 +521,11 @@ pub struct ServerState {
 
     /// Server-wide address bans (K-lines), persisted across restarts.
     pub bans: crate::bans::BanStore,
+
+    /// The rest of the spanning tree: other servers and the users they own.
+    pub network: crate::network::Network,
+    /// Live links to directly-connected peers.
+    pub links: Vec<crate::link::LinkHandle>,
 }
 
 impl ServerState {
@@ -533,6 +559,10 @@ impl ServerState {
             limits: crate::limits::Limits::default(),
             sources: crate::limits::SourceTable::new(),
             bans: crate::bans::BanStore::load(std::env::var("IRC_BANS_PATH").ok()),
+            network: crate::network::Network::new(
+                &std::env::var("IRC_SID").unwrap_or_else(|_| "0CL".into()),
+            ),
+            links: Vec::new(),
             total_connections: 0,
             peak_users: 0,
             messages_relayed: 0,
@@ -810,6 +840,54 @@ impl ServerState {
     /// registered users leaves the banned address's half-open sockets in place.
     pub fn each_connection(&self) -> impl Iterator<Item = &Cx> + '_ {
         self.users.values().chain(self.unreg.values())
+    }
+
+    /// Render every local user as a UID line for a burst.
+    pub fn burst_users(&self, sid: &str) -> Vec<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.users
+            .values()
+            .filter_map(|u| {
+                let uuid = self.network.local_uuid(u.id)?;
+                Some(crate::link::uid_line(
+                    sid, uuid, now, &u.nick, &u.real_host, &u.host, &u.user,
+                    &u.real_host, now, "+", &u.realname,
+                ))
+            })
+            .collect()
+    }
+
+    /// Render every channel with local members as an FJOIN line for a burst.
+    pub fn burst_channels(&self, sid: &str) -> Vec<String> {
+        self.chans
+            .iter()
+            .filter_map(|(key, c)| {
+                let members: Vec<(String, String)> = c
+                    .members
+                    .iter()
+                    .filter_map(|id| {
+                        let uuid = self.network.local_uuid(*id)?.clone();
+                        let mut prefix = String::new();
+                        if c.ops.contains(id) { prefix.push('o'); }
+                        if c.voices.contains(id) { prefix.push('v'); }
+                        Some((prefix, uuid))
+                    })
+                    .collect();
+                if members.is_empty() {
+                    return None;
+                }
+                let _ = key;
+                Some(crate::link::fjoin_line(sid, &c.display, c.created_at, "+nt", &members))
+            })
+            .collect()
+    }
+
+    /// Local connection ids in a channel, for delivering remote traffic.
+    pub fn local_members(&self, chan_key: &str) -> Vec<usize> {
+        self.chans.get(chan_key).map(|c| c.members.iter().copied().collect()).unwrap_or_default()
     }
 
     pub fn user_count(&self) -> usize { self.users.len() }
