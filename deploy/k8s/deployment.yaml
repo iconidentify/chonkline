@@ -126,8 +126,15 @@ spec:
             # recreated, and a lapsed exemption would start refusing traffic
             # silently. Exempt sources are also kept out of IRC_MAX_CLIENTS, so
             # a health-check cadence can never consume the global ceiling.
+            # NARROWED. This previously included 10.2.* and the node addresses,
+            # which are exactly what the legacy ingress path SNAT'd to -- so any
+            # client reaching 6667/6697 through the old ingress was exempt from
+            # every limit AND from the global ceiling, making it an unbounded
+            # connection sink into a pod that OOMs in under a minute. That path
+            # is now removed; only the NodeBalancer's own health-check address
+            # needs exempting.
             - name: IRC_LIMIT_EXEMPT
-              value: "10.2.*,192.168.*,127.0.0.1,172.232.169.19,172.232.189.82,172.234.237.243"
+              value: "192.168.*,127.0.0.1"
             - name: IRC_MAX_FLOOD_VIOLATIONS
               value: "10"
             # Persistent operator bans (KLINE), alongside the other stores.
@@ -165,11 +172,18 @@ spec:
               port: irc
             initialDelaySeconds: 2
             periodSeconds: 10
+          # Liveness is deliberately slack. The probe targets the very port a
+          # connect flood contends for, and recovery costs ~90s (Recreate plus a
+          # block-volume detach/reattach) -- so a tight probe turns an attack
+          # into a self-amplifying restart loop. With one replica a restart can
+          # never fail over to anything, so it only ever subtracts availability.
           livenessProbe:
             tcpSocket:
               port: irc
             initialDelaySeconds: 10
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
           # The sidecar's allocation (20m/16Mi req, 500m/64Mi lim) folds in here
           # now that TLS terminates in-process. The memory limit is raised
           # because rustls holds per-session buffers; with IRC_MAX_CLIENTS=512
@@ -179,7 +193,12 @@ spec:
               cpu: 75m
               memory: 64Mi
             limits:
-              cpu: "1500m"
+              # 500m, not 1500m: the node has 2 cores and also runs coredns and
+              # chonkbase-postgres. Under flood we want chonkline throttled, not
+              # starving cluster DNS. Steady state is ~2m, so this is still ~250x
+              # headroom. Memory stays deliberately low -- it makes chonkline
+              # fail fast and alone rather than dragging the node down.
+              cpu: "500m"
               memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false

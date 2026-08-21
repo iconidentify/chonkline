@@ -99,7 +99,13 @@ fn handle_oper(stg: &mut ServerState, id: usize, cmd: &Command) {
         numeric(stg, id, "464", &[user_now, "Password is incorrect"]); // ERR_PASSWDMISMATCH: recipient token then the referenced user name
         return;
     };
-    if pass.as_str() != stg.oper_pass {
+    // The username was previously ignored entirely: any name with the correct
+    // password became an operator, and IRC_OPER_USER was configured, logged and
+    // never compared. Both halves are now checked, in constant time, so a wrong
+    // username is not distinguishable from a wrong password by timing.
+    let user_ok = crate::crypto::constant_time_eq(user_now.as_bytes(), stg.oper_user.as_bytes());
+    let pass_ok = crate::crypto::constant_time_eq(pass.as_bytes(), stg.oper_pass.as_bytes());
+    if !(user_ok && pass_ok) {
         let src = stg.find_by_id(id).map(|u| u.real_host.clone()).unwrap_or_default();
         crate::log::auth(id, &src, user_now, "OPER", false);
         numeric(stg, id, "464", &[user_now, "Password is incorrect"]); // ERR_PASSWDMISMATCH: recipient token then the referenced user name

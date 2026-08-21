@@ -38,11 +38,18 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     let p = pattern.as_bytes();
     let t = text.as_bytes();
     let (m, n) = (p.len(), t.len());
+    // An empty pattern matches only empty text. This must be handled before the
+    // table is built: the row-zero loop below used to read p[0], and because
+    // dp[0][0] is true the && never short-circuited, so an empty pattern
+    // indexed an empty slice and panicked -- inside dispatch, under the state
+    // lock, poisoning it for every other connection.
+    if m == 0 {
+        return n == 0;
+    }
     let mut dp = vec![vec![false; n + 1]; m + 1];
     dp[0][0] = true;
-    for j in 1..=n {
-        dp[0][j] = dp[0][j - 1] && p[0] == b'*';
-    }
+    // Row zero stays false for j > 0: with no pattern left, no text can match.
+    // (For a leading '*', dp[1][*] below still fills correctly.)
     for i in 1..=m {
         let pb = p[i - 1];
         if pb == b'*' {
@@ -914,3 +921,31 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod wildcard_tests {
+    use super::wildcard_match;
+
+    #[test]
+    fn empty_pattern_does_not_panic_and_matches_only_empty() {
+        // Reachable from any client with a single line: `WHO :` yields an empty
+        // mask param. This used to panic under the state lock, poisoning it and
+        // wedging the whole server while TCP kept accepting -- so the tcpSocket
+        // liveness probe would never have restarted the pod.
+        assert!(!wildcard_match("", "anything"));
+        assert!(wildcard_match("", ""));
+    }
+
+    #[test]
+    fn still_matches_normally() {
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("a*c", "abc"));
+        assert!(wildcard_match("a?c", "abc"));
+        assert!(!wildcard_match("a?c", "ac"));
+        assert!(wildcard_match("*!*@*", "nick!user@host"));
+        assert!(!wildcard_match("abc", "abd"));
+        assert!(wildcard_match("**", "xy"));
+        assert!(!wildcard_match("a", ""));
+    }
+}

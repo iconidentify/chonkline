@@ -230,3 +230,56 @@ fn an_empty_username_is_still_refused() {
     let line = c.read_until(|l| l.contains(" 461 ") || l.contains(" 001 "));
     assert!(line.contains(" 461 "), "an empty username must still be refused: {line:?}");
 }
+
+#[test]
+fn a_bare_wildcard_mask_cannot_wedge_the_server() {
+    // `WHO :` sends an empty mask. That used to panic wildcard_match inside
+    // dispatch, under the state lock -- poisoning it, so every later lock
+    // panicked too. The server kept accepting TCP while being permanently
+    // unable to serve anyone, which a tcpSocket liveness probe cannot detect.
+    let addr = start_proxied_server();
+
+    let mut attacker = Client::new(&addr);
+    attacker.send("PROXY TCP4 203.0.113.70 10.0.0.1 45000 6667");
+    attacker.send("NICK wedger");
+    attacker.send("USER wedger 0 * :Wedge");
+    attacker.read_until(|l| l.contains(" 001 "));
+    attacker.send("WHO :");
+    attacker.send("LIST :");
+
+    // The real assertion: a brand-new client must still be able to register.
+    let mut after = Client::new(&addr);
+    after.send("PROXY TCP4 203.0.113.71 10.0.0.1 45001 6667");
+    after.send("NICK survivor");
+    after.send("USER survivor 0 * :Survivor");
+    let line = after.read_until(|l| l.contains(" 001 ") || l.contains("ERROR"));
+    assert!(
+        line.contains(" 001 "),
+        "server must still serve new clients after an empty mask: {line:?}"
+    );
+}
+
+#[test]
+fn an_empty_ban_mask_cannot_wedge_the_server() {
+    // Same matcher, reached through a stored channel ban -- worse, because the
+    // empty mask persists and re-fires on every subsequent join.
+    let addr = start_proxied_server();
+
+    let mut c = Client::new(&addr);
+    c.send("PROXY TCP4 203.0.113.72 10.0.0.1 45002 6667");
+    c.send("NICK banner");
+    c.send("USER banner 0 * :Banner");
+    c.read_until(|l| l.contains(" 001 "));
+    c.send("JOIN #wedge");
+    c.read_until(|l| l.contains("JOIN"));
+    c.send("MODE #wedge +b :");
+    c.send("PART #wedge");
+    c.send("JOIN #wedge");
+
+    let mut after = Client::new(&addr);
+    after.send("PROXY TCP4 203.0.113.73 10.0.0.1 45003 6667");
+    after.send("NICK survivor2");
+    after.send("USER survivor2 0 * :Survivor");
+    let line = after.read_until(|l| l.contains(" 001 ") || l.contains("ERROR"));
+    assert!(line.contains(" 001 "), "server must survive an empty ban mask: {line:?}");
+}

@@ -205,7 +205,7 @@ async fn admit_and_run(
     }
 
     let deny = {
-        let mut guard = state.lock().unwrap();
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
         let stg = &mut *guard;
         match stg.bans.matching(&real_host) {
             Some(ban) => Some(Deny::Banned(ban.reason.clone())),
@@ -254,7 +254,7 @@ async fn admit_and_run(
     // Release the admission slot this connection reserved, and record the close
     // with whatever identity it had reached.
     let nick = {
-        let mut guard = state.lock().unwrap();
+        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
         let stg = &mut *guard;
         stg.sources.release(&stg.limits, &real_host, Instant::now());
         stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()
@@ -391,7 +391,7 @@ fn route(
     }
 
     let quit = {
-        let mut stg = state.lock().unwrap();
+        let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(pfx) = &cmd.prefix {
             // Only the sender's own prefix may be carried; anything else is
@@ -492,7 +492,7 @@ fn deliver_not_registered(stg: &mut ServerState, id: usize) {
 /// then remove it from every channel and nick table. Idempotent for clean
 /// exits that already purged via QUIT/kill.
 fn cleanup_on_eof(state: &Arc<Mutex<ServerState>>, id: usize) {
-    let mut stg = state.lock().unwrap();
+    let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
     match stg.find_by_id(id).map(|u| (u.registered, u.prefix())) {
         Some((true, pfx)) => {
             let line = proto::line(&pfx, "QUIT", ":Client connection lost");
@@ -519,7 +519,7 @@ pub fn park_unregistered(
     tx: mpsc::UnboundedSender<String>,
     notify: Arc<Notify>,
 ) {
-    let mut stg = state.lock().unwrap();
+    let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
     if stg.find_by_id(id).is_some() {
         return; // already parked (should not happen); be harmless
     }
@@ -561,7 +561,7 @@ pub(crate) fn reclaim_grace_window() -> std::time::Duration {
 /// Runs on a short supervisor cadence so expiries land promptly without waiting
 /// for the slow liveness interval.
 pub fn reclaim_tick(state: &Arc<Mutex<ServerState>>) {
-    let mut stg = state.lock().unwrap();
+    let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
 
     let now = Instant::now();
     let expired_now: Vec<usize> = stg
@@ -585,7 +585,7 @@ pub fn reclaim_tick(state: &Arc<Mutex<ServerState>>) {
 }
 
 pub fn liveness_tick(state: &Arc<Mutex<ServerState>>) {
-    let mut stg = state.lock().unwrap();
+    let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
 
     // Expire unanswered pings first, then ping newly-silent connections.
     let now = Instant::now();

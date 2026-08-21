@@ -168,7 +168,7 @@ where
     let path = target.split('?').next().unwrap_or("/");
 
     let resp = {
-        let stg = state.lock().unwrap();
+        let stg = state.lock().unwrap_or_else(|e| e.into_inner());
         route(path, &stg)
     };
     let payload = format!(

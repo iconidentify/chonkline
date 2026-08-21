@@ -27,7 +27,12 @@ metadata:
     # are left plain so the web property needs no header handling.
     service.beta.kubernetes.io/linode-loadbalancer-port-6667: '{"proxy-protocol": "v1"}'
     service.beta.kubernetes.io/linode-loadbalancer-port-6697: '{"proxy-protocol": "v1"}'
-    service.beta.kubernetes.io/linode-loadbalancer-throttle: "20"
+    # 5, not 20. Linode's throttle is new connections per second per client IP,
+    # range 0-20 where 0 disables -- so 20 was the loosest non-zero setting.
+    # The app limit is 30/min (0.5/s), so 5/s is still 10x headroom while
+    # capping a single-source connect flood at the edge, before it reaches a
+    # node. It does nothing against a distributed flood; nothing here can.
+    service.beta.kubernetes.io/linode-loadbalancer-throttle: "5"
 spec:
   type: LoadBalancer
   # Cluster, not Local. Local would preserve the source address at the node,
