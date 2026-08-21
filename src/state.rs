@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc::UnboundedSender, Notify};
+use tokio::sync::{mpsc::Sender, Notify};
 
 /// Recent nickname-change history (RFC 8.9 mandates servers keep one).
 #[derive(Debug, Clone)]
@@ -35,36 +35,14 @@ pub fn norm_nick(s: &str) -> String {
 
 /// Wildcard matcher: '*' matches any run (including empty), '?' a single byte.
 pub fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let p = pattern.as_bytes();
-    let t = text.as_bytes();
-    let (m, n) = (p.len(), t.len());
-    // An empty pattern matches only empty text. This must be handled before the
-    // table is built: the row-zero loop below used to read p[0], and because
-    // dp[0][0] is true the && never short-circuited, so an empty pattern
-    // indexed an empty slice and panicked -- inside dispatch, under the state
-    // lock, poisoning it for every other connection.
-    if m == 0 {
-        return n == 0;
-    }
-    let mut dp = vec![vec![false; n + 1]; m + 1];
-    dp[0][0] = true;
-    // Row zero stays false for j > 0: with no pattern left, no text can match.
-    // (For a leading '*', dp[1][*] below still fills correctly.)
-    for i in 1..=m {
-        let pb = p[i - 1];
-        if pb == b'*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-        for j in 1..=n {
-            dp[i][j] = match pb {
-                b'*' => dp[i - 1][j] || dp[i][j - 1],
-                b'?' => dp[i - 1][j - 1],
-                _ => pb == t[j - 1] && dp[i - 1][j - 1],
-            };
-        }
-    }
-    dp[m][n]
+    // Delegates to the iterative matcher. The previous implementation built a
+    // full (m+1)x(n+1) DP matrix on every call with no early exit, so a
+    // client-supplied 500-byte mask cost ~29us per field -- and WHO runs it
+    // over every user, three fields each, while holding the state lock. At 512
+    // users that is tens of milliseconds of locked CPU per command.
+    crate::bans::glob_match(pattern, text)
 }
+
 
 // ---------------------------------------------------------------------------
 // Client / user record
@@ -104,7 +82,12 @@ impl Caps {
 
 pub struct Cx {
     pub id: usize,
-    pub tx: UnboundedSender<String>,
+    /// Bounded reply queue. Unbounded here was the real OOM path: a client that
+    /// stops reading parks the writer task while sends keep succeeding, so
+    /// queued replies grow without limit -- uncounted by any inbound rate limit
+    /// and uncounted by the pod's memory sizing, which only ever accounted for
+    /// the (bounded) read buffer.
+    pub tx: Sender<String>,
     /// Display nick as chosen by the client (case preserved).
     pub nick: String,
     /// Normalized key used for all comparisons.
@@ -622,7 +605,7 @@ impl ServerState {
         id: usize,
         host: String,
         real_host: String,
-        tx: UnboundedSender<String>,
+        tx: Sender<String>,
         notify: Arc<Notify>,
     ) {
         let mut cx = Cx {
@@ -808,6 +791,12 @@ impl ServerState {
     }
 
     /// Counts used by LUSERS-style replies.
+    /// Iteration over PRE-REGISTRATION connections. `each_user` deliberately
+    /// covers only registered users, which meant parked connections were never
+    /// pinged and never evicted -- an idle socket held an admission slot and its
+    /// read buffer indefinitely.
+    pub fn each_unreg(&self) -> impl Iterator<Item = &Cx> + '_ { self.unreg.values() }
+
     pub fn user_count(&self) -> usize { self.users.len() }
 
     pub fn chan_count(&self) -> usize { self.chans.len() }
@@ -869,7 +858,7 @@ mod tests {
 
     #[test]
     fn composite_ban_matching() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let cx = test_cx(1, tx);
         assert!(cx.matches_ban("alice*"));
         assert!(!cx.matches_ban("bob*"));
@@ -877,7 +866,7 @@ mod tests {
         assert!(!cx.matches_ban("*!*@other.net"));
     }
 
-    fn test_cx(id: usize, tx: UnboundedSender<String>) -> Cx {
+    fn test_cx(id: usize, tx: Sender<String>) -> Cx {
         Cx {
             id,
             tx,
@@ -909,7 +898,7 @@ mod tests {
 
     #[test]
     fn lookup_walks_recent_renames() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let mut state = ServerState::new(
             "srv", "o", "p", "loc1", "loc2", "a@b.c", "127.0.0.1 6697"
         );
@@ -917,7 +906,7 @@ mod tests {
         // so exercise the history-walk predicate in isolation instead.
         state.record_rename("oldnick", "newnick", 1);
         assert_eq!(state.lookup("nope").map(|_| ()), None);
-        let _: tokio::sync::mpsc::UnboundedSender<String> = tx;
+        let _: tokio::sync::mpsc::Sender<String> = tx;
     }
 }
 

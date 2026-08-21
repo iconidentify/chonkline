@@ -14,6 +14,11 @@ use crate::state::{norm_nick, ServerState};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
+/// Per-connection reply queue depth. At ~200 bytes/line this bounds one
+/// connection's queued output near 100 KiB, so the 512-client ceiling implies a
+/// provable worst case rather than an open-ended one.
+const REPLY_QUEUE: usize = 512;
+
 /// Per-connection flood window (RFC 8.10): one message per two seconds is the
 /// sustainable rate; bursts above six messages within two seconds have the
 /// excess lines silently dropped.
@@ -167,8 +172,21 @@ async fn admit_and_run(
     // begin a header. That also makes Optional mode safe on the TLS port.
     let mode = if is_tls { tls_proxy_mode() } else { proxy_mode() };
     let real_host = if mode != ProxyMode::Off && !proxy_exempt_peer(&peer) {
-        match crate::proxyproto::peek_is_header(&sock).await {
-            crate::proxyproto::Peek::Header => match crate::proxyproto::read_v1(&mut sock).await {
+        // Time-bounded: this runs BEFORE admission control, so a client that
+        // sends "PROXY " and then stalls would otherwise hold a task and an fd
+        // that no limit counts.
+        let peeked = match tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::proxyproto::peek_is_header(&sock),
+        ).await {
+            Ok(p) => p,
+            Err(_) => { crate::log::counted("proxy.timeout", ""); return; }
+        };
+        match peeked {
+            crate::proxyproto::Peek::Header => match tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::proxyproto::read_v1(&mut sock),
+            ).await.unwrap_or(crate::proxyproto::Header::Invalid) {
                 crate::proxyproto::Header::Source(addr) => addr,
                 crate::proxyproto::Header::Unknown => peer.clone(),
                 crate::proxyproto::Header::Empty => return, // hung up mid-header
@@ -286,7 +304,10 @@ async fn run_session<S>(
 
     // Writer task: drain queued replies into the socket. Exits when its queue
     // closes (reader gone) or a write fails; dropping `wr` half-closes then.
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    // Bounded: caps per-connection queued output at REPLY_QUEUE lines, so a
+    // slow or deliberately non-reading client costs a known, finite amount of
+    // memory instead of an unbounded one.
+    let (tx, mut rx) = mpsc::channel::<String>(REPLY_QUEUE);
     tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
             if wr.write_all(line.as_bytes()).await.is_err() {
@@ -443,7 +464,7 @@ fn route(
                     crate::log::flood("disconnected");
                     let line = proto::line("", "ERROR", ":Excess flood");
                     if let Some(u) = stg_ref.find_by_id(id) {
-                        let _ = u.tx.send(line);
+                        if u.tx.try_send(line).is_err() { crate::log::counted("output.dropped", ""); }
                     }
                     return true;
                 }
@@ -483,7 +504,7 @@ fn deliver_not_registered(stg: &mut ServerState, id: usize) {
     let nick = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_else(|| "*".into());
     let line = proto::line(&p, "451", &format!("{} :You have not registered", nick));
     if let Some(u) = stg.find_by_id(id) {
-        let _ = u.tx.send(line);
+        if u.tx.try_send(line).is_err() { crate::log::counted("output.dropped", ""); }
     }
 }
 
@@ -516,7 +537,7 @@ pub fn park_unregistered(
     id: usize,
     host: String,
     real_host: String,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::Sender<String>,
     notify: Arc<Notify>,
 ) {
     let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -531,6 +552,17 @@ pub fn park_unregistered(
 /// Liveness windows in seconds. Shipped defaults run ~30s ping / ~30s eviction
 /// so a dead client is gone within roughly a minute; tests may shrink both via
 /// environment overrides so reaping stays verifiable at test scale.
+/// How long a connection may stay unregistered. Real clients complete the
+/// NICK/USER pairing in milliseconds; this only ever catches abandoned or
+/// deliberately idle sockets. Tunable for tests via CHONKLINE_REG_TIMEOUT_SECS.
+fn registration_window() -> Duration {
+    let secs: u64 = std::env::var("CHONKLINE_REG_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    Duration::from_secs(secs.max(1))
+}
+
 fn eviction_window() -> std::time::Duration {
     let secs: u64 = std::env::var("CHONKLINE_EVICTION_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
     std::time::Duration::from_secs(secs.max(1))
@@ -589,6 +621,22 @@ pub fn liveness_tick(state: &Arc<Mutex<ServerState>>) {
 
     // Expire unanswered pings first, then ping newly-silent connections.
     let now = Instant::now();
+
+    // Registration deadline. Without this a connection that completes admission
+    // and then sends nothing is never reaped: the liveness sweep below only
+    // covers registered users, and TCP keepalive catches dead peers, not
+    // deliberately idle ones. Such sockets hold an admission slot against the
+    // global ceiling -- the bound that exists to stop memory exhaustion.
+    let reg_deadline = registration_window();
+    let expired_reg: Vec<usize> = stg
+        .each_unreg()
+        .filter(|u| now.duration_since(u.connected_at) > reg_deadline)
+        .map(|u| u.id)
+        .collect();
+    for id in expired_reg {
+        crate::log::counted("reg.timeout", "");
+        announce_loss_and_evict(&mut stg, id, "Registration timeout");
+    }
     let expired: Vec<usize> = stg
         .ping_outstanding
         .iter()
@@ -619,7 +667,7 @@ pub fn liveness_tick(state: &Arc<Mutex<ServerState>>) {
 /// Send one pre-formed line to a connection's reply queue (best effort).
 fn send_to(stg: &ServerState, id: usize, line: &str) {
     if let Some(u) = stg.find_by_id(id) {
-        let _ = u.tx.send(line.to_string());
+        if u.tx.try_send(line.to_string()).is_err() { crate::log::counted("output.dropped", ""); }
     }
 }
 

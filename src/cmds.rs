@@ -345,7 +345,9 @@ fn handle_wallops(stg: &mut ServerState, id: usize, cmd: &Command) {
 /// Deliver one pre-formed reply line to client `id`'s queue (best effort).
 fn deliver(stg: &mut ServerState, id: usize, line: &str) {
     if let Some(u) = stg.find_by_id(id) {
-        let _ = u.tx.send(line.to_string()); // slow/dead sockets drop the reply
+        // try_send, not send: a full queue means the peer is not draining, and
+        // dropping the line is what keeps memory bounded.
+        if u.tx.try_send(line.to_string()).is_err() { crate::log::counted("output.dropped", ""); }
     }
 }
 
@@ -460,7 +462,7 @@ fn begin_reclaim(stg: &mut ServerState, occ_id: usize, pairings: Vec<(usize, Str
 /// Reply-queue push used by the reclaim path (same semantics as ops' internal sends).
 fn send_to(stg: &ServerState, id: usize, line: &str) {
     if let Some(u) = stg.find_by_id(id) {
-        let _ = u.tx.send(line.to_string());
+        if u.tx.try_send(line.to_string()).is_err() { crate::log::counted("output.dropped", ""); }
     }
 }
 
@@ -2241,6 +2243,14 @@ fn relay_user_message(
 
 /// $ server-name mask dispatch for this single-server deployment.
 fn deliver_to_server_mask(stg: &mut ServerState, id: usize, raw: &str, text: &str, is_priv: bool) {
+    // Operator-only, as on every other ircd. Without this any registered client
+    // could fan one small command out to every user on the server: a broadcast
+    // amplifier, and a memory amplifier against per-connection reply queues.
+    if !stg.find_by_id(id).map(|u| u.oper).unwrap_or(false) {
+        numeric(stg, id, "481", &["Permission Denied- You're not an IRC operator"]);
+        return;
+    }
+
     let host_now: String = raw[1..].to_string();
 
     if !crate::state::wildcard_match(&host_now, &stg.prefix().to_lowercase()) {

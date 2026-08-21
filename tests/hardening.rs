@@ -283,3 +283,44 @@ fn an_empty_ban_mask_cannot_wedge_the_server() {
     let line = after.read_until(|l| l.contains(" 001 ") || l.contains("ERROR"));
     assert!(line.contains(" 001 "), "server must survive an empty ban mask: {line:?}");
 }
+
+#[test]
+fn an_idle_unregistered_connection_is_reaped() {
+    // A socket that completes admission and then sends nothing used to hold an
+    // admission slot forever: the liveness sweep covers only registered users,
+    // and TCP keepalive catches dead peers, not deliberately idle ones.
+    std::env::set_var("CHONKLINE_REG_TIMEOUT_SECS", "1");
+    std::env::set_var("CHONKLINE_LIVENESS_TICK_SECS", "1");
+    let addr = start_proxied_server();
+
+    let mut idler = Client::new(&addr);
+    idler.send("PROXY TCP4 203.0.113.80 10.0.0.1 46000 6667");
+    // Deliberately never sends NICK/USER.
+
+    // The reaper should close it rather than leave it parked indefinitely.
+    let line = idler.read_until(|l| l.contains("ERROR") || l.contains("QUIT") || l.contains(" 001 "));
+    assert!(
+        !line.contains(" 001 "),
+        "an idle connection must never register on its own: {line:?}"
+    );
+
+    std::env::remove_var("CHONKLINE_REG_TIMEOUT_SECS");
+    std::env::remove_var("CHONKLINE_LIVENESS_TICK_SECS");
+}
+
+#[test]
+fn a_server_mask_broadcast_requires_operator() {
+    // PRIVMSG $<mask> fans one command out to every user on the server. Any
+    // registered client could do this: a broadcast and memory amplifier.
+    let addr = start_proxied_server();
+
+    let mut c = Client::new(&addr);
+    c.send("PROXY TCP4 203.0.113.81 10.0.0.1 46001 6667");
+    c.send("NICK masker");
+    c.send("USER masker 0 * :Masker");
+    c.read_until(|l| l.contains(" 001 "));
+    c.send("PRIVMSG $** :broadcast attempt");
+
+    let line = c.read_until(|l| l.contains(" 481 ") || l.contains("PRIVMSG"));
+    assert!(line.contains(" 481 "), "non-oper server-mask broadcast must be refused: {line:?}");
+}
