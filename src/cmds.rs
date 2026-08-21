@@ -2570,7 +2570,11 @@ pub(crate) fn relay_join_to_links(stg: &mut ServerState, id: usize, chan_key: &s
         format!(":{} IJOIN {} {}", uuid, display, membid)
     } else {
         let prefix = if is_op { "o".to_string() } else { String::new() };
-        crate::link::fjoin_line(&sid, display, ts, "+nt", &[(prefix, uuid)])
+        let (flags, mparams) = stg
+            .chan(chan_key)
+            .map(|c| c.burst_mode_parts())
+            .unwrap_or_else(|| ("+".to_string(), Vec::new()));
+        crate::link::fjoin_line_with_params(&sid, display, ts, &flags, &mparams, &[(prefix, uuid)])
     };
     to_links(stg, &line);
 }

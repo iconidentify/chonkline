@@ -449,12 +449,32 @@ pub fn uid_line(
 
 /// Render a channel as the FJOIN line that introduces it.
 pub fn fjoin_line(sid: &str, chan: &str, ts: u64, modes: &str, members: &[(String, String)]) -> String {
+    fjoin_line_with_params(sid, chan, ts, modes, &[], members)
+}
+
+/// As `fjoin_line`, with parameters for the modes that take them.
+///
+/// Modes like +k and +l carry a value, and a burst that omits it describes a
+/// channel the peer cannot reconstruct.
+pub fn fjoin_line_with_params(
+    sid: &str,
+    chan: &str,
+    ts: u64,
+    modes: &str,
+    mode_params: &[String],
+    members: &[(String, String)],
+) -> String {
     let list = members
         .iter()
         .map(|(p, u)| format!("{},{}", p, u))
         .collect::<Vec<_>>()
         .join(" ");
-    format!(":{sid} FJOIN {chan} {ts} {modes} :{list}")
+    let params = if mode_params.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", mode_params.join(" "))
+    };
+    format!(":{sid} FJOIN {chan} {ts} {modes}{params} :{list}")
 }
 
 #[cfg(test)]
@@ -1211,6 +1231,50 @@ mod relay_tests {
         match s.handle_line(":1IN SERVER insp2.test 3IN :Some Description").as_slice() {
             [Event::ServerIntroduced { sid, .. }] => assert_eq!(sid, "3IN"),
             other => panic!("expected a server introduction, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod burst_mode_tests {
+    use super::*;
+
+    #[test]
+    fn a_burst_carries_mode_parameters() {
+        // +k and +l take values. Omitting them describes a channel the peer
+        // cannot reconstruct, and it will believe the description.
+        let line = fjoin_line_with_params(
+            "2CH", "#x", 100, "+ntkl",
+            &["sekrit".to_string(), "25".to_string()],
+            &[("o".into(), "2CHAAAAAA".into())],
+        );
+        assert_eq!(line, ":2CH FJOIN #x 100 +ntkl sekrit 25 :o,2CHAAAAAA");
+    }
+
+    #[test]
+    fn a_burst_without_parameters_is_unchanged() {
+        let line = fjoin_line("2CH", "#x", 100, "+nt", &[(String::new(), "2CHAAAAAA".into())]);
+        assert_eq!(line, ":2CH FJOIN #x 100 +nt :,2CHAAAAAA");
+    }
+
+    #[test]
+    fn a_parameterised_burst_round_trips_through_the_parser() {
+        let mut s = LinkSession::new(
+            LinkConfig { sid: "2CH".into(), name: "c".into(), desc: "d".into(),
+                         send_password: "pw".into(), recv_password: "pw".into() }, true);
+        s.begin();
+        s.take_outbound();
+        s.handle_line("SERVER insp.test pw 0 1IN :InspIRCd");
+        s.take_outbound();
+        let line = fjoin_line_with_params("1IN", "#x", 100, "+ntl", &["25".to_string()],
+                                          &[("o".into(), "1INAAAAAA".into())]);
+        match s.handle_line(&line).as_slice() {
+            [Event::ChannelJoin { modes, members, .. }] => {
+                assert_eq!(modes, "+ntl");
+                assert_eq!(members.len(), 1, "the member list survives the extra parameter");
+                assert_eq!(members[0].1, "1INAAAAAA");
+            }
+            other => panic!("expected a channel join, got {other:?}"),
         }
     }
 }

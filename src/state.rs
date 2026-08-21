@@ -312,6 +312,35 @@ impl Chn {
     /// protocol requires the younger channel to discard all of its modes,
     /// including prefixes, bans and every list mode, before taking the
     /// winner's.
+    /// Modes rendered for a burst, as (flags, params).
+    ///
+    /// A burst that hardcodes its modes tells the peer the channel is something
+    /// it is not, and the peer believes it -- so a re-burst after a split would
+    /// quietly replace the real modes with the invented ones.
+    pub fn burst_mode_parts(&self) -> (String, Vec<String>) {
+        let mut flags = String::from("+");
+        let mut params: Vec<String> = Vec::new();
+        if self.invite_only { flags.push('i'); }
+        if self.nomsg { flags.push('n'); }
+        if self.private { flags.push('p'); }
+        if self.secret { flags.push('s'); }
+        if self.op_topic { flags.push('t'); }
+        if self.moderated { flags.push('m'); }
+        if self.regonly { flags.push('R'); }
+        if let Some(k) = &self.chan_key {
+            flags.push('k');
+            params.push(k.clone());
+        }
+        if self.key_limit > 0 {
+            flags.push('l');
+            params.push(self.key_limit.to_string());
+        }
+        let (fflags, fparams) = self.foreign_mode_parts();
+        flags.push_str(&fflags);
+        params.extend(fparams);
+        (flags, params)
+    }
+
     /// Set or clear the channel key (+k) from a linked server.
     pub(crate) fn set_key_opt(&mut self, k: Option<String>) {
         self.chan_key = k.filter(|v| !v.is_empty());
@@ -938,7 +967,8 @@ impl ServerState {
                     return None;
                 }
                 let _ = key;
-                Some(crate::link::fjoin_line(sid, &c.display, c.created_at, "+nt", &members))
+                let (flags, params) = c.burst_mode_parts();
+                Some(crate::link::fjoin_line_with_params(sid, &c.display, c.created_at, &flags, &params, &members))
             })
             .collect()
     }
