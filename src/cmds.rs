@@ -77,6 +77,12 @@ fn handle_quit(stg: &mut ServerState, id: usize, cmd: &Command) {
         _ => cx.nick.clone(),
     };
     let line = proto::line(&cx.prefix(), "QUIT", &format!(":{}", reason));
+    if !stg.links.is_empty() {
+        if let Some(uuid) = stg.network.local_uuid(id).cloned() {
+            let out = format!(":{} QUIT :{}", uuid, reason);
+            to_links(stg, &out);
+        }
+    }
     // Only users sharing a channel witness the quit (RFC 2812 3.1.7).
     for mid in stg.channel_peers(id) {
         deliver(stg, mid, &line);
@@ -597,6 +603,16 @@ fn handle_nick(stg: &mut ServerState, id: usize, cmd: &Command) {
         // member lists never update.
         let old_prefix = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
         stg.apply_rename(id, new_display);
+        if !stg.links.is_empty() {
+            if let Some(uuid) = stg.network.local_uuid(id).cloned() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let out = format!(":{} NICK {} {}", uuid, new_display, ts);
+                to_links(stg, &out);
+            }
+        }
         let line = proto::line(&old_prefix, "NICK", new_display);
         let mut recipients = stg.channel_peers(id);
         recipients.push(id);
@@ -1169,6 +1185,15 @@ fn handle_part(stg: &mut ServerState, id: usize, cmd: &Command) {
         let sender_prefix = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
         if let Some(u) = stg.find_by_id_mut(id) {
             u.chans.remove(&norm);
+        }
+        if !stg.links.is_empty() {
+            if let Some(uuid) = stg.network.local_uuid(id).cloned() {
+                let out = format!(":{} PART {} :{}", uuid, norm, reason.unwrap_or(""));
+                to_links(stg, &out);
+            }
+        }
+        if let Some(u) = stg.find_by_id_mut(id) {
+            let _ = &u.nick;
         }
         if let Some(c) = stg.chan_mut(&norm) {
             c.eject(id);
