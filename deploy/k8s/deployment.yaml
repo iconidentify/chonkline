@@ -133,6 +133,15 @@ spec:
             # connection sink into a pod that OOMs in under a minute. That path
             # is now removed; only the NodeBalancer's own health-check address
             # needs exempting.
+            # The balancer's own address is here so its health checks -- one
+            # connection every 5s, forever -- are not rate limited.
+            #
+            # Under externalTrafficPolicy: Local every forwarded client shares
+            # that address as its TCP peer, so exemption must NOT be keyed on
+            # the peer or all of them inherit it. It is keyed on the address the
+            # header claims, which is trustworthy precisely because
+            # IRC_PROXY_TRUSTED restricts who may send one. The two settings are
+            # a pair; changing one without the other reopens something.
             - name: IRC_LIMIT_EXEMPT
               value: "192.168.*,127.0.0.1"
             # Peers whose PROXY header is trusted.

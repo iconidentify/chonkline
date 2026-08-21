@@ -166,8 +166,10 @@ impl SourceTable {
     /// Admit or refuse a new connection from `key`, reserving a slot on success.
     /// Every successful call must be matched by exactly one `release`.
     ///
-    /// `exempt` is decided by the caller from the TCP PEER address, never from
-    /// the key. The key may come from a PROXY header, and a header is only as
+    /// `exempt` is decided by the caller from whichever address it has grounds
+    /// to believe -- the claimed one when it arrived over an explicitly trusted
+    /// path, the TCP peer otherwise. Never blindly from the key: a header is
+    /// only as
     /// trustworthy as the path it arrived on -- anyone who can reach the daemon
     /// directly writes their own. Matching the exemption list against a claimed
     /// address let such a client name an exempt range and bypass every bound,

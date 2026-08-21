@@ -89,3 +89,44 @@ fn an_untrusted_peer_is_refused_with_or_without_a_header() {
 
     std::env::remove_var("IRC_PROXY_TRUSTED");
 }
+
+#[test]
+fn a_trusted_proxy_does_not_exempt_everyone_behind_it() {
+    // The regression this exists to prevent. A load balancer's own address is
+    // usually in the exemption list so its health checks are not rate limited.
+    // If exemption keyed on the TCP peer, every client forwarded by that
+    // balancer would share the exempt peer and inherit the exemption -- and no
+    // per-source limit would apply to anybody. This shipped, briefly: 45
+    // connections from one address drew zero refusals in production.
+    std::env::set_var("IRC_PROXY_PROTOCOL", "1");
+    std::env::set_var("IRC_PROXY_PROTOCOL_EXEMPT", "");
+    std::env::set_var("IRC_PROXY_TRUSTED", "127.0.0.1,::1");
+    // The proxy itself is exempt; the clients it forwards are not.
+    std::env::set_var("IRC_LIMIT_EXEMPT", "127.0.0.1,::1");
+    std::env::set_var("IRC_MAX_CONNS_PER_MIN", "3");
+    std::env::set_var("IRC_CLOAK_SUFFIX", "users.test");
+    let addr = start_server();
+
+    // Same forwarded client, over the exempt proxy, past the per-minute limit.
+    let mut refused = 0;
+    let mut held = Vec::new();
+    for i in 0..8 {
+        let mut c = Client::new(&addr);
+        c.send("PROXY TCP4 198.51.100.4 10.0.0.1 1 6667");
+        c.send(&format!("NICK behind{i}"));
+        c.send(&format!("USER behind{i} 0 * :Behind"));
+        let line = c.read_until(|l| l.contains(" 001 ") || l.contains("ERROR"));
+        if line.contains("ERROR") {
+            refused += 1;
+        }
+        held.push(c);
+    }
+    assert!(
+        refused > 0,
+        "a client behind an exempt proxy must still be rate limited; got 0 refusals in 8"
+    );
+
+    for v in ["IRC_PROXY_TRUSTED", "IRC_LIMIT_EXEMPT", "IRC_MAX_CONNS_PER_MIN"] {
+        std::env::remove_var(v);
+    }
+}

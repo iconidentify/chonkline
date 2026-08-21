@@ -100,6 +100,16 @@ fn tls_proxy_mode() -> ProxyMode {
 /// Empty means "trust any peer", which is only safe when the network guarantees
 /// nothing else can reach the port. Set it, and restrict the NodePort at the
 /// firewall as well: neither control alone is sufficient.
+/// Whether an explicit trusted-peer allowlist is configured.
+///
+/// Unset means "trust any peer", which is the compatible default but is not a
+/// statement that any particular header is true. Exemptions lean on this: a
+/// claimed address is only worth acting on when we know which path it came in
+/// on.
+fn proxy_trust_configured() -> bool {
+    matches!(std::env::var("IRC_PROXY_TRUSTED"), Ok(l) if !l.trim().is_empty())
+}
+
 fn proxy_trusted_peer(peer: &str) -> bool {
     match std::env::var("IRC_PROXY_TRUSTED") {
         Ok(list) if !list.trim().is_empty() => list
@@ -199,6 +209,9 @@ async fn admit_and_run(
     // consumed by a header read, so bytes are only taken once they are known to
     // begin a header. That also makes Optional mode safe on the TLS port.
     let mode = if is_tls { tls_proxy_mode() } else { proxy_mode() };
+    // Set only when the address below came from a header that arrived on a
+    // path we explicitly trust. That is what makes the claim actionable.
+    let mut trusted_header = false;
     let real_host = if mode != ProxyMode::Off && !proxy_exempt_peer(&peer) {
         // Time-bounded: this runs BEFORE admission control, so a client that
         // sends "PROXY " and then stalls would otherwise hold a task and an fd
@@ -220,7 +233,10 @@ async fn admit_and_run(
                 Duration::from_secs(10),
                 crate::proxyproto::read_v1(&mut sock),
             ).await.unwrap_or(crate::proxyproto::Header::Invalid) {
-                crate::proxyproto::Header::Source(addr) => addr,
+                crate::proxyproto::Header::Source(addr) => {
+                    trusted_header = proxy_trust_configured();
+                    addr
+                }
                 // PROXY UNKNOWN carries no client address. Falling back to the
                 // peer would collapse such connections onto the proxy's own
                 // address -- which is in the exemption list, so they would
@@ -259,11 +275,22 @@ async fn admit_and_run(
     // /64 cannot mint unlimited distinct sources. Cloaks and logs keep the full
     // address, so attribution is unchanged.
     let limit_key = crate::limits::source_key(&real_host);
-    // Exemption is decided from the TCP peer, never from the address a PROXY
-    // header claims: a header is only as trustworthy as the path it arrived on.
-    let peer_exempt = {
+    // Exemption keys on whichever address we have grounds to believe.
+    //
+    // Keying it on the TCP peer unconditionally looks safer and is much worse
+    // in practice: behind a proxy every client shares one peer, so if that peer
+    // falls in the exemption list -- as a load balancer's own address usually
+    // does, to spare its health checks -- then EVERY forwarded client inherits
+    // the exemption and no per-source limit applies to anyone. Measured in
+    // production: 45 connections from one address, zero refusals.
+    //
+    // So use the claimed address when it arrived over an explicitly trusted
+    // path, and the peer otherwise. An untrusted peer cannot supply a header at
+    // all, so the two agree exactly when it matters.
+    let exempt_key = if trusted_header { limit_key.as_str() } else { peer.as_str() };
+    let exempt = {
         let stg = state.lock().unwrap_or_else(|e| e.into_inner());
-        crate::limits::SourceTable::is_exempt(&stg.limits, &peer)
+        crate::limits::SourceTable::is_exempt(&stg.limits, exempt_key)
     };
 
     // Bans and admission control are both keyed on that resolved address.
@@ -281,7 +308,7 @@ async fn admit_and_run(
             Some(ban) => Some(Deny::Banned(ban.reason.clone())),
             None => stg
                 .sources
-                .try_admit(&stg.limits, &limit_key, peer_exempt, Instant::now())
+                .try_admit(&stg.limits, &limit_key, exempt, Instant::now())
                 .err()
                 .map(Deny::Limited),
         }
@@ -323,14 +350,14 @@ async fn admit_and_run(
                 Ok(_) => {}
             }
             match acc.accept(sock).await {
-                Ok(stream) => run_session(&state, id, stream, &host, &real_host, &limit_key, peer_exempt).await,
+                Ok(stream) => run_session(&state, id, stream, &host, &real_host, &limit_key, exempt).await,
                 Err(e) => {
                     crate::log::counted("tls.handshake_failed", &real_host);
                     let _ = e;
                 }
             }
         }
-        None => run_session(&state, id, sock, &host, &real_host, &limit_key, peer_exempt).await,
+        None => run_session(&state, id, sock, &host, &real_host, &limit_key, exempt).await,
     }
 
     // Release the admission slot this connection reserved, and record the close
@@ -338,7 +365,7 @@ async fn admit_and_run(
     let nick = {
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
         let stg = &mut *guard;
-        stg.sources.release(&stg.limits, &limit_key, peer_exempt, Instant::now());
+        stg.sources.release(&stg.limits, &limit_key, exempt, Instant::now());
         stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()
     };
     crate::log::conn_close(id, &real_host, &nick, "closed");
@@ -362,7 +389,7 @@ async fn run_session<S>(
     host: &str,
     real_host: &str,
     limit_key: &str,
-    peer_exempt: bool,
+    exempt: bool,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -386,7 +413,7 @@ async fn run_session<S>(
     let notify = Arc::new(Notify::new());
     park_unregistered(state, id, host.to_string(), real_host.to_string(), tx.clone(), notify.clone());
 
-    run_reader(state.clone(), id, rd, notify, limit_key.to_string(), peer_exempt).await;
+    run_reader(state.clone(), id, rd, notify, limit_key.to_string(), exempt).await;
 }
 
 /// Read loop: frames lines out of the byte stream (CR-LF / LF / CR per current
@@ -399,7 +426,7 @@ async fn run_reader<R>(
     mut rd: R,
     notify: Arc<Notify>,
     src: String,
-    peer_exempt: bool,
+    exempt: bool,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -443,7 +470,7 @@ async fn run_reader<R>(
                 tokio::time::sleep(throttle).await;
                 throttle = Duration::ZERO;
             }
-            if process_segment(&state, id, &mut flood, &content, &src, peer_exempt, &mut throttle) {
+            if process_segment(&state, id, &mut flood, &content, &src, exempt, &mut throttle) {
                 cleanup_on_eof(&state, id); // idempotent: no-ops when the session left cleanly via QUIT
                 return;
             }
@@ -480,7 +507,7 @@ fn process_segment(
     flood: &mut VecDeque<Instant>,
     seg: &[u8],
     src: &str,
-    peer_exempt: bool,
+    exempt: bool,
     throttle: &mut Duration,
 ) -> bool {
     if seg.is_empty() {
@@ -502,7 +529,7 @@ fn process_segment(
             }
             false
         }
-        Some(cmd) => route(state, id, flood, &cmd, src, peer_exempt, throttle),
+        Some(cmd) => route(state, id, flood, &cmd, src, exempt, throttle),
     }
 }
 
@@ -515,7 +542,7 @@ fn route(
     flood: &mut VecDeque<Instant>,
     cmd: &proto::Command,
     src: &str,
-    peer_exempt: bool,
+    exempt: bool,
     throttle: &mut Duration,
 ) -> bool {
     if cmd.name.len() == 3 && cmd.name.chars().all(|c| c.is_ascii_digit()) {
@@ -574,7 +601,7 @@ fn route(
         // the limiter weakens in exact proportion to the abuse.
         if !is_oper {
             let stg_ref = &mut *stg;
-            match stg_ref.sources.charge_message(&stg_ref.limits, src, peer_exempt, now) {
+            match stg_ref.sources.charge_message(&stg_ref.limits, src, exempt, now) {
                 Ok(()) => {}
                 Err(false) => {
                     crate::log::flood("dropped");
