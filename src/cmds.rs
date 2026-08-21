@@ -3,6 +3,9 @@ use crate::proto::{self, Command};
 /// Username length carried in a user's prefix. Longer values are truncated to
 /// this rather than refused (see `handle_user`).
 const MAX_USER_LEN: usize = 10;
+
+/// Distinct recipients permitted in one PRIVMSG/NOTICE, advertised as TARGMAX.
+const MAX_TARGETS: usize = 4;
 use crate::state::{norm_nick, ServerState};
 
 /// Route a parsed command against the locked state. Returns true when the
@@ -727,7 +730,7 @@ fn welcome_sequence(stg: &mut ServerState, id: usize, _nick_snapshot_at_completi
     let myinfo_srv = stg.name.clone();
     numeric(stg, id, "004", &[&myinfo_srv, stg.version, "iow", "biklmnotv"]);
     // RPL_ISUPPORT: advertise only tokens the server genuinely honors.
-    numeric(stg, id, "005", &["CHANTYPES=#", "PREFIX=(ov)@+", "CHANMODES=beI,k,l,imntR", "STATUSMSG=@+", "EXCEPTS=e", "INVEX=I", "CASEMAPPING=rfc1459", "NICKLEN=30", "CHANNELLEN=50", "TOPICLEN=390", "NETWORK=Chonkbase", ":are supported by this server"]);
+    numeric(stg, id, "005", &["CHANTYPES=#", "PREFIX=(ov)@+", "CHANMODES=beI,k,l,imntR", "STATUSMSG=@+", "EXCEPTS=e", "INVEX=I", "CASEMAPPING=rfc1459", "NICKLEN=30", "CHANNELLEN=50", "TOPICLEN=390", "TARGMAX=PRIVMSG:4,NOTICE:4", "NETWORK=Chonkbase", ":are supported by this server"]);
 
     let users = stg.user_count();
     let invis = stg.invis_count();
@@ -1812,9 +1815,29 @@ fn handle_privmsg(stg: &mut ServerState, id: usize, cmd: &Command, is_priv: bool
         _ => { if is_priv { reply_missing_text(stg, id); } return; }
     }
 
+    // Cap and de-duplicate the target list. Uncapped, one 512-byte line could
+    // name the same victim 161 times and produce 161 deliveries -- a ~19x
+    // amplifier that both flood tiers charged as a SINGLE message, because they
+    // count input lines rather than deliveries. That multiplier, not CTCP
+    // itself, is what made the reflection flood effective.
+    let mut seen: Vec<String> = Vec::with_capacity(MAX_TARGETS);
+    let mut over = false;
     for raw in recips_raw.split(',').filter(|c| !c.is_empty()) {
+        let key = raw.to_lowercase();
+        if seen.iter().any(|s| *s == key) {
+            continue; // same target twice in one line is one delivery
+        }
+        if seen.len() >= MAX_TARGETS {
+            over = true;
+            break;
+        }
+        seen.push(key);
         stg.note_message(); // lifetime relay counter for the stats page
         deliver_one_recipient(stg, id, raw, text.unwrap(), is_priv);
+    }
+    if over {
+        // ERR_TOOMANYTARGETS
+        numeric(stg, id, "407", &[recips_raw, "Too many recipients"]);
     }
 }
 

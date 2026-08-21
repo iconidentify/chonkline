@@ -188,7 +188,15 @@ async fn admit_and_run(
                 crate::proxyproto::read_v1(&mut sock),
             ).await.unwrap_or(crate::proxyproto::Header::Invalid) {
                 crate::proxyproto::Header::Source(addr) => addr,
-                crate::proxyproto::Header::Unknown => peer.clone(),
+                // PROXY UNKNOWN carries no client address. Falling back to the
+                // peer would collapse such connections onto the proxy's own
+                // address -- which is in the exemption list, so they would
+                // bypass every limit. Refuse instead.
+                crate::proxyproto::Header::Unknown => {
+                    crate::log::counted("proxy.unknown", &peer);
+                    refuse(&mut sock, is_tls, "PROXY protocol header carries no client address").await;
+                    return;
+                }
                 crate::proxyproto::Header::Empty => return, // hung up mid-header
                 crate::proxyproto::Header::Invalid => {
                     crate::log::proxy_rejected(&peer);
@@ -214,6 +222,11 @@ async fn admit_and_run(
         peer.clone()
     };
 
+    // Limits are keyed on the network block, not the exact address, so an IPv6
+    // /64 cannot mint unlimited distinct sources. Cloaks and logs keep the full
+    // address, so attribution is unchanged.
+    let limit_key = crate::limits::source_key(&real_host);
+
     // Bans and admission control are both keyed on that resolved address.
     // Both decisions are taken under one short lock, and every socket write
     // happens after it is released.
@@ -229,7 +242,7 @@ async fn admit_and_run(
             Some(ban) => Some(Deny::Banned(ban.reason.clone())),
             None => stg
                 .sources
-                .try_admit(&stg.limits, &real_host, Instant::now())
+                .try_admit(&stg.limits, &limit_key, Instant::now())
                 .err()
                 .map(Deny::Limited),
         }
@@ -260,13 +273,13 @@ async fn admit_and_run(
     // costs a key exchange — which matters precisely when refusals are frequent.
     match acceptor {
         Some(acc) => match acc.accept(sock).await {
-            Ok(stream) => run_session(&state, id, stream, &host, &real_host).await,
+            Ok(stream) => run_session(&state, id, stream, &host, &real_host, &limit_key).await,
             Err(e) => {
                 crate::log::counted("tls.handshake_failed", &real_host);
                 let _ = e;
             }
         },
-        None => run_session(&state, id, sock, &host, &real_host).await,
+        None => run_session(&state, id, sock, &host, &real_host, &limit_key).await,
     }
 
     // Release the admission slot this connection reserved, and record the close
@@ -274,7 +287,7 @@ async fn admit_and_run(
     let nick = {
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
         let stg = &mut *guard;
-        stg.sources.release(&stg.limits, &real_host, Instant::now());
+        stg.sources.release(&stg.limits, &limit_key, Instant::now());
         stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()
     };
     crate::log::conn_close(id, &real_host, &nick, "closed");
@@ -297,6 +310,7 @@ async fn run_session<S>(
     stream: S,
     host: &str,
     real_host: &str,
+    limit_key: &str,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -320,7 +334,7 @@ async fn run_session<S>(
     let notify = Arc::new(Notify::new());
     park_unregistered(state, id, host.to_string(), real_host.to_string(), tx.clone(), notify.clone());
 
-    run_reader(state.clone(), id, rd, notify, real_host.to_string()).await;
+    run_reader(state.clone(), id, rd, notify, limit_key.to_string()).await;
 }
 
 /// Read loop: frames lines out of the byte stream (CR-LF / LF / CR per current
@@ -340,7 +354,10 @@ async fn run_reader<R>(
     let mut flood: VecDeque<Instant> = VecDeque::new();
 
     loop {
-        let mut chunk = [0u8; 1 << 16];
+        // 8 KiB, not 64 KiB. This array lives in the spawned future across the
+        // read await, so it was reserved for every accepted socket whether or
+        // not a byte ever arrived -- ~82 KB per connection, most of it this.
+        let mut chunk = [0u8; 8 * 1024];
         tokio::select! {
             _ = notify.notified() => break,
             nres = rd.read(&mut chunk) => match nres {
@@ -380,6 +397,22 @@ async fn run_reader<R>(
 }
 
 /// Route one framed command line. Returns true when the session must close.
+/// Record one line against the per-connection burst window and report whether
+/// the connection is now over budget.
+fn charge_burst(flood: &mut VecDeque<Instant>) -> bool {
+    let now = Instant::now();
+    let fw = flood_window();
+    flood.push_back(now);
+    while let Some(front) = flood.front() {
+        if now.duration_since(*front) > fw {
+            flood.pop_front();
+        } else {
+            break;
+        }
+    }
+    flood.len() > FLOOD_BURST
+}
+
 fn process_segment(
     state: &Arc<Mutex<ServerState>>,
     id: usize,
@@ -388,11 +421,20 @@ fn process_segment(
     src: &str,
 ) -> bool {
     if seg.is_empty() {
-        return false; // empty messages are silently ignored (RFC 2.3.1)
+        // Still charged: a stream of bare newlines is real framing work, and
+        // uncharged it consumed CPU indefinitely without ever being throttled.
+        charge_burst(flood);
+        return false;
     }
     let text = String::from_utf8_lossy(seg);
     match proto::parse(&text) {
-        None => false, // grammar violations: dropped silently
+        // Grammar violations are dropped, but they still cost the server the
+        // framing work, so they must be charged. Uncharged, a stream of
+        // malformed lines was never throttled and never disconnected the sender.
+        None => {
+            charge_burst(flood);
+            false
+        }
         Some(cmd) => route(state, id, flood, &cmd, src),
     }
 }
@@ -433,16 +475,13 @@ fn route(
         // Flood control (RFC 8.10), tier 1: the per-connection burst window.
         // Excess over the burst is dropped silently.
         let now = Instant::now();
-        let fw = flood_window();
-        flood.push_back(now);
-        while let Some(front) = flood.front() {
-            if now.duration_since(*front) > fw {
-                flood.pop_front();
-            } else {
-                break;
-            }
-        }
-        if flood.len() > FLOOD_BURST {
+        let over_burst = charge_burst(flood);
+        // PING/PONG are exempt from the drop. Otherwise a client whose
+        // auto-replies saturate the window cannot answer the server's own
+        // liveness ping, and is evicted for traffic someone else aimed at it --
+        // which is exactly how a CTCP reflection flood removes its victim.
+        let liveness_cmd = matches!(cmd.name.as_str(), "PING" | "PONG");
+        if over_burst && !liveness_cmd {
             crate::log::flood("dropped");
             return false;
         }
@@ -578,8 +617,16 @@ fn ping_after_window() -> std::time::Duration {
 /// and given a short grace to answer; silence past the grace evicts the holder.
 /// Environment overrides keep both knobs tunable per deployment. Single source of
 /// truth: the collision-time predicate and marker installation in cmds delegate here.
+/// How long a nick holder must have been silent before another client may
+/// contest the nick.
+///
+/// This defaulted to ZERO, which made every user permanently "stale": anyone
+/// quiet for more than a second could be contested by any socket, including an
+/// unregistered one, which pinged them and evicted them 3s later. That is a
+/// targeted disconnect loop against any named user for one 12-byte line every
+/// three seconds. 60s is long enough that only genuinely absent clients qualify.
 pub(crate) fn reclaim_silence_window() -> std::time::Duration {
-    let secs: u64 = std::env::var("CHONKLINE_RECLAIM_SILENCE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let secs: u64 = std::env::var("CHONKLINE_RECLAIM_SILENCE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
     std::time::Duration::from_secs(secs)
 }
 

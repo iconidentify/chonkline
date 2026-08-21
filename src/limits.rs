@@ -75,6 +75,29 @@ impl Default for Limits {
     }
 }
 
+/// Collapse an address to the unit that actually costs an attacker money.
+///
+/// A single IPv6 /64 is the smallest block routinely handed to one customer, so
+/// keying on the full address made every per-source bound meaningless: an
+/// attacker with one /64 has 18 quintillion distinct "sources" and can take
+/// every admission slot without tripping a clone cap or a connect rate. IPv4 is
+/// keyed whole, since a /32 is already the unit of scarcity there.
+pub fn source_key(addr: &str) -> String {
+    match addr.parse::<std::net::Ipv6Addr>() {
+        Ok(v6) => {
+            // An IPv4-mapped address is really IPv4; key it as such.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.to_string();
+            }
+            let o = v6.octets();
+            let mut net = [0u8; 16];
+            net[..8].copy_from_slice(&o[..8]);
+            format!("{}/64", std::net::Ipv6Addr::from(net))
+        }
+        Err(_) => addr.to_string(),
+    }
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }

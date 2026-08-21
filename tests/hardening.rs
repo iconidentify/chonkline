@@ -172,7 +172,9 @@ fn kill_requires_operator_privilege() {
     rando.read_until(|l| l.contains(" 001 "));
 
     rando.send("KILL victim :not allowed");
-    let reply = rando.read_until(|l| l.contains(" 481 ") || l.contains("NOTICE"));
+    // Specific: the 005 burst now advertises TARGMAX=PRIVMSG:4,NOTICE:4, so a
+    // bare "NOTICE" predicate matches the wrong line.
+    let reply = rando.read_until(|l| l.contains(" 481 "));
     assert!(
         reply.contains(" 481 "),
         "a non-operator KILL must be refused with 481, got {reply:?}"
@@ -321,6 +323,100 @@ fn a_server_mask_broadcast_requires_operator() {
     c.read_until(|l| l.contains(" 001 "));
     c.send("PRIVMSG $** :broadcast attempt");
 
-    let line = c.read_until(|l| l.contains(" 481 ") || l.contains("PRIVMSG"));
+    // Predicate must not match the 005 burst, which now advertises TARGMAX=PRIVMSG:4.
+    let line = c.read_until(|l| l.contains(" 481 ") || l.contains(" 401 "));
     assert!(line.contains(" 481 "), "non-oper server-mask broadcast must be refused: {line:?}");
+}
+
+#[test]
+fn a_quiet_user_cannot_be_evicted_by_a_stranger() {
+    // The reclaim silence window defaulted to zero, so anyone quiet for a
+    // second looked "stale" and any socket -- including an unregistered one --
+    // could force a ping and evict them 3s later. A 12-byte line every three
+    // seconds was a targeted disconnect loop against any named user.
+    let addr = start_proxied_server();
+
+    let mut victim = Client::new(&addr);
+    victim.send("PROXY TCP4 203.0.113.90 10.0.0.1 47000 6667");
+    victim.send("NICK quietuser");
+    victim.send("USER quietuser 0 * :Quiet");
+    victim.read_until(|l| l.contains(" 001 "));
+
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    // An unregistered stranger contests the nick.
+    let mut attacker = Client::new(&addr);
+    attacker.send("PROXY TCP4 203.0.113.91 10.0.0.1 47001 6667");
+    attacker.send("NICK quietuser");
+    attacker.send("USER thief 0 * :Thief");
+
+    // The nick is in use and must stay that way.
+    let line = attacker.read_until(|l| l.contains(" 433 ") || l.contains(" 001 "));
+    assert!(
+        !line.contains(" 001 "),
+        "a stranger must not take a live user's nick: {line:?}"
+    );
+}
+
+#[test]
+fn a_single_line_cannot_name_the_same_target_many_times() {
+    // One 512-byte line naming a victim 161 times produced 161 deliveries, and
+    // both flood tiers charged it as a single message. That multiplier is what
+    // made the CTCP reflection flood effective.
+    let addr = start_proxied_server();
+
+    let mut victim = Client::new(&addr);
+    victim.send("PROXY TCP4 203.0.113.92 10.0.0.1 47002 6667");
+    victim.send("NICK target");
+    victim.send("USER target 0 * :Target");
+    victim.read_until(|l| l.contains(" 001 "));
+
+    let mut sender = Client::new(&addr);
+    sender.send("PROXY TCP4 203.0.113.93 10.0.0.1 47003 6667");
+    sender.send("NICK sender");
+    sender.send("USER sender 0 * :Sender");
+    sender.read_until(|l| l.contains(" 001 "));
+
+    // Distinct targets: identical ones de-duplicate to a single delivery, which
+    // is the other half of the fix and correctly never reaches the cap.
+    let many: String = (0..40).map(|i| format!("nick{}", i)).collect::<Vec<_>>().join(",");
+    sender.send(&format!("PRIVMSG {} :amplified", many));
+
+    // The first MAX_TARGETS entries are delivered (each 401, they do not exist)
+    // and the 407 follows, so skip past the 401s.
+    let reply = sender.read_until(|l| l.contains(" 407 "));
+    assert!(reply.contains(" 407 "), "an oversized target list must be refused: {reply:?}");
+}
+
+#[test]
+fn identical_targets_collapse_to_one_delivery() {
+    // The other half of the amplification fix: naming the same victim many
+    // times in one line must cost one delivery, not many.
+    let addr = start_proxied_server();
+
+    let mut victim = Client::new(&addr);
+    victim.send("PROXY TCP4 203.0.113.94 10.0.0.1 47004 6667");
+    victim.send("NICK dupetarget");
+    victim.send("USER dupetarget 0 * :Target");
+    victim.read_until(|l| l.contains(" 001 "));
+
+    let mut sender = Client::new(&addr);
+    sender.send("PROXY TCP4 203.0.113.95 10.0.0.1 47005 6667");
+    sender.send("NICK dupesender");
+    sender.send("USER dupesender 0 * :Sender");
+    sender.read_until(|l| l.contains(" 001 "));
+
+    let many = vec!["dupetarget"; 40].join(",");
+    sender.send(&format!("PRIVMSG {} :once please", many));
+    sender.send("PRIVMSG dupetarget :marker");
+
+    // The victim should see the amplified line once, then the marker -- not 40
+    // copies before it.
+    let first = victim.read_until(|l| l.contains("once please") || l.contains("marker"));
+    assert!(first.contains("once please"), "expected the message: {first:?}");
+    let second = victim.read_until(|l| l.contains("once please") || l.contains("marker"));
+    assert!(
+        second.contains("marker"),
+        "duplicate targets must collapse; saw another copy instead: {second:?}"
+    );
 }
