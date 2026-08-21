@@ -78,6 +78,7 @@ pub struct Network {
     /// Local connection id to the UUID minted for it.
     local_uuids: HashMap<usize, String>,
     next_uid: u64,
+    next_membid: u64,
 }
 
 const UID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -91,6 +92,7 @@ impl Network {
             nick_index: HashMap::new(),
             local_uuids: HashMap::new(),
             next_uid: 0,
+            next_membid: 1,
         }
     }
 
@@ -121,6 +123,14 @@ impl Network {
 
     pub fn local_uuid(&self, id: usize) -> Option<&String> {
         self.local_uuids.get(&id)
+    }
+
+    /// Membership ids distinguish two joins of the same user to one channel.
+    /// IJOIN requires one; a peer rejects the message outright without it.
+    pub fn next_membid(&mut self) -> u64 {
+        let id = self.next_membid;
+        self.next_membid = self.next_membid.wrapping_add(1).max(1);
+        id
     }
 
     /// The local connection that owns a UUID, if we minted it.

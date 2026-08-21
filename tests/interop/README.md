@@ -48,6 +48,39 @@ Protocol 1205 and 1206 both link to a 4.11 server (`PROTO_OLDEST = 1205`,
 `PROTO_NEWEST = 1206`), so a single implementation speaking 1205 reaches both
 InspIRCd v3 and v4.
 
+## Live linking
+
+`live_link.py` and `live_link_full.py` run a real chonkline against a real
+InspIRCd and exercise the whole surface: channel traffic both ways, private
+messages both ways, NAMES and WHOIS resolving remote users, nick change, part,
+rejoin, quit, and a netsplit. Sixteen checks.
+
+```
+IRC_SID=2CH IRC_SERVER_NAME=chonk.test IRC_LINK_PASSWORD=linkpass \
+  IRC_LINK_PEERS=127.0.0.1:7001 target/release/irc-server
+python3 live_link_full.py
+```
+
+Two things these caught that no unit test would have:
+
+* **FJOIN versus IJOIN.** FJOIN introduces channel state and is what a burst
+  uses; a single user joining a channel the network already knows is an
+  incremental join and must be IJOIN. A peer merges a post-burst FJOIN silently
+  rather than announcing it, so the join simply never appeared on the other
+  side. IJOIN also takes `<chan> <membid>` -- sending only the channel fails the
+  peer's arity check and is dropped without a word either way.
+
+* **The join relay was wired into only one of the two join paths**, so a user
+  joining a channel that already existed was never announced. A peer routes
+  channel traffic only to servers it believes hold a member, so the channel
+  worked in exactly one direction.
+
+Worth knowing when reading a failure here: chonkline's own tier-1 flood control
+drops the seventh message in a two-second window silently. A test that fires
+commands back to back trips it and the symptom -- a join that never reaches the
+peer -- looks identical to a protocol bug. The harness paces itself for that
+reason.
+
 ## The obligation this creates
 
 Skipping mode validation does not make the modes go away. InspIRCd still sends

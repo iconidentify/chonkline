@@ -1106,6 +1106,7 @@ fn joiner_replies(stg: &mut ServerState, id: usize, display: &str) {
             }
         }
     }
+    nicks.extend(remote_names(stg, &display.to_lowercase()));
     let listing: String = nicks.join(" ");
     let sym = stg.chan(&display.to_lowercase()).map(names_symbol).unwrap_or("=");
     numeric(stg, id, "353", &[sym, display, &format!(":{}", listing)]); // RFC 353: =/*/@ visibility symbol then channel
@@ -1761,7 +1762,8 @@ fn handle_names(stg: &mut ServerState, id: usize, cmd: &Command) {
                 }))
                 .collect::<Vec<String>>())
         });
-        if let Some(nicks) = markers_now {
+        if let Some(mut nicks) = markers_now {
+            nicks.extend(remote_names(stg, &norm_key));
             let sym = stg.chan(&norm_key).map(names_symbol).unwrap_or("=");
             numeric(stg, id, "353", &[sym, raw, &format!(":{}", nicks.join(" "))]); // RFC 353: visibility symbol then channel
         }
@@ -2378,6 +2380,18 @@ fn deliver_one_recipient(stg: &mut ServerState, id: usize, raw: &str, text: &str
     }
 }
 
+/// Nicknames of remote users in a channel, formatted for a NAMES listing.
+///
+/// Without this a linked channel looks empty of everyone on the other side,
+/// which is the most visible way a working link can still look broken.
+pub(crate) fn remote_names(stg: &ServerState, chan_key: &str) -> Vec<String> {
+    stg.network
+        .members_of(chan_key)
+        .iter()
+        .filter_map(|uuid| stg.network.user(uuid).map(|u| u.nick.clone()))
+        .collect()
+}
+
 /// Tell every link that a local user joined a channel.
 ///
 /// Must fire on BOTH join paths. A peer routes channel traffic only to servers
@@ -2391,8 +2405,21 @@ pub(crate) fn relay_join_to_links(stg: &mut ServerState, id: usize, chan_key: &s
     let uuid = stg.network.uuid_for_local(id);
     let ts = stg.chan(chan_key).map(|c| c.created_at).unwrap_or(0);
     let is_op = stg.chan(chan_key).map(|c| c.is_op(id)).unwrap_or(false);
-    let prefix = if is_op { "o".to_string() } else { String::new() };
-    let line = crate::link::fjoin_line(&sid, display, ts, "+nt", &[(prefix, uuid)]);
+
+    // FJOIN introduces channel state and is what a burst uses. A single user
+    // joining a channel the network already knows is an incremental join, and
+    // the peer will merge an FJOIN silently rather than announce it -- which
+    // looked exactly like the join never happening.
+    let peer_knows = !stg.network.members_of(chan_key).is_empty();
+    let line = if peer_knows {
+        // IJOIN takes <chan> <membid>; sending only the channel fails the
+        // peer's arity check and the join is dropped without a word.
+        let membid = stg.network.next_membid();
+        format!(":{} IJOIN {} {}", uuid, display, membid)
+    } else {
+        let prefix = if is_op { "o".to_string() } else { String::new() };
+        crate::link::fjoin_line(&sid, display, ts, "+nt", &[(prefix, uuid)])
+    };
     to_links(stg, &line);
 }
 
@@ -2704,7 +2731,32 @@ fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) {
     let target_id_now: Option<usize> = stg.lookup(&norm_nick(target_param_now)).map(|t| t.id);
     match target_id_now {
 
-        None => { deliver_nosuch_nick(stg, id, target_param_now); }
+        None => {
+            // The nickname may belong to a user on another server. Answering
+            // 401 for someone plainly present in a shared channel is the other
+            // obvious way a working link looks broken.
+            let remote = stg.network.by_nick(&norm_nick(target_param_now)).cloned();
+            match remote {
+                Some(u) => {
+                    let srv = stg
+                        .network
+                        .server(&u.sid)
+                        .map(|s| (s.name.clone(), s.desc.clone()))
+                        .unwrap_or_else(|| (u.sid.clone(), String::new()));
+                    numeric(stg, id, "311", &[&u.nick, &u.user, &u.host, "*", &u.realname]);
+                    numeric(stg, id, "312", &[&u.nick, &srv.0, &srv.1]);
+                    if let Some(reason) = u.away.clone() {
+                        numeric(stg, id, "301", &[&u.nick, &reason]);
+                    }
+                    let chans: Vec<String> = u.chans.iter().cloned().collect();
+                    if !chans.is_empty() {
+                        numeric(stg, id, "319", &[&u.nick, &chans.join(" ")]);
+                    }
+                    numeric(stg, id, "318", &[&u.nick, "End of /WHOIS list"]);
+                }
+                None => deliver_nosuch_nick(stg, id, target_param_now),
+            }
+        }
 
         Some(tid) => {
             let nick_now: String = stg.find_by_id(tid).map(|t| t.nick.clone()).unwrap_or_default();

@@ -818,10 +818,15 @@ impl ServerState {
 
     /// Drop channels left without members after ejections.
     pub fn drop_empty_channels(&mut self) {
+        // A channel with no LOCAL members may still hold users on other
+        // servers. Dropping it then recreating it on the next local join mints
+        // a fresh, higher creation timestamp -- and the higher timestamp loses
+        // every conflict, so the channel would churn its modes away each time
+        // the last local user left and came back.
         let dead: Vec<String> = self
             .chans
             .iter()
-            .filter(|(_, c)| c.members.is_empty())
+            .filter(|(k, c)| c.members.is_empty() && self.network.members_of(k).is_empty())
             .map(|(k, _)| k.clone())
             .collect();
         for k in dead {
