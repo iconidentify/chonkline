@@ -35,11 +35,31 @@ metadata:
     service.beta.kubernetes.io/linode-loadbalancer-throttle: "5"
 spec:
   type: LoadBalancer
-  # Cluster, not Local. Local would preserve the source address at the node,
-  # but the PROXY header already carries it -- so Local buys nothing here and
-  # costs resilience: with a single replica only the node running the pod would
-  # pass the balancer's health check, making every pod move a brief outage.
-  externalTrafficPolicy: Cluster
+  # Local, not Cluster. An earlier revision of this file said Local "buys
+  # nothing here, because the PROXY header already carries the address". That
+  # was wrong, and wrong in the direction that mattered.
+  #
+  # A LoadBalancer Service also opens its nodePort on EVERY node's PUBLIC
+  # address, so the balancer can be bypassed by anyone who scans for it. Under
+  # Cluster policy kube-proxy SNATs, and the daemon sees the node's own address
+  # for balancer traffic and bypass traffic alike -- indistinguishable, so no
+  # allowlist can separate them and a bypasser's self-written PROXY header is
+  # indistinguishable from the balancer's. Measured on this cluster:
+  #
+  #   nodePort, Cluster policy -> pod saw 172.232.169.19  (the node itself)
+  #   nodePort, Local policy   -> pod saw 24.22.110.119   (the true client)
+  #
+  # Local removes that SNAT, so the balancer arrives as 192.168.255.65 and a
+  # bypasser arrives as themselves. That is what makes IRC_PROXY_TRUSTED able
+  # to tell the two apart, which is what closes the forgery. The header is
+  # trusted because of the path it came in on; under Cluster there is no path
+  # to check.
+  #
+  # The resilience cost is real but small: with one replica only the node
+  # running the pod passes the health check. That check is every 5s with 2
+  # attempts, so a pod move costs about 10s of failover -- against a bypass
+  # that currently defeats every per-source limit and ban the daemon has.
+  externalTrafficPolicy: Local
   selector:
     app.kubernetes.io/name: chonkline
   ports:

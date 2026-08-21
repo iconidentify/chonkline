@@ -83,6 +83,7 @@ plaintext ones.
 | `IRC_PROXY_PROTOCOL`         | *(off)*           | `1`/`required`, `optional`, or off              |
 | `IRC_TLS_PROXY_PROTOCOL`     | *(as above)*      | Same, for the TLS listener only                |
 | `IRC_PROXY_PROTOCOL_EXEMPT`  | *(none)*          | Peers admitted without a header                |
+| `IRC_PROXY_TRUSTED`          | *(any)*           | Peers whose PROXY header is trusted            |
 
 A proxy terminates the client's connection and opens its own, so `peer_addr()`
 reports the proxy rather than the client. Behind a single ingress that address
@@ -121,6 +122,18 @@ The first controls decoding the inbound connection; the second controls sending
 the header upstream. With only one, nginx decodes but does not forward, and
 every client reaches the daemon wearing the ingress pod's address.
 
+`IRC_PROXY_TRUSTED` matters more than it looks. A PROXY header is only as
+trustworthy as the path it arrived on: anything that can open a connection to
+the daemon can write its own and name any source it likes, which defeats
+per-source limits and bans. On Kubernetes a `type: LoadBalancer` Service also
+opens a NodePort on every node's public address, so the balancer can be bypassed
+by anyone who scans for it. Set this to the address the balancer reaches the pod
+from -- it appears as `peer=` on `conn.open` at debug level -- **and** restrict
+the NodePort range at the firewall. Neither control is sufficient alone.
+
+Rate-limit exemptions (`IRC_LIMIT_EXEMPT`) are matched against the TCP peer,
+never against the address a header claims, for the same reason.
+
 The exemption list is empty by default. It exists for deployments that still
 front the daemon with a local terminator unable to emit a header; such peers
 necessarily share one cloak, since their real address never arrives.
@@ -145,6 +158,43 @@ clients do not answer, which illustrates both the value and the risk.
 Any `PONG` is accepted rather than a matching token: matching adds nothing
 against a bot that reads the socket, and only risks breaking a client that
 echoes the token oddly.
+
+### Server linking
+
+chonkline speaks the InspIRCd spanning-tree protocol and can join an InspIRCd
+network as a peer. Off unless `IRC_SID` is set.
+
+| Env var             | Default   | Meaning                                       |
+|---------------------|-----------|-----------------------------------------------|
+| `IRC_SID`           | *(off)*   | This server's id, `[0-9][A-Z0-9]{2}`          |
+| `IRC_LINK_PORT`     | *(none)*  | Listen for inbound links                      |
+| `IRC_LINK_PEERS`    | *(none)*  | `host:port[:fingerprint]`, comma separated    |
+| `IRC_LINK_PASSWORD` | *(empty)* | Shared with the peer's `<link>` block         |
+| `IRC_LINK_TLS`      | *(off)*   | TLS for links (use it off loopback)           |
+
+Protocol 1205 is offered, which InspIRCd v3 and v4 both accept, so one build
+links to either.
+
+**Transport.** Set `IRC_LINK_TLS=1` for anything that is not loopback: a link
+otherwise carries every user's traffic and the link password in the clear. Peers
+are authenticated by pinning a SHA-256 certificate fingerprint rather than by a
+CA chain, because certificates on server links are routinely self-signed and
+there is no authority to appeal to. An outbound peer given no pin is refused --
+an unauthenticated TLS link is encrypted against an observer and wide open to
+whoever answers that address. The server logs its own fingerprint as
+`link.fingerprint` at startup; that is what the other operator needs.
+
+**Modes.** chonkline never advertises `CAPAB CHANMODES`, `USERMODES` or
+`EXTBANS`. InspIRCd compares those only when a peer sends them, so staying quiet
+is what lets a smaller mode set link at all; sending a set that differs is
+refused. Modes it does not implement still arrive, and are stored per channel
+and reported rather than dropped, because dropping one the peer believes is set
+is a silent divergence.
+
+**Interoperability testing** lives in `tests/interop/` and runs against a real
+InspIRCd: handshake and refusal probes, a twenty-one check functional suite, a
+three-server multi-hop topology, TLS links with a pinned fingerprint, and a load
+and stress harness.
 
 ### Limits
 

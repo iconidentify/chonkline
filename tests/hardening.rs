@@ -477,3 +477,31 @@ fn a_failed_oper_attempt_is_announced() {
         "a failed OPER attempt must be announced: {notice:?}"
     );
 }
+
+#[test]
+fn a_burst_of_commands_is_paced_not_discarded() {
+    // Flood control used to drop the seventh message in a two-second window
+    // silently, so a client joining several channels quickly simply lost some
+    // of them with no feedback. Delaying throttles just as well and keeps the
+    // work, which is what fakelag means.
+    let addr = start_proxied_server();
+
+    let mut c = Client::new(&addr);
+    c.send("PROXY TCP4 203.0.113.120 10.0.0.1 49000 6667");
+    c.send("NICK burster");
+    c.send("USER burster 0 * :Burster");
+    c.read_until(|l| l.contains(" 001 "));
+
+    // Well past the six-per-two-seconds burst allowance, sent back to back.
+    for i in 0..10 {
+        c.send(&format!("JOIN #burst{}", i));
+    }
+
+    // Every join must eventually land. The last one is the one that used to be
+    // thrown away.
+    let last = c.read_until(|l| l.contains("#burst9"));
+    assert!(
+        last.contains("#burst9"),
+        "the tenth join must arrive rather than be dropped: {last:?}"
+    );
+}

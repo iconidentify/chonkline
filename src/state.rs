@@ -218,6 +218,12 @@ pub struct Chn {
     excepts: Vec<String>, // +e ban-exception masks (lowercased)
     invex: Vec<String>,  // +I invite-exception masks (lowercased)
     invites: BTreeSet<usize>,
+    /// Modes set by another server that this server does not implement.
+    ///
+    /// They must be kept and echoed back verbatim rather than dropped: the peer
+    /// believes they are set, and silently discarding one is a divergence that
+    /// surfaces later as two servers disagreeing about a channel.
+    foreign_modes: std::collections::BTreeMap<char, Option<String>>,
     pub ops: BTreeSet<usize>,    // connection ids with operator privileges here
     pub voices: BTreeSet<usize>,
     pub members: BTreeSet<usize>,
@@ -247,6 +253,7 @@ impl Chn {
             excepts: Vec::new(),
             invex: Vec::new(),
             invites: BTreeSet::new(),
+            foreign_modes: std::collections::BTreeMap::new(),
             ops: BTreeSet::new(),
             voices: BTreeSet::new(),
             members: BTreeSet::new(),
@@ -300,6 +307,95 @@ impl Chn {
     }
 
     // Mutators used by the MODE command handler.
+
+    /// Drop every mode. Used when this side loses a timestamp conflict: the
+    /// protocol requires the younger channel to discard all of its modes,
+    /// including prefixes, bans and every list mode, before taking the
+    /// winner's.
+    /// Modes rendered for a burst, as (flags, params).
+    ///
+    /// A burst that hardcodes its modes tells the peer the channel is something
+    /// it is not, and the peer believes it -- so a re-burst after a split would
+    /// quietly replace the real modes with the invented ones.
+    pub fn burst_mode_parts(&self) -> (String, Vec<String>) {
+        let mut flags = String::from("+");
+        let mut params: Vec<String> = Vec::new();
+        if self.invite_only { flags.push('i'); }
+        if self.nomsg { flags.push('n'); }
+        if self.private { flags.push('p'); }
+        if self.secret { flags.push('s'); }
+        if self.op_topic { flags.push('t'); }
+        if self.moderated { flags.push('m'); }
+        if self.regonly { flags.push('R'); }
+        if let Some(k) = &self.chan_key {
+            flags.push('k');
+            params.push(k.clone());
+        }
+        if self.key_limit > 0 {
+            flags.push('l');
+            params.push(self.key_limit.to_string());
+        }
+        let (fflags, fparams) = self.foreign_mode_parts();
+        flags.push_str(&fflags);
+        params.extend(fparams);
+        (flags, params)
+    }
+
+    /// Set or clear the channel key (+k) from a linked server.
+    pub(crate) fn set_key_opt(&mut self, k: Option<String>) {
+        self.chan_key = k.filter(|v| !v.is_empty());
+    }
+
+    /// Set or clear the member limit (+l) from a linked server.
+    pub(crate) fn set_limit_value(&mut self, n: i32) {
+        self.key_limit = n.max(0);
+    }
+
+    /// Grant or remove a prefix mode for a local member.
+    pub(crate) fn set_member_prefix(&mut self, ch: char, cx_id: usize, on: bool) {
+        let set = if ch == 'o' { &mut self.ops } else { &mut self.voices };
+        if on { set.insert(cx_id); } else { set.remove(&cx_id); }
+    }
+
+    /// Record a mode this server does not implement.
+    pub(crate) fn set_foreign_mode(&mut self, ch: char, param: Option<String>, on: bool) {
+        if on {
+            self.foreign_modes.insert(ch, param);
+        } else {
+            self.foreign_modes.remove(&ch);
+        }
+    }
+
+    /// Foreign modes rendered for a burst or a MODE reply, as (flags, params).
+    pub fn foreign_mode_parts(&self) -> (String, Vec<String>) {
+        let mut flags = String::new();
+        let mut params = Vec::new();
+        for (ch, p) in &self.foreign_modes {
+            flags.push(*ch);
+            if let Some(v) = p {
+                params.push(v.clone());
+            }
+        }
+        (flags, params)
+    }
+
+    pub(crate) fn clear_all_modes(&mut self) {
+        self.invite_only = false;
+        self.nomsg = false;
+        self.private = false;
+        self.secret = false;
+        self.op_topic = false;
+        self.moderated = false;
+        self.regonly = false;
+        self.key_limit = 0;
+        self.chan_key = None;
+        self.bans.clear();
+        self.excepts.clear();
+        self.invex.clear();
+        self.ops.clear();
+        self.voices.clear();
+        self.foreign_modes.clear();
+    }
 
     pub(crate) fn set_flag(&mut self, ch: char, on: bool) {
         match ch {
@@ -393,8 +489,15 @@ impl Chn {
         if self.moderated { s.push('m'); }
         // +b is a list mode (shown via 367/368), not a simple flag; it is not
         // reported in RPL_CHANNELMODEIS.
+        if self.regonly { s.push('R'); }
         if self.chan_key.is_some() { s.push('k'); }
         if self.key_limit > 0 { s.push('l'); }
+        // Modes another server set that this one does not implement are still
+        // reported: the peer believes they are set, and a client asking this
+        // server should see the same channel it would see there.
+        for ch in self.foreign_modes.keys() {
+            s.push(*ch);
+        }
         s
     }
 
@@ -500,6 +603,11 @@ pub struct ServerState {
 
     /// Server-wide address bans (K-lines), persisted across restarts.
     pub bans: crate::bans::BanStore,
+
+    /// The rest of the spanning tree: other servers and the users they own.
+    pub network: crate::network::Network,
+    /// Live links to directly-connected peers.
+    pub links: Vec<crate::link::LinkHandle>,
 }
 
 impl ServerState {
@@ -533,6 +641,10 @@ impl ServerState {
             limits: crate::limits::Limits::default(),
             sources: crate::limits::SourceTable::new(),
             bans: crate::bans::BanStore::load(std::env::var("IRC_BANS_PATH").ok()),
+            network: crate::network::Network::new(
+                &std::env::var("IRC_SID").unwrap_or_else(|_| "0CL".into()),
+            ),
+            links: Vec::new(),
             total_connections: 0,
             peak_users: 0,
             messages_relayed: 0,
@@ -788,10 +900,15 @@ impl ServerState {
 
     /// Drop channels left without members after ejections.
     pub fn drop_empty_channels(&mut self) {
+        // A channel with no LOCAL members may still hold users on other
+        // servers. Dropping it then recreating it on the next local join mints
+        // a fresh, higher creation timestamp -- and the higher timestamp loses
+        // every conflict, so the channel would churn its modes away each time
+        // the last local user left and came back.
         let dead: Vec<String> = self
             .chans
             .iter()
-            .filter(|(_, c)| c.members.is_empty())
+            .filter(|(k, c)| c.members.is_empty() && self.network.members_of(k).is_empty())
             .map(|(k, _)| k.clone())
             .collect();
         for k in dead {
@@ -810,6 +927,55 @@ impl ServerState {
     /// registered users leaves the banned address's half-open sockets in place.
     pub fn each_connection(&self) -> impl Iterator<Item = &Cx> + '_ {
         self.users.values().chain(self.unreg.values())
+    }
+
+    /// Render every local user as a UID line for a burst.
+    pub fn burst_users(&self, sid: &str) -> Vec<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.users
+            .values()
+            .filter_map(|u| {
+                let uuid = self.network.local_uuid(u.id)?;
+                Some(crate::link::uid_line(
+                    sid, uuid, now, &u.nick, &u.real_host, &u.host, &u.user,
+                    &u.real_host, now, "+", &u.realname,
+                ))
+            })
+            .collect()
+    }
+
+    /// Render every channel with local members as an FJOIN line for a burst.
+    pub fn burst_channels(&self, sid: &str) -> Vec<String> {
+        self.chans
+            .iter()
+            .filter_map(|(key, c)| {
+                let members: Vec<(String, String)> = c
+                    .members
+                    .iter()
+                    .filter_map(|id| {
+                        let uuid = self.network.local_uuid(*id)?.clone();
+                        let mut prefix = String::new();
+                        if c.ops.contains(id) { prefix.push('o'); }
+                        if c.voices.contains(id) { prefix.push('v'); }
+                        Some((prefix, uuid))
+                    })
+                    .collect();
+                if members.is_empty() {
+                    return None;
+                }
+                let _ = key;
+                let (flags, params) = c.burst_mode_parts();
+                Some(crate::link::fjoin_line_with_params(sid, &c.display, c.created_at, &flags, &params, &members))
+            })
+            .collect()
+    }
+
+    /// Local connection ids in a channel, for delivering remote traffic.
+    pub fn local_members(&self, chan_key: &str) -> Vec<usize> {
+        self.chans.get(chan_key).map(|c| c.members.iter().copied().collect()).unwrap_or_default()
     }
 
     pub fn user_count(&self) -> usize { self.users.len() }

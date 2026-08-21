@@ -48,10 +48,145 @@ Protocol 1205 and 1206 both link to a 4.11 server (`PROTO_OLDEST = 1205`,
 `PROTO_NEWEST = 1206`), so a single implementation speaking 1205 reaches both
 InspIRCd v3 and v4.
 
+## Live linking
+
+`live_link.py` and `live_link_full.py` run a real chonkline against a real
+InspIRCd and exercise the whole surface: channel traffic both ways, private
+messages both ways, NAMES and WHOIS resolving remote users, nick change, part,
+rejoin, quit, and a netsplit. Sixteen checks.
+
+```
+IRC_SID=2CH IRC_SERVER_NAME=chonk.test IRC_LINK_PASSWORD=linkpass \
+  IRC_LINK_PEERS=127.0.0.1:7001 target/release/irc-server
+python3 live_link_full.py
+```
+
+Two things these caught that no unit test would have:
+
+* **FJOIN versus IJOIN.** FJOIN introduces channel state and is what a burst
+  uses; a single user joining a channel the network already knows is an
+  incremental join and must be IJOIN. A peer merges a post-burst FJOIN silently
+  rather than announcing it, so the join simply never appeared on the other
+  side. IJOIN also takes `<chan> <membid>` -- sending only the channel fails the
+  peer's arity check and is dropped without a word either way.
+
+* **The join relay was wired into only one of the two join paths**, so a user
+  joining a channel that already existed was never announced. A peer routes
+  channel traffic only to servers it believes hold a member, so the channel
+  worked in exactly one direction.
+
+Worth knowing when reading a failure here: chonkline's own tier-1 flood control
+drops the seventh message in a two-second window silently. A test that fires
+commands back to back trips it and the symptom -- a join that never reaches the
+peer -- looks identical to a protocol bug. The harness paces itself for that
+reason.
+
+## Load and stress
+
+`stress.py` escalates: local load, connect/disconnect churn, the same load
+crossing the link, then a split under load. It reports measurements rather than
+pass/fail, because the interesting failures here are partial.
+
+```
+python3 stress.py --clients 80 --msgs 5 --link-clients 20
+```
+
+Last run, 80 local clients and 20 each side of the link:
+
+| | |
+|---|---|
+| local delivery | 31,600 of 31,600 (100%) |
+| cross-link delivery | 2,000 of 2,000 (100%) |
+| send rate sustained | ~46,000 messages/sec |
+| memory | 3.3 MB -> 9.3 MB peak |
+| churn | 240 connect/disconnect cycles, 0 failures, +0.6 MB |
+| after peer killed | survives, still usable |
+| server error lines | 0 |
+
+Two traps this harness fell into, both worth knowing before trusting a number
+from it:
+
+* **Verify preconditions before measuring.** An early run reported 0% cross-link
+  delivery, which read as a serious linking bug. The clients had never
+  registered. A stress test that does not check its own setup produces a
+  confident zero.
+* **Count what IRC actually sends.** A channel message is not echoed back to its
+  sender, so expecting every member to receive it makes a perfect run look like
+  a 1.7% loss.
+
+## Environment notes
+
+Both cost real time, and neither is a server fault:
+
+* **macOS Control Center listens on port 7000** (AirPlay Receiver). The InspIRCd
+  client port is 7010 here for that reason.
+* **Connection limits belong on `<connect>`, not `<class>`.** `<class>` is for
+  OPER classes. With the limits in the wrong block InspIRCd silently fell back to
+  its small defaults and reset every client after the first, which looked
+  exactly like a concurrency bug in the harness.
+
+## Multi-server
+
+`multihop.py` builds `chonkline -- insp1 -- insp2` and drives traffic that must
+traverse the intermediate hop. `conf2/` is the second InspIRCd; `conf/` gains an
+`<autoconnect>` to it.
+
+```
+python3 multihop.py
+```
+
+Fourteen checks: the InspIRCd pair links; chonkline links to insp1; a user two
+hops away is visible and attributed to the correct server; channel traffic and
+private messages cross both ways through the intermediate; NAMES lists users
+from both remote servers; killing the far server removes only its users, leaves
+the nearer server's intact, and the near link keeps passing traffic.
+
+Two bugs this found that a single-peer test cannot reach:
+
+* **A relayed `SERVER` has a different shape from the handshake form.** On the
+  wire: `:1IN SERVER insp2.test 3IN hidden=0 :InspIRCd Link Test` -- no
+  password, no unused field, and optional `key=value` data after the SID. Taking
+  the SID by index picked up the description, so the far server was recorded
+  under a nonsense id and its users were attributed to nothing.
+
+* **A split removed users from the network table without telling local
+  clients.** They stayed in channel lists and NAMES output until the client
+  reconnected. Dropping the record is not the same as announcing the quit, and
+  an unannounced split just looks like the other side going quiet.
+
+The test also polls for the InspIRCd pair to finish linking rather than sleeping
+a fixed time. An unformed topology makes every later check fail for the wrong
+reason, which is how the first run reported twelve failures that were all one
+problem.
+
+## Coverage
+
+`live_link_full.py` is the functional surface, twenty checks against a live
+InspIRCd 4.11.0:
+
+link established; remote joins seen; channel messages both ways; NAMES and WHOIS
+resolving remote users with their owning server; topic both ways; a remote `+o`
+grant; modes both ways; a mode chonkline does not implement not desyncing the
+link; private messages both ways; nick change; part; rejoin; quit; split
+detected; server survives the split; server usable after it.
+
+One behaviour worth knowing before reading a failure here: the channel InspIRCd
+bursts is `+nt`, so a non-op cannot set its topic. Once inbound modes are
+applied chonkline enforces that correctly, and a test that sets a topic without
+first granting op fails for the right reason.
+
 ## The obligation this creates
 
 Skipping mode validation does not make the modes go away. InspIRCd still sends
 `FJOIN #chan <ts> +nt` and `FMODE` carrying modes chonkline does not implement.
-Those must be stored and echoed back verbatim: dropping a mode the other side
-believes is set is a silent desync, and desync is the characteristic failure of
-server linking.
+Those are now stored per channel as foreign modes, reported in
+`RPL_CHANNELMODEIS`, and cleared only when the channel loses a timestamp
+conflict -- dropping a mode the other side believes is set is a silent desync,
+and desync is the characteristic failure of server linking.
+
+One protocol shape worth recording, because the documentation does not give it
+and assuming cost a debugging round: **FTOPIC has an optional setter**.
+InspIRCd's own handler reads
+`setter = (params.size() > 4) ? params[3] : user->nick` and takes the topic from
+`params.back()`. Requiring five parameters silently dropped every inbound topic
+change while outbound worked, which reads as a one-directional bug.

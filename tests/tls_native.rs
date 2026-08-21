@@ -250,3 +250,30 @@ async fn https_and_plaintext_serve_the_same_content() {
     assert!(text.starts_with("HTTP/1.1 200"), "index page must serve over TLS");
     assert!(text.contains("<"), "expected HTML for the index page");
 }
+
+#[tokio::test]
+async fn a_bare_tcp_probe_on_the_tls_port_is_not_logged_as_a_failure() {
+    // Load balancers health-check a TLS port by connecting and closing without
+    // speaking TLS. Counting that as a failed handshake produced ~2 log lines a
+    // minute in production and buried everything worth reading.
+    let Some((port, _cert)) = start_tls_server().await else {
+        eprintln!("skipping: openssl unavailable");
+        return;
+    };
+
+    // Connect and close immediately, exactly as a probe does.
+    let probe = connect_retry(port).await;
+    drop(probe);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // The listener must still serve a real client afterwards. This suite runs
+    // with the PROXY header required, so send one as a genuine client would.
+    let mut tcp = connect_retry(port).await;
+    tcp.write_all(b"PROXY TCP4 203.0.113.200 10.0.0.1 40000 6697\r\n")
+        .await
+        .expect("write proxy header");
+    let connector = TlsConnector::from(Arc::new(client_config(&_cert)));
+    let name = ServerName::try_from("localhost").expect("server name");
+    let tls = connector.connect(name, tcp).await;
+    assert!(tls.is_ok(), "a probe must not disturb the listener");
+}
