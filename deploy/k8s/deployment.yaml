@@ -150,8 +150,13 @@ spec:
             # necessary but NOT sufficient on its own -- restrict the NodePort
             # range at the firewall as well, because an attacker that can still
             # reach the port can claim any non-exempt address to evade bans.
+            #
+            # This only works because the Service uses externalTrafficPolicy:
+            # Local. Under Cluster, kube-proxy SNATs and every external
+            # connection arrives as the node's own address, so balancer and
+            # bypass are indistinguishable and no value here can help.
             - name: IRC_PROXY_TRUSTED
-              value: ""
+              value: "192.168.*"
             - name: IRC_MAX_FLOOD_VIOLATIONS
               value: "10"
             # Persistent operator bans (KLINE), alongside the other stores.

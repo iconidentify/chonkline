@@ -64,3 +64,28 @@ fn an_unset_allowlist_trusts_any_peer() {
     let line = c.read_until(|l| l.contains(" 001 ") || l.contains("ERROR"));
     assert!(line.contains(" 001 "));
 }
+
+#[test]
+fn an_untrusted_peer_is_refused_with_or_without_a_header() {
+    // The production shape: IRC_PROXY_PROTOCOL=1 is Required mode, and the
+    // Service uses externalTrafficPolicy: Local so a bypasser arrives as
+    // themselves rather than as the node. Both doors must be shut -- no header
+    // is refused by the mode, a header is refused by the allowlist. Together
+    // they leave a NodePort bypasser with nothing to say.
+    let addr = start_trusting("192.168.*");
+
+    let mut with_header = Client::new(&addr);
+    with_header.send("PROXY TCP4 203.0.113.80 10.0.0.1 1 6667");
+    with_header.send("NICK a");
+    with_header.send("USER a 0 * :A");
+    let l = with_header.read_until(|l| l.contains("ERROR") || l.contains(" 001 "));
+    assert!(l.contains("ERROR"), "header from untrusted peer must be refused, got {l:?}");
+
+    let mut no_header = Client::new(&addr);
+    no_header.send("NICK b");
+    no_header.send("USER b 0 * :B");
+    let l = no_header.read_until(|l| l.contains("ERROR") || l.contains(" 001 "));
+    assert!(l.contains("ERROR"), "required mode must refuse a missing header, got {l:?}");
+
+    std::env::remove_var("IRC_PROXY_TRUSTED");
+}
