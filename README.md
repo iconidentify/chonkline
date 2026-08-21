@@ -83,6 +83,7 @@ plaintext ones.
 | `IRC_PROXY_PROTOCOL`         | *(off)*           | `1`/`required`, `optional`, or off              |
 | `IRC_TLS_PROXY_PROTOCOL`     | *(as above)*      | Same, for the TLS listener only                |
 | `IRC_PROXY_PROTOCOL_EXEMPT`  | *(none)*          | Peers admitted without a header                |
+| `IRC_PROXY_TRUSTED`          | *(any)*           | Peers whose PROXY header is trusted            |
 
 A proxy terminates the client's connection and opens its own, so `peer_addr()`
 reports the proxy rather than the client. Behind a single ingress that address
@@ -120,6 +121,18 @@ ingress-nginx does not forward client addresses by default. In its
 The first controls decoding the inbound connection; the second controls sending
 the header upstream. With only one, nginx decodes but does not forward, and
 every client reaches the daemon wearing the ingress pod's address.
+
+`IRC_PROXY_TRUSTED` matters more than it looks. A PROXY header is only as
+trustworthy as the path it arrived on: anything that can open a connection to
+the daemon can write its own and name any source it likes, which defeats
+per-source limits and bans. On Kubernetes a `type: LoadBalancer` Service also
+opens a NodePort on every node's public address, so the balancer can be bypassed
+by anyone who scans for it. Set this to the address the balancer reaches the pod
+from -- it appears as `peer=` on `conn.open` at debug level -- **and** restrict
+the NodePort range at the firewall. Neither control is sufficient alone.
+
+Rate-limit exemptions (`IRC_LIMIT_EXEMPT`) are matched against the TCP peer,
+never against the address a header claims, for the same reason.
 
 The exemption list is empty by default. It exists for deployments that still
 front the daemon with a local terminator unable to emit a header; such peers

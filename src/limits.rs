@@ -157,14 +157,23 @@ impl SourceTable {
     /// need exempting are infrastructure ranges -- load-balancer health checks
     /// and cluster gateways -- whose exact values change when those resources
     /// are recreated. Pinning exact IPs means the exemption silently lapses.
-    fn exempt(limits: &Limits, key: &str) -> bool {
+    /// Whether an address is exempt. Callers must pass the TCP peer, not a
+    /// header-supplied address.
+    pub fn is_exempt(limits: &Limits, key: &str) -> bool {
         limits.exempt.iter().any(|e| crate::bans::glob_match(e, key))
     }
 
     /// Admit or refuse a new connection from `key`, reserving a slot on success.
     /// Every successful call must be matched by exactly one `release`.
-    pub fn try_admit(&mut self, limits: &Limits, key: &str, now: Instant) -> Result<(), Refusal> {
-        if Self::exempt(limits, key) {
+    ///
+    /// `exempt` is decided by the caller from the TCP PEER address, never from
+    /// the key. The key may come from a PROXY header, and a header is only as
+    /// trustworthy as the path it arrived on -- anyone who can reach the daemon
+    /// directly writes their own. Matching the exemption list against a claimed
+    /// address let such a client name an exempt range and bypass every bound,
+    /// including the global ceiling.
+    pub fn try_admit(&mut self, limits: &Limits, key: &str, exempt: bool, now: Instant) -> Result<(), Refusal> {
+        if exempt {
             // Exempt sources are infrastructure -- health checks and gateways.
             // They are deliberately kept OUT of `active_total` as well as the
             // per-source caps: counting them would let a health-check cadence
@@ -197,8 +206,9 @@ impl SourceTable {
     /// Release a slot reserved by `try_admit`. Takes `limits` so the exempt
     /// check matches admission exactly -- an asymmetry here would drift
     /// `active_total` until the ceiling refused everyone.
-    pub fn release(&mut self, limits: &Limits, key: &str, now: Instant) {
-        let is_exempt = Self::exempt(limits, key);
+    pub fn release(&mut self, limits: &Limits, key: &str, exempt: bool, now: Instant) {
+        let is_exempt = exempt;
+        let _ = limits;
         let drop_entry = match self.sources.get_mut(key) {
             Some(entry) => {
                 entry.active = entry.active.saturating_sub(1);
@@ -220,8 +230,8 @@ impl SourceTable {
     /// Returns `Ok(())` while within budget, `Err(true)` when the budget is
     /// exceeded and the connection should be closed, and `Err(false)` when it
     /// is exceeded but the message should merely be dropped.
-    pub fn charge_message(&mut self, limits: &Limits, key: &str, now: Instant) -> Result<(), bool> {
-        if Self::exempt(limits, key) || limits.max_messages_per_window == 0 {
+    pub fn charge_message(&mut self, limits: &Limits, key: &str, exempt: bool, now: Instant) -> Result<(), bool> {
+        if exempt || limits.max_messages_per_window == 0 {
             return Ok(());
         }
         let entry = self.sources.entry(key.to_string()).or_default();
@@ -286,36 +296,36 @@ mod tests {
     fn clone_cap_is_enforced_per_source() {
         let (l, mut t, now) = (limits(), SourceTable::new(), Instant::now());
         for _ in 0..3 {
-            assert!(t.try_admit(&l, "203.0.113.7", now).is_ok());
+            assert!(t.try_admit(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now).is_ok());
         }
-        assert_eq!(t.try_admit(&l, "203.0.113.7", now), Err(Refusal::TooManyClones));
+        assert_eq!(t.try_admit(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now), Err(Refusal::TooManyClones));
     }
 
     #[test]
     fn sources_are_isolated_from_each_other() {
         let (l, mut t, now) = (limits(), SourceTable::new(), Instant::now());
         for _ in 0..3 {
-            assert!(t.try_admit(&l, "203.0.113.7", now).is_ok());
+            assert!(t.try_admit(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now).is_ok());
         }
         // A second address is unaffected by the first exhausting its budget.
-        assert!(t.try_admit(&l, "198.51.100.9", now).is_ok());
+        assert!(t.try_admit(&l, "198.51.100.9", SourceTable::is_exempt(&l, "198.51.100.9"), now).is_ok());
     }
 
     #[test]
     fn releasing_frees_a_slot() {
         let (l, mut t, now) = (limits(), SourceTable::new(), Instant::now());
         for _ in 0..3 {
-            assert!(t.try_admit(&l, "203.0.113.7", now).is_ok());
+            assert!(t.try_admit(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now).is_ok());
         }
-        t.release(&l, "203.0.113.7", now);
-        assert!(t.try_admit(&l, "203.0.113.7", now).is_ok());
+        t.release(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now);
+        assert!(t.try_admit(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now).is_ok());
     }
 
     #[test]
     fn exempt_source_bypasses_every_cap() {
         let (l, mut t, now) = (limits(), SourceTable::new(), Instant::now());
         for _ in 0..50 {
-            assert!(t.try_admit(&l, "10.2.0.169", now).is_ok(), "exempt source must never be refused");
+            assert!(t.try_admit(&l, "10.2.0.169", SourceTable::is_exempt(&l, "10.2.0.169"), now).is_ok(), "exempt source must never be refused");
         }
     }
 
@@ -325,10 +335,10 @@ mod tests {
         // A health-check cadence must not be able to exhaust the ceiling that
         // protects real users from a connect flood.
         for _ in 0..100 {
-            assert!(t.try_admit(&l, "10.2.0.169", now).is_ok());
+            assert!(t.try_admit(&l, "10.2.0.169", SourceTable::is_exempt(&l, "10.2.0.169"), now).is_ok());
         }
         assert_eq!(t.active_total(), 0, "exempt connections must stay out of the ceiling");
-        assert!(t.try_admit(&l, "203.0.113.7", now).is_ok(), "a real client must still be admitted");
+        assert!(t.try_admit(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now).is_ok(), "a real client must still be admitted");
     }
 
     #[test]
@@ -340,14 +350,14 @@ mod tests {
         // infrastructure happens to use; a pattern survives them being recreated.
         for addr in ["10.2.0.1", "10.2.1.1", "192.168.255.65"] {
             for _ in 0..50 {
-                assert!(t.try_admit(&l, addr, now).is_ok(), "{addr} should be exempt by pattern");
+                assert!(t.try_admit(&l, addr, SourceTable::is_exempt(&l, addr), now).is_ok(), "{addr} should be exempt by pattern");
             }
         }
         // A real client is still bounded.
         for _ in 0..3 {
-            assert!(t.try_admit(&l, "203.0.113.7", now).is_ok());
+            assert!(t.try_admit(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now).is_ok());
         }
-        assert_eq!(t.try_admit(&l, "203.0.113.7", now), Err(Refusal::TooManyClones));
+        assert_eq!(t.try_admit(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now), Err(Refusal::TooManyClones));
     }
 
     #[test]
@@ -358,12 +368,12 @@ mod tests {
         // though its own source is nowhere near the per-source cap.
         for src in ["a", "b", "c"] {
             for _ in 0..3 {
-                assert!(t.try_admit(&l, src, now).is_ok());
+                assert!(t.try_admit(&l, src, SourceTable::is_exempt(&l, src), now).is_ok());
             }
         }
-        assert!(t.try_admit(&l, "d", now).is_ok());
+        assert!(t.try_admit(&l, "d", SourceTable::is_exempt(&l, "d"), now).is_ok());
         assert_eq!(t.active_total(), 10);
-        assert_eq!(t.try_admit(&l, "e", now), Err(Refusal::ServerFull));
+        assert_eq!(t.try_admit(&l, "e", SourceTable::is_exempt(&l, "e"), now), Err(Refusal::ServerFull));
     }
 
     #[test]
@@ -372,9 +382,9 @@ mod tests {
         l.max_clones_per_ip = 0; // isolate the rate limit from the clone cap
         let (mut t, now) = (SourceTable::new(), Instant::now());
         for _ in 0..5 {
-            assert!(t.try_admit(&l, "203.0.113.7", now).is_ok());
+            assert!(t.try_admit(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now).is_ok());
         }
-        assert_eq!(t.try_admit(&l, "203.0.113.7", now), Err(Refusal::ConnectingTooFast));
+        assert_eq!(t.try_admit(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now), Err(Refusal::ConnectingTooFast));
     }
 
     #[test]
@@ -383,19 +393,19 @@ mod tests {
         // The budget is charged per source, so it does not matter that these
         // messages arrive on different connections.
         for _ in 0..4 {
-            assert!(t.charge_message(&l, "203.0.113.7", now).is_ok());
+            assert!(t.charge_message(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now).is_ok());
         }
-        assert!(t.charge_message(&l, "203.0.113.7", now).is_err(), "budget must not scale with connection count");
+        assert!(t.charge_message(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now).is_err(), "budget must not scale with connection count");
     }
 
     #[test]
     fn repeated_violations_escalate_to_disconnect() {
         let (l, mut t, now) = (limits(), SourceTable::new(), Instant::now());
         for _ in 0..4 {
-            let _ = t.charge_message(&l, "203.0.113.7", now);
+            let _ = t.charge_message(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now);
         }
-        assert_eq!(t.charge_message(&l, "203.0.113.7", now), Err(false), "first violation drops");
-        assert_eq!(t.charge_message(&l, "203.0.113.7", now), Err(true), "second violation disconnects");
+        assert_eq!(t.charge_message(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now), Err(false), "first violation drops");
+        assert_eq!(t.charge_message(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now), Err(true), "second violation disconnects");
     }
 
     #[test]
@@ -405,7 +415,7 @@ mod tests {
         // One message every window-length stays inside budget indefinitely.
         for i in 0..20 {
             let now = start + l.message_window * (i + 1);
-            assert!(t.charge_message(&l, "203.0.113.7", now).is_ok(), "steady traffic must not trip the limiter");
+            assert!(t.charge_message(&l, "203.0.113.7", SourceTable::is_exempt(&l, "203.0.113.7"), now).is_ok(), "steady traffic must not trip the limiter");
         }
     }
 
@@ -416,8 +426,8 @@ mod tests {
         // cannot itself become a memory leak.
         for i in 0..100 {
             let key = format!("198.51.100.{}", i % 250);
-            assert!(t.try_admit(&l, &key, now).is_ok());
-            t.release(&l, &key, now + Duration::from_secs(120));
+            assert!(t.try_admit(&l, &key, SourceTable::is_exempt(&l, &key), now).is_ok());
+            t.release(&l, &key, SourceTable::is_exempt(&l, &key), now + Duration::from_secs(120));
         }
         assert_eq!(t.tracked_sources(), 0);
         assert_eq!(t.active_total(), 0);
@@ -442,5 +452,66 @@ mod interlock_tests {
         assert_eq!(l.max_messages_per_window, 0);
         // The global ceiling is still meaningful and stays on.
         assert!(l.max_clients > 0);
+    }
+}
+
+#[cfg(test)]
+mod forgery_tests {
+    use super::*;
+
+    #[test]
+    fn a_forged_address_cannot_buy_an_exemption() {
+        // A PROXY header is only as trustworthy as the path it arrived on. Any
+        // client that can reach the daemon directly writes its own, so matching
+        // the exemption list against the address a header CLAIMS lets it name an
+        // exempt range and bypass every bound -- including the global ceiling,
+        // which exempt sources are deliberately kept out of.
+        //
+        // Exemption is therefore decided from the TCP peer.
+        let l = Limits {
+            max_clones_per_ip: 2,
+            max_clients: 10,
+            max_connects_per_window: 0,
+            connect_window: Duration::from_secs(60),
+            max_messages_per_window: 0,
+            message_window: Duration::from_secs(10),
+            max_violations: 0,
+            exempt: vec!["192.168.*".to_string()],
+        };
+        let mut t = SourceTable::new();
+        let now = Instant::now();
+
+        // Claims an exempt address, but its real peer is not exempt.
+        let claimed = "192.168.1.99";
+        let peer_exempt = SourceTable::is_exempt(&l, "203.0.113.50");
+        assert!(!peer_exempt, "the real peer is not in the exemption list");
+
+        for _ in 0..2 {
+            assert!(t.try_admit(&l, claimed, peer_exempt, now).is_ok());
+        }
+        assert_eq!(
+            t.try_admit(&l, claimed, peer_exempt, now),
+            Err(Refusal::TooManyClones),
+            "a claimed exempt address must still be capped"
+        );
+        assert_eq!(t.active_total(), 2, "and must still count against the ceiling");
+    }
+
+    #[test]
+    fn a_genuinely_exempt_peer_is_still_exempt() {
+        let l = Limits {
+            max_clones_per_ip: 2, max_clients: 10, max_connects_per_window: 0,
+            connect_window: Duration::from_secs(60), max_messages_per_window: 0,
+            message_window: Duration::from_secs(10), max_violations: 0,
+            exempt: vec!["192.168.*".to_string()],
+        };
+        let mut t = SourceTable::new();
+        let now = Instant::now();
+        let peer_exempt = SourceTable::is_exempt(&l, "192.168.255.65");
+        assert!(peer_exempt);
+        for _ in 0..50 {
+            assert!(t.try_admit(&l, "192.168.255.65", peer_exempt, now).is_ok());
+        }
+        assert_eq!(t.active_total(), 0, "health checks stay out of the ceiling");
     }
 }

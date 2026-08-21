@@ -86,6 +86,30 @@ fn tls_proxy_mode() -> ProxyMode {
     }
 }
 
+/// Peers whose PROXY header is trusted (IRC_PROXY_TRUSTED, glob patterns).
+///
+/// A PROXY header is only as trustworthy as the path it arrived on. Anything
+/// that can open a TCP connection to this daemon can write its own header and
+/// name any source it likes -- which defeats per-source limits and bans, and,
+/// if it names an exempted range, every bound including the global ceiling.
+///
+/// On Kubernetes this is not hypothetical: a `type: LoadBalancer` Service also
+/// opens a NodePort on every node's public address, so the balancer can be
+/// bypassed entirely by anyone who scans for it.
+///
+/// Empty means "trust any peer", which is only safe when the network guarantees
+/// nothing else can reach the port. Set it, and restrict the NodePort at the
+/// firewall as well: neither control alone is sufficient.
+fn proxy_trusted_peer(peer: &str) -> bool {
+    match std::env::var("IRC_PROXY_TRUSTED") {
+        Ok(list) if !list.trim().is_empty() => list
+            .split(',')
+            .map(str::trim)
+            .any(|p| !p.is_empty() && crate::bans::glob_match(p, peer)),
+        _ => true,
+    }
+}
+
 /// Peers permitted to connect without a PROXY header while the feature is on.
 ///
 /// Empty by default: TLS is terminated in-process, so nothing legitimately
@@ -179,6 +203,11 @@ async fn admit_and_run(
         // Time-bounded: this runs BEFORE admission control, so a client that
         // sends "PROXY " and then stalls would otherwise hold a task and an fd
         // that no limit counts.
+        if !proxy_trusted_peer(&peer) {
+            crate::log::counted("proxy.untrusted_peer", &peer);
+            refuse(&mut sock, is_tls, "PROXY protocol header not accepted from this address").await;
+            return;
+        }
         let peeked = match tokio::time::timeout(
             Duration::from_secs(10),
             crate::proxyproto::peek_is_header(&sock),
@@ -230,6 +259,12 @@ async fn admit_and_run(
     // /64 cannot mint unlimited distinct sources. Cloaks and logs keep the full
     // address, so attribution is unchanged.
     let limit_key = crate::limits::source_key(&real_host);
+    // Exemption is decided from the TCP peer, never from the address a PROXY
+    // header claims: a header is only as trustworthy as the path it arrived on.
+    let peer_exempt = {
+        let stg = state.lock().unwrap_or_else(|e| e.into_inner());
+        crate::limits::SourceTable::is_exempt(&stg.limits, &peer)
+    };
 
     // Bans and admission control are both keyed on that resolved address.
     // Both decisions are taken under one short lock, and every socket write
@@ -246,7 +281,7 @@ async fn admit_and_run(
             Some(ban) => Some(Deny::Banned(ban.reason.clone())),
             None => stg
                 .sources
-                .try_admit(&stg.limits, &limit_key, Instant::now())
+                .try_admit(&stg.limits, &limit_key, peer_exempt, Instant::now())
                 .err()
                 .map(Deny::Limited),
         }
@@ -271,7 +306,7 @@ async fn admit_and_run(
     // seconds and would otherwise be ~95% of the log, rotating the real events
     // out of retention within hours. The security-relevant event is a session
     // reaching registration, logged from the registration path instead.
-    crate::log::conn_open(id, &real_host, &host, if is_tls { "tls" } else { "plain" });
+    crate::log::conn_open_peer(id, &real_host, &host, &peer, if is_tls { "tls" } else { "plain" });
 
     // The handshake happens only after admission, so a refused connection never
     // costs a key exchange — which matters precisely when refusals are frequent.
@@ -288,14 +323,14 @@ async fn admit_and_run(
                 Ok(_) => {}
             }
             match acc.accept(sock).await {
-                Ok(stream) => run_session(&state, id, stream, &host, &real_host, &limit_key).await,
+                Ok(stream) => run_session(&state, id, stream, &host, &real_host, &limit_key, peer_exempt).await,
                 Err(e) => {
                     crate::log::counted("tls.handshake_failed", &real_host);
                     let _ = e;
                 }
             }
         }
-        None => run_session(&state, id, sock, &host, &real_host, &limit_key).await,
+        None => run_session(&state, id, sock, &host, &real_host, &limit_key, peer_exempt).await,
     }
 
     // Release the admission slot this connection reserved, and record the close
@@ -303,7 +338,7 @@ async fn admit_and_run(
     let nick = {
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
         let stg = &mut *guard;
-        stg.sources.release(&stg.limits, &limit_key, Instant::now());
+        stg.sources.release(&stg.limits, &limit_key, peer_exempt, Instant::now());
         stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()
     };
     crate::log::conn_close(id, &real_host, &nick, "closed");
@@ -327,6 +362,7 @@ async fn run_session<S>(
     host: &str,
     real_host: &str,
     limit_key: &str,
+    peer_exempt: bool,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -350,7 +386,7 @@ async fn run_session<S>(
     let notify = Arc::new(Notify::new());
     park_unregistered(state, id, host.to_string(), real_host.to_string(), tx.clone(), notify.clone());
 
-    run_reader(state.clone(), id, rd, notify, limit_key.to_string()).await;
+    run_reader(state.clone(), id, rd, notify, limit_key.to_string(), peer_exempt).await;
 }
 
 /// Read loop: frames lines out of the byte stream (CR-LF / LF / CR per current
@@ -363,6 +399,7 @@ async fn run_reader<R>(
     mut rd: R,
     notify: Arc<Notify>,
     src: String,
+    peer_exempt: bool,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -406,7 +443,7 @@ async fn run_reader<R>(
                 tokio::time::sleep(throttle).await;
                 throttle = Duration::ZERO;
             }
-            if process_segment(&state, id, &mut flood, &content, &src, &mut throttle) {
+            if process_segment(&state, id, &mut flood, &content, &src, peer_exempt, &mut throttle) {
                 cleanup_on_eof(&state, id); // idempotent: no-ops when the session left cleanly via QUIT
                 return;
             }
@@ -443,6 +480,7 @@ fn process_segment(
     flood: &mut VecDeque<Instant>,
     seg: &[u8],
     src: &str,
+    peer_exempt: bool,
     throttle: &mut Duration,
 ) -> bool {
     if seg.is_empty() {
@@ -464,7 +502,7 @@ fn process_segment(
             }
             false
         }
-        Some(cmd) => route(state, id, flood, &cmd, src, throttle),
+        Some(cmd) => route(state, id, flood, &cmd, src, peer_exempt, throttle),
     }
 }
 
@@ -477,6 +515,7 @@ fn route(
     flood: &mut VecDeque<Instant>,
     cmd: &proto::Command,
     src: &str,
+    peer_exempt: bool,
     throttle: &mut Duration,
 ) -> bool {
     if cmd.name.len() == 3 && cmd.name.chars().all(|c| c.is_ascii_digit()) {
@@ -535,7 +574,7 @@ fn route(
         // the limiter weakens in exact proportion to the abuse.
         if !is_oper {
             let stg_ref = &mut *stg;
-            match stg_ref.sources.charge_message(&stg_ref.limits, src, now) {
+            match stg_ref.sources.charge_message(&stg_ref.limits, src, peer_exempt, now) {
                 Ok(()) => {}
                 Err(false) => {
                     crate::log::flood("dropped");

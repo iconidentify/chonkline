@@ -109,6 +109,21 @@ pub fn conn_close(id: usize, src: &str, nick: &str, reason: &str) {
     ]);
 }
 
+/// As `conn_open`, additionally recording the TCP peer.
+///
+/// The peer is what an operator needs in order to set IRC_PROXY_TRUSTED: it is
+/// the address a PROXY header actually arrived from, as opposed to the address
+/// the header claims.
+pub fn conn_open_peer(id: usize, src: &str, cloak: &str, peer: &str, via: &str) {
+    event(DEBUG, "conn.open", &[
+        ("id", &id.to_string()),
+        ("src", src),
+        ("peer", peer),
+        ("cloak", cloak),
+        ("via", via),
+    ]);
+}
+
 /// A client completed registration. This is the connection event worth keeping
 /// at INFO: it names a real session and ties its nick to a real address, and
 /// health checks never reach it.

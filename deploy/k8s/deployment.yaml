@@ -135,6 +135,23 @@ spec:
             # needs exempting.
             - name: IRC_LIMIT_EXEMPT
               value: "192.168.*,127.0.0.1"
+            # Peers whose PROXY header is trusted.
+            #
+            # A header is only as trustworthy as the path it arrived on. A
+            # type: LoadBalancer Service also opens a NodePort on EVERY node's
+            # public address, so the balancer can be bypassed by anyone who
+            # scans for it -- and a bypasser writes their own header, naming any
+            # source they like. Verified against production: a direct NodePort
+            # connection registered as an arbitrary address, and by naming one
+            # inside IRC_LIMIT_EXEMPT it became exempt from every bound.
+            #
+            # Set this to the address the balancer actually reaches the pod
+            # from; the value appears as `peer=` on conn.open at DEBUG. This is
+            # necessary but NOT sufficient on its own -- restrict the NodePort
+            # range at the firewall as well, because an attacker that can still
+            # reach the port can claim any non-exempt address to evade bans.
+            - name: IRC_PROXY_TRUSTED
+              value: ""
             - name: IRC_MAX_FLOOD_VIOLATIONS
               value: "10"
             # Persistent operator bans (KLINE), alongside the other stores.
