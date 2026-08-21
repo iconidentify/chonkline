@@ -134,7 +134,13 @@ necessarily share one cloak, since their real address never arrives.
 | `IRC_MAX_CONNECTS_PER_MIN` | `30`    | New connections per minute from one address      |
 | `IRC_MAX_MESSAGES_PER_10S` | `60`    | Aggregate messages per 10s from one address      |
 | `IRC_MAX_FLOOD_VIOLATIONS` | `10`    | Budget violations tolerated before disconnect    |
-| `IRC_LIMIT_EXEMPT`         | *(none)*| Comma-separated addresses exempt from all limits |
+| `IRC_LIMIT_EXEMPT`         | *(none)*| Comma-separated address patterns exempt from limits |
+
+`IRC_LIMIT_EXEMPT` accepts glob patterns (`10.2.*`), because the addresses that
+need exempting are infrastructure — load-balancer health checks and cluster
+gateways — whose exact values change when those resources are recreated.
+Exempt sources are also excluded from `IRC_MAX_CLIENTS`, so a health-check
+cadence can never consume the global ceiling.
 
 The per-source bounds default to **off** unless `IRC_PROXY_PROTOCOL` is enabled.
 A per-source cap applied to a shared address is not a per-user limit, it is a

@@ -130,15 +130,23 @@ impl SourceTable {
         Self::default()
     }
 
+    /// Exemptions accept glob patterns (`10.2.*`), because the addresses that
+    /// need exempting are infrastructure ranges -- load-balancer health checks
+    /// and cluster gateways -- whose exact values change when those resources
+    /// are recreated. Pinning exact IPs means the exemption silently lapses.
     fn exempt(limits: &Limits, key: &str) -> bool {
-        limits.exempt.iter().any(|e| e == key)
+        limits.exempt.iter().any(|e| crate::bans::glob_match(e, key))
     }
 
     /// Admit or refuse a new connection from `key`, reserving a slot on success.
     /// Every successful call must be matched by exactly one `release`.
     pub fn try_admit(&mut self, limits: &Limits, key: &str, now: Instant) -> Result<(), Refusal> {
         if Self::exempt(limits, key) {
-            self.active_total += 1;
+            // Exempt sources are infrastructure -- health checks and gateways.
+            // They are deliberately kept OUT of `active_total` as well as the
+            // per-source caps: counting them would let a health-check cadence
+            // consume the global ceiling and lock real users out of the very
+            // bound that exists to stop memory exhaustion.
             self.sources.entry(key.to_string()).or_default().active += 1;
             return Ok(());
         }
@@ -163,12 +171,17 @@ impl SourceTable {
         Ok(())
     }
 
-    /// Release a slot reserved by `try_admit`.
-    pub fn release(&mut self, key: &str, now: Instant) {
+    /// Release a slot reserved by `try_admit`. Takes `limits` so the exempt
+    /// check matches admission exactly -- an asymmetry here would drift
+    /// `active_total` until the ceiling refused everyone.
+    pub fn release(&mut self, limits: &Limits, key: &str, now: Instant) {
+        let is_exempt = Self::exempt(limits, key);
         let drop_entry = match self.sources.get_mut(key) {
             Some(entry) => {
                 entry.active = entry.active.saturating_sub(1);
-                self.active_total = self.active_total.saturating_sub(1);
+                if !is_exempt {
+                    self.active_total = self.active_total.saturating_sub(1);
+                }
                 entry.connects.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
                 entry.active == 0 && entry.connects.is_empty()
             }
@@ -257,7 +270,7 @@ mod tests {
         for _ in 0..3 {
             assert!(t.try_admit(&l, "203.0.113.7", now).is_ok());
         }
-        t.release("203.0.113.7", now);
+        t.release(&l, "203.0.113.7", now);
         assert!(t.try_admit(&l, "203.0.113.7", now).is_ok());
     }
 
@@ -267,6 +280,37 @@ mod tests {
         for _ in 0..50 {
             assert!(t.try_admit(&l, "10.2.0.169", now).is_ok(), "exempt source must never be refused");
         }
+    }
+
+    #[test]
+    fn exempt_sources_do_not_consume_the_global_ceiling() {
+        let (l, mut t, now) = (limits(), SourceTable::new(), Instant::now());
+        // A health-check cadence must not be able to exhaust the ceiling that
+        // protects real users from a connect flood.
+        for _ in 0..100 {
+            assert!(t.try_admit(&l, "10.2.0.169", now).is_ok());
+        }
+        assert_eq!(t.active_total(), 0, "exempt connections must stay out of the ceiling");
+        assert!(t.try_admit(&l, "203.0.113.7", now).is_ok(), "a real client must still be admitted");
+    }
+
+    #[test]
+    fn exemptions_accept_patterns() {
+        let mut l = limits();
+        l.exempt = vec!["10.2.*".to_string(), "192.168.*".to_string()];
+        let (mut t, now) = (SourceTable::new(), Instant::now());
+        // Health checks arrive from whichever gateway or balancer address the
+        // infrastructure happens to use; a pattern survives them being recreated.
+        for addr in ["10.2.0.1", "10.2.1.1", "192.168.255.65"] {
+            for _ in 0..50 {
+                assert!(t.try_admit(&l, addr, now).is_ok(), "{addr} should be exempt by pattern");
+            }
+        }
+        // A real client is still bounded.
+        for _ in 0..3 {
+            assert!(t.try_admit(&l, "203.0.113.7", now).is_ok());
+        }
+        assert_eq!(t.try_admit(&l, "203.0.113.7", now), Err(Refusal::TooManyClones));
     }
 
     #[test]
@@ -336,7 +380,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("198.51.100.{}", i % 250);
             assert!(t.try_admit(&l, &key, now).is_ok());
-            t.release(&key, now + Duration::from_secs(120));
+            t.release(&l, &key, now + Duration::from_secs(120));
         }
         assert_eq!(t.tracked_sources(), 0);
         assert_eq!(t.active_total(), 0);

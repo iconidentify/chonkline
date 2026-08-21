@@ -1,4 +1,8 @@
 use crate::proto::{self, Command};
+
+/// Username length carried in a user's prefix. Longer values are truncated to
+/// this rather than refused (see `handle_user`).
+const MAX_USER_LEN: usize = 10;
 use crate::state::{norm_nick, ServerState};
 
 /// Route a parsed command against the locked state. Returns true when the
@@ -570,15 +574,21 @@ fn handle_user(stg: &mut ServerState, id: usize, cmd: &Command) {
         deliver_need_more_params(stg, id, &cmd.name); // RFC numeric 461
         return;
     }
-    let user_part = &cmd.params[0];
-    if user_part.is_empty() || user_part.contains(' ') || user_part.len() > 10 {
+    let user_raw = &cmd.params[0];
+    if user_raw.is_empty() || user_raw.contains(' ') {
         deliver_need_more_params(stg, id, &cmd.name); // malformed username: refuse
         return;
     }
+    // Overlong usernames are TRUNCATED, not refused. Clients send the local
+    // system username here without asking, so refusing an 11-character one
+    // makes the server unreachable for those users -- they see only a bare 461
+    // with nothing to act on. Truncation is what other servers do, and it keeps
+    // the length bound that the rest of the code relies on.
+    let user_part: String = user_raw.chars().take(MAX_USER_LEN).collect();
     let realname: &str = cmd.params.last().map(String::as_str).unwrap_or("");
 
     if let Some(u) = stg.find_by_id_mut(id) {
-        u.pending_user = Some(user_part.to_string());
+        u.pending_user = Some(user_part);
         maybe_complete(stg, id, realname);
     }
 }
@@ -621,6 +631,13 @@ fn maybe_complete(stg: &mut ServerState, id: usize, realname_this_call: &str) {
         Some(cx) => Some(cx.nick.clone()),
         None => None,
     };
+    if completed.is_some() {
+        // The connection event worth keeping at INFO: a real session, tied to a
+        // real address. Health checks never get this far.
+        if let Some(u) = stg.find_by_id(id) {
+            crate::log::session_registered(id, &u.real_host, &u.host, &u.nick);
+        }
+    }
     match completed {
         Some(nick_display) => {
             // CAP-END gating (round-4): once capability negotiation has begun the welcome

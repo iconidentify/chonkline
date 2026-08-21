@@ -92,7 +92,7 @@ pub fn event(lvl: usize, name: &str, fields: &[(&str, &str)]) {
 /// A connection was admitted. Records both the real source and the cloak issued
 /// for it, so operator reports naming a cloak can be tied back to an address.
 pub fn conn_open(id: usize, src: &str, cloak: &str, tls_hint: &str) {
-    event(INFO, "conn.open", &[
+    event(DEBUG, "conn.open", &[
         ("id", &id.to_string()),
         ("src", src),
         ("cloak", cloak),
@@ -101,11 +101,23 @@ pub fn conn_open(id: usize, src: &str, cloak: &str, tls_hint: &str) {
 }
 
 pub fn conn_close(id: usize, src: &str, nick: &str, reason: &str) {
-    event(INFO, "conn.close", &[
+    event(DEBUG, "conn.close", &[
         ("id", &id.to_string()),
         ("src", src),
         ("nick", nick),
         ("reason", reason),
+    ]);
+}
+
+/// A client completed registration. This is the connection event worth keeping
+/// at INFO: it names a real session and ties its nick to a real address, and
+/// health checks never reach it.
+pub fn session_registered(id: usize, src: &str, cloak: &str, nick: &str) {
+    event(INFO, "session.registered", &[
+        ("id", &id.to_string()),
+        ("src", src),
+        ("cloak", cloak),
+        ("nick", nick),
     ]);
 }
 

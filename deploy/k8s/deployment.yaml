@@ -110,15 +110,24 @@ spec:
             # address -- so a per-source cap of 5 would not admit 5 connections
             # per user, it would admit 5 for the entire network.
             #
-            # They stay unset for one more step: while the shared ingress remains
-            # as a fallback, connections arriving that way still carry a SNAT'd
-            # node address, so only a handful of distinct sources exist on that
-            # path. Enable these once the ingress entries are removed and every
-            # client arrives via the dedicated balancer:
-            #
-            #   IRC_MAX_CLONES_PER_IP: "5"
-            #   IRC_MAX_CONNECTS_PER_MIN: "30"
-            #   IRC_MAX_MESSAGES_PER_10S: "60"
+            # PER-SOURCE bounds. Safe to set now that clients arrive via the
+            # dedicated balancer with their real addresses (PROXY v1).
+            - name: IRC_MAX_CLONES_PER_IP
+              value: "5"
+            - name: IRC_MAX_CONNECTS_PER_MIN
+              value: "30"
+            - name: IRC_MAX_MESSAGES_PER_10S
+              value: "60"
+            # Infrastructure is exempt from all of the above. Health checks from
+            # the balancer and cluster gateways arrive far faster than 30/min
+            # from a handful of shared addresses, and were being refused ~40
+            # times a minute before this was set. Patterns rather than exact IPs:
+            # these addresses change whenever the balancer or gateway is
+            # recreated, and a lapsed exemption would start refusing traffic
+            # silently. Exempt sources are also kept out of IRC_MAX_CLIENTS, so
+            # a health-check cadence can never consume the global ceiling.
+            - name: IRC_LIMIT_EXEMPT
+              value: "10.2.*,192.168.*,127.0.0.1,172.232.169.19,172.232.189.82,172.234.237.243"
             - name: IRC_MAX_FLOOD_VIOLATIONS
               value: "10"
             # Persistent operator bans (KLINE), alongside the other stores.

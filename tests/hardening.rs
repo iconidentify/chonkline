@@ -198,3 +198,35 @@ fn a_client_that_is_not_a_header_is_refused_without_its_bytes_being_eaten() {
         "required mode must refuse a stream with no header, got {line:?}"
     );
 }
+
+#[test]
+fn an_overlong_username_is_truncated_rather_than_refused() {
+    // Clients send the local system username without asking. Refusing an
+    // 11-character one made the server unreachable for those users, who saw
+    // only a bare 461 with nothing to act on.
+    let addr = start_proxied_server();
+
+    let mut c = Client::new(&addr);
+    c.send("PROXY TCP4 203.0.113.60 10.0.0.1 44000 6667");
+    c.send("NICK longuser");
+    c.send("USER christopherlong 0 * :Long Username");
+
+    let line = c.read_until(|l| l.contains(" 001 ") || l.contains(" 461 "));
+    assert!(
+        line.contains(" 001 "),
+        "an overlong username must register, not be refused: {line:?}"
+    );
+}
+
+#[test]
+fn an_empty_username_is_still_refused() {
+    let addr = start_proxied_server();
+
+    let mut c = Client::new(&addr);
+    c.send("PROXY TCP4 203.0.113.61 10.0.0.1 44001 6667");
+    c.send("NICK emptyuser");
+    c.send("USER  0 * :No Username");
+
+    let line = c.read_until(|l| l.contains(" 461 ") || l.contains(" 001 "));
+    assert!(line.contains(" 461 "), "an empty username must still be refused: {line:?}");
+}

@@ -232,6 +232,10 @@ async fn admit_and_run(
     }
 
     let host = cloak_host(&real_host);
+    // DEBUG, not INFO: health checks open and close a connection every few
+    // seconds and would otherwise be ~95% of the log, rotating the real events
+    // out of retention within hours. The security-relevant event is a session
+    // reaching registration, logged from the registration path instead.
     crate::log::conn_open(id, &real_host, &host, if is_tls { "tls" } else { "plain" });
 
     // The handshake happens only after admission, so a refused connection never
@@ -250,8 +254,9 @@ async fn admit_and_run(
     // Release the admission slot this connection reserved, and record the close
     // with whatever identity it had reached.
     let nick = {
-        let mut stg = state.lock().unwrap();
-        stg.sources.release(&real_host, Instant::now());
+        let mut guard = state.lock().unwrap();
+        let stg = &mut *guard;
+        stg.sources.release(&stg.limits, &real_host, Instant::now());
         stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()
     };
     crate::log::conn_close(id, &real_host, &nick, "closed");
