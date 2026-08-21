@@ -276,13 +276,25 @@ async fn admit_and_run(
     // The handshake happens only after admission, so a refused connection never
     // costs a key exchange — which matters precisely when refusals are frequent.
     match acceptor {
-        Some(acc) => match acc.accept(sock).await {
-            Ok(stream) => run_session(&state, id, stream, &host, &real_host, &limit_key).await,
-            Err(e) => {
-                crate::log::counted("tls.handshake_failed", &real_host);
-                let _ = e;
+        Some(acc) => {
+            // A load balancer health-checks the TLS port with a bare TCP
+            // connect and close, speaking no TLS at all. Treating that as a
+            // failed handshake logged roughly two lines a minute forever -- 488
+            // of 511 lines in one four-hour production sample -- which buries
+            // the events worth reading. A peer that sends nothing is a probe.
+            let mut first = [0u8; 1];
+            match sock.peek(&mut first).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
             }
-        },
+            match acc.accept(sock).await {
+                Ok(stream) => run_session(&state, id, stream, &host, &real_host, &limit_key).await,
+                Err(e) => {
+                    crate::log::counted("tls.handshake_failed", &real_host);
+                    let _ = e;
+                }
+            }
+        }
         None => run_session(&state, id, sock, &host, &real_host, &limit_key).await,
     }
 
