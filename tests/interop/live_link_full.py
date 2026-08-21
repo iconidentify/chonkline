@@ -94,6 +94,28 @@ try:
     R["whois_finds_remote"] = cc.wait(" 311 ", 6)
     R["whois_names_their_server"] = cc.wait("insp.test", 3)
 
+    # --- topic propagates both ways ---
+    ci.clear(); cc.clear()
+    ci.send("TOPIC #bridge :topic from inspircd")
+    R["topic_insp_to_chonk"] = cc.wait("topic from inspircd", 6)
+    ci.clear(); cc.clear()
+    cc.send("TOPIC #bridge :topic from chonkline")
+    R["topic_chonk_to_insp"] = ci.wait("topic from chonkline", 6)
+
+    # --- modes propagate both ways ---
+    ci.clear(); cc.clear()
+    ci.send("MODE #bridge +m")
+    R["mode_insp_to_chonk"] = cc.wait("MODE", 6)
+    ci.send("MODE #bridge -m"); time.sleep(1)
+
+    # A mode chonkline does not implement must not desync the link: the server
+    # has to keep serving afterwards and the channel must still work.
+    ci.clear(); cc.clear()
+    ci.send("MODE #bridge +C")          # noctcp, which chonkline has no notion of
+    time.sleep(2)
+    cc.send("PRIVMSG #bridge :AFTER-FOREIGN-MODE")
+    R["survives_unknown_mode"] = ci.wait("AFTER-FOREIGN-MODE", 6)
+
     # --- private message, both directions ---
     ci.clear(); cc.clear()
     cc.send("PRIVMSG inspuser :PRIV-A2B"); R["priv_chonk_to_insp"] = ci.wait("PRIV-A2B", 6)
@@ -137,6 +159,7 @@ finally:
 print("=" * 62)
 order = ["link_up","insp_sees_remote_join","chan_chonk_to_insp","chan_insp_to_chonk",
          "names_shows_remote","whois_finds_remote","whois_names_their_server",
+         "topic_insp_to_chonk","topic_chonk_to_insp","mode_insp_to_chonk","survives_unknown_mode",
          "priv_chonk_to_insp","priv_insp_to_chonk","nick_propagates","part_propagates",
          "rejoin_propagates","quit_propagates","split_detected","chonkline_survives_split","usable_after_split"]
 for k in order:

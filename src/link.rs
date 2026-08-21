@@ -203,7 +203,7 @@ impl LinkSession {
             }],
             "PRIVMSG" | "NOTICE" => self.on_message(&cmd, &source),
             "FMODE" => self.on_fmode(&cmd),
-            "FTOPIC" => self.on_ftopic(&cmd),
+            "FTOPIC" => self.on_ftopic(&cmd, &source),
             "AWAY" => vec![Event::Away {
                 uuid: source,
                 reason: cmd.params.first().filter(|r| !r.is_empty()).cloned(),
@@ -364,16 +364,26 @@ impl LinkSession {
         }]
     }
 
-    fn on_ftopic(&mut self, cmd: &Command) -> Vec<Event> {
-        // FTOPIC <chan> <chants> <topicts> <setter> :<topic>
-        if cmd.params.len() < 5 {
+    fn on_ftopic(&mut self, cmd: &Command, source: &str) -> Vec<Event> {
+        // FTOPIC <chan> <chants> <topicts> [<setter>] :<topic>
+        //
+        // The setter is optional -- InspIRCd sends the four-parameter form and
+        // falls back to the message source. The topic is always the LAST
+        // parameter, not a fixed index. Requiring five silently dropped every
+        // inbound topic change.
+        if cmd.params.len() < 4 {
             return Vec::new();
         }
+        let setter = if cmd.params.len() > 4 {
+            cmd.params[3].clone()
+        } else {
+            source.to_string()
+        };
         vec![Event::TopicChanged {
             chan: cmd.params[0].clone(),
             ts: cmd.params[2].parse().unwrap_or(0),
-            setter: cmd.params[3].clone(),
-            topic: cmd.params[4].clone(),
+            setter,
+            topic: cmd.params.last().cloned().unwrap_or_default(),
         }]
     }
 
@@ -691,6 +701,12 @@ use crate::state::ServerState;
 /// queues are: a peer that stops reading must cost a known amount of memory.
 const LINK_QUEUE: usize = 4096;
 
+/// How often to ping a peer, and how long it may stay silent before the link is
+/// considered dead. The timeout is a comfortable multiple of the interval so a
+/// slow peer is not dropped for one missed reply.
+const KEEPALIVE_SECS: u64 = 60;
+const LINK_TIMEOUT_SECS: u64 = 300;
+
 /// A live link, as seen from the rest of the server.
 pub struct LinkHandle {
     pub sid: String,
@@ -771,11 +787,35 @@ pub async fn run_session(
     let mut lines = BufReader::new(rd).lines();
     let mut registered_sid: Option<String> = None;
 
+    // Keepalive. Without it a peer that stops answering is never noticed and
+    // its users stay in our view indefinitely -- a split that never gets
+    // announced is worse than one that does.
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(KEEPALIVE_SECS));
+    keepalive.tick().await; // the first tick fires immediately
+    let mut last_rx = std::time::Instant::now();
+
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(l)) => l,
-            _ => break,
+        let line = tokio::select! {
+            read = lines.next_line() => match read {
+                Ok(Some(l)) => l,
+                _ => break,
+            },
+            _ = keepalive.tick() => {
+                if last_rx.elapsed() > std::time::Duration::from_secs(LINK_TIMEOUT_SECS) {
+                    crate::log::event(crate::log::WARN, "link.timeout",
+                        &[("peer", &peer), ("silent_secs", &last_rx.elapsed().as_secs().to_string())]);
+                    break;
+                }
+                if let Some(sid) = session.peer_sid.clone() {
+                    let ours = our_sid.clone();
+                    if tx.try_send(format!(":{} PING {} {}", ours, ours, sid)).is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
         };
+        last_rx = std::time::Instant::now();
         if line.trim().is_empty() {
             continue;
         }
@@ -889,11 +929,8 @@ fn apply_event(state: &Arc<Mutex<ServerState>>, ev: Event) {
         Event::BurstComplete => {
             crate::log::event(crate::log::INFO, "link.burst_complete", &[]);
         }
-        Event::ModeChange { .. } => {
-            // Modes we do not implement still arrive and must not be treated as
-            // an error. Applying them locally is future work; dropping them is
-            // visible only as chonkline not enforcing a mode it never had.
-            crate::log::counted("link.mode_ignored", "");
+        Event::ModeChange { target, ts, modes } => {
+            crate::cmds::apply_remote_mode(&mut stg, &target, ts, &modes);
         }
         Event::PeerRegistered { .. } | Event::Failed(_) => {}
     }
@@ -946,5 +983,93 @@ pub async fn maintain_peer(state: Arc<Mutex<ServerState>>, peer: String, cfg: Li
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
+#[cfg(test)]
+mod protocol_extra_tests {
+    use super::*;
+
+    fn cfg() -> LinkConfig {
+        LinkConfig { sid: "2CH".into(), name: "chonk.test".into(), desc: "d".into(),
+                     send_password: "pw".into(), recv_password: "pw".into() }
+    }
+    fn linked() -> LinkSession {
+        let mut s = LinkSession::new(cfg(), true);
+        s.begin();
+        s.take_outbound();
+        s.handle_line("SERVER insp.test pw 0 1IN :InspIRCd");
+        s.take_outbound();
+        s
+    }
+
+    #[test]
+    fn fmode_carries_its_flags_and_parameters() {
+        let mut s = linked();
+        let ev = s.handle_line(":1IN FMODE #test 1665473560 +ntl 50");
+        match ev.as_slice() {
+            [Event::ModeChange { target, ts, modes }] => {
+                assert_eq!(target, "#test");
+                assert_eq!(*ts, 1665473560);
+                assert_eq!(modes, &vec!["+ntl".to_string(), "50".to_string()]);
+            }
+            other => panic!("expected a mode change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ftopic_reports_setter_and_topic() {
+        let mut s = linked();
+        let ev = s.handle_line(":1IN FTOPIC #test 100 200 alice :the new topic");
+        match ev.as_slice() {
+            [Event::TopicChanged { chan, ts, setter, topic }] => {
+                assert_eq!(chan, "#test");
+                assert_eq!(*ts, 200, "the topic's own timestamp, not the channel's");
+                assert_eq!(setter, "alice");
+                assert_eq!(topic, "the new topic");
+            }
+            other => panic!("expected a topic change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ftopic_accepts_the_four_parameter_form() {
+        // InspIRCd sends FTOPIC without a setter and falls back to the source.
+        let mut s = linked();
+        match s.handle_line(":1INAAAAAB FTOPIC #test 100 200 :no setter here").as_slice() {
+            [Event::TopicChanged { setter, topic, ts, .. }] => {
+                assert_eq!(topic, "no setter here", "the topic is the last parameter");
+                assert_eq!(setter, "1INAAAAAB", "falls back to the message source");
+                assert_eq!(*ts, 200);
+            }
+            other => panic!("expected a topic change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn away_sets_and_clears() {
+        let mut s = linked();
+        match s.handle_line(":1INAAAAAB AWAY :at lunch").as_slice() {
+            [Event::Away { uuid, reason }] => {
+                assert_eq!(uuid, "1INAAAAAB");
+                assert_eq!(reason.as_deref(), Some("at lunch"));
+            }
+            other => panic!("expected away, got {other:?}"),
+        }
+        match s.handle_line(":1INAAAAAB AWAY").as_slice() {
+            [Event::Away { reason, .. }] => assert!(reason.is_none(), "no reason clears away"),
+            other => panic!("expected away clear, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pong_from_the_peer_is_accepted_silently() {
+        // We ping on a timer; their answer must not be treated as unknown and
+        // must not produce output of its own.
+        let mut s = linked();
+        let ev = s.handle_line(":1IN PONG 1IN 2CH");
+        assert!(ev.is_empty());
+        assert!(s.take_outbound().is_empty(), "a PONG must not be answered");
+        assert_ne!(s.phase, Phase::Dead);
     }
 }

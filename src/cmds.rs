@@ -1289,6 +1289,16 @@ fn handle_topic(stg: &mut ServerState, id: usize, cmd: &Command) {
             for mid in members {
                 relay_tagged(stg, mid, &proto::line(&sender_prefix, "TOPIC", &format!("{} :{}", raw, new_topic)));
             }
+            // FTOPIC carries both the channel timestamp and the topic's own, so
+            // the peer can tell a newer topic from an older one after a split.
+            if !stg.links.is_empty() {
+                let uuid = stg.network.uuid_for_local(id);
+                let chan_ts = stg.chan(&norm).map(|c| c.created_at).unwrap_or(0);
+                let display = stg.chan(&norm).map(|c| c.display.clone()).unwrap_or_else(|| raw.to_string());
+                let setter = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
+                let line = format!(":{} FTOPIC {} {} {} {} :{}", uuid, display, chan_ts, now_secs, setter, new_topic);
+                to_links(stg, &line);
+            }
         }
         None => send_topic_state(stg, id, raw),
     }
@@ -1455,6 +1465,54 @@ fn mode_channel(stg: &mut ServerState, id: usize, raw: &str, terms_in: &[String]
     for line in member_changes.iter() {
         for mid in priv_members.iter() {
             deliver(stg, *mid, line.as_str());
+        }
+    }
+
+    // The rest of the network needs the same change, as FMODE carrying the
+    // channel timestamp so the peer can resolve a conflict against it. Prefix
+    // modes are re-expressed against the target's UUID, because a nickname is
+    // not an identity anywhere off this server.
+    if !stg.links.is_empty() && !member_changes.is_empty() {
+        let ts = stg.chan(&norm).map(|c| c.created_at).unwrap_or(0);
+        let uuid = stg.network.uuid_for_local(id);
+        let display = stg.chan(&norm).map(|c| c.display.clone()).unwrap_or_else(|| raw.to_string());
+        let mut flags = String::new();
+        let mut params: Vec<String> = Vec::new();
+        let mut j = 0usize;
+        while j < terms.len() {
+            let term = &terms[j];
+            let mut sign = '+';
+            for ch in term.chars() {
+                match ch {
+                    '+' | '-' => { sign = ch; flags.push(ch); }
+                    'o' | 'v' => {
+                        flags.push(ch);
+                        if let Some(nick) = terms.get(j + 1) {
+                            let target = stg
+                                .lookup(&norm_nick(nick))
+                                .map(|u| u.id)
+                                .and_then(|tid| stg.network.local_uuid(tid).cloned())
+                                .or_else(|| stg.network.by_nick(&norm_nick(nick)).map(|u| u.uuid.clone()));
+                            if let Some(t) = target { params.push(t); }
+                            j += 1;
+                        }
+                    }
+                    'k' | 'l' | 'b' | 'e' | 'I' => {
+                        flags.push(ch);
+                        let takes_param = sign == '+' || matches!(ch, 'b' | 'e' | 'I' | 'k');
+                        if takes_param {
+                            if let Some(p) = terms.get(j + 1) { params.push(p.to_string()); j += 1; }
+                        }
+                    }
+                    other => flags.push(other),
+                }
+            }
+            j += 1;
+        }
+        if !flags.is_empty() {
+            let tail = if params.is_empty() { flags.clone() } else { format!("{} {}", flags, params.join(" ")) };
+            let line = format!(":{} FMODE {} {} {}", uuid, display, ts, tail);
+            to_links(stg, &line);
         }
     }
 
@@ -2378,6 +2436,100 @@ fn deliver_one_recipient(stg: &mut ServerState, id: usize, raw: &str, text: &str
     if is_priv {
         deliver_nosuch_nick(stg, id, raw);
     }
+}
+
+/// Apply a channel mode change that arrived over a link.
+///
+/// Modes this server implements are applied normally. Modes it does not are
+/// recorded verbatim so they can be echoed back and reported: InspIRCd sends
+/// modes we never advertised (a burst arrives carrying +nt before we have said
+/// anything about modes at all), and dropping one the peer believes is set is a
+/// silent divergence.
+pub(crate) fn apply_remote_mode(stg: &mut ServerState, target: &str, ts: u64, modes: &[String]) {
+    if !valid_channel(target) {
+        return; // user modes on remote users are their server's business
+    }
+    let key = target.to_lowercase();
+    if stg.chan(&key).is_none() {
+        return;
+    }
+    // A mode change from the losing side of a timestamp conflict is ignored, as
+    // the protocol requires.
+    if let Some(our_ts) = stg.chan(&key).map(|c| c.created_at) {
+        if ts > our_ts && our_ts != 0 {
+            crate::log::counted("link.mode_ignored_ts", &key);
+            return;
+        }
+    }
+
+    let flags = modes.first().cloned().unwrap_or_default();
+    let mut params = modes[1.min(modes.len())..].iter();
+    let mut adding = true;
+    let mut applied: Vec<String> = Vec::new();
+
+    for ch in flags.chars() {
+        match ch {
+            '+' => { adding = true; continue; }
+            '-' => { adding = false; continue; }
+            _ => {}
+        }
+        match ch {
+            'i' | 'n' | 'p' | 's' | 't' | 'm' | 'R' => {
+                if let Some(c) = stg.chan_mut(&key) { c.set_flag(ch, adding); }
+            }
+            'k' => {
+                let p = params.next().cloned();
+                if let Some(c) = stg.chan_mut(&key) { c.set_key_opt(if adding { p.clone() } else { None }); }
+            }
+            'l' => {
+                let p = params.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+                if let Some(c) = stg.chan_mut(&key) { c.set_limit_value(if adding { p } else { 0 }); }
+            }
+            'b' | 'e' | 'I' => {
+                if let Some(mask) = params.next().cloned() {
+                    if let Some(c) = stg.chan_mut(&key) {
+                        match (ch, adding) {
+                            ('b', true) => { c.add_ban(&mask); }
+                            ('b', false) => { c.remove_ban(&mask); }
+                            ('e', true) => { c.add_except(&mask); }
+                            ('e', false) => { c.remove_except(&mask); }
+                            ('I', true) => { c.add_invex(&mask); }
+                            _ => { c.remove_invex(&mask); }
+                        }
+                    }
+                }
+            }
+            'o' | 'v' => {
+                // Prefix modes name a UUID. Only local users have a membership
+                // this server can flip; a remote user's prefix is tracked by
+                // their own server.
+                if let Some(uuid) = params.next().cloned() {
+                    if let Some(local_id) = stg.network.local_uuid_owner(&uuid) {
+                        if let Some(c) = stg.chan_mut(&key) {
+                            c.set_member_prefix(ch, local_id, adding);
+                        }
+                    }
+                }
+            }
+            other => {
+                // Unimplemented: keep it rather than drop it.
+                let p = params.next().cloned();
+                if let Some(c) = stg.chan_mut(&key) { c.set_foreign_mode(other, p, adding); }
+                crate::log::counted("link.foreign_mode", &other.to_string());
+            }
+        }
+        applied.push(format!("{}{}", if adding { '+' } else { '-' }, ch));
+    }
+
+    if applied.is_empty() {
+        return;
+    }
+    // Local members should see the change, as they would from a local operator.
+    let display = stg.chan(&key).map(|c| c.display.clone()).unwrap_or_else(|| target.to_string());
+    let srv = stg.prefix();
+    let body = format!("{} {}", display, modes.join(" "));
+    let line = proto::line(&srv, "MODE", &body);
+    to_local_members(stg, &key, &line);
 }
 
 /// Nicknames of remote users in a channel, formatted for a NAMES listing.

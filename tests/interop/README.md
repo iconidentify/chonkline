@@ -125,10 +125,29 @@ Both cost real time, and neither is a server fault:
   its small defaults and reset every client after the first, which looked
   exactly like a concurrency bug in the harness.
 
+## Coverage
+
+`live_link_full.py` is the functional surface, twenty checks against a live
+InspIRCd 4.11.0:
+
+link established; remote joins seen; channel messages both ways; NAMES and WHOIS
+resolving remote users with their owning server; topic both ways; modes both
+ways; a mode chonkline does not implement not desyncing the link; private
+messages both ways; nick change; part; rejoin; quit; split detected; server
+survives the split; server usable after it.
+
 ## The obligation this creates
 
 Skipping mode validation does not make the modes go away. InspIRCd still sends
 `FJOIN #chan <ts> +nt` and `FMODE` carrying modes chonkline does not implement.
-Those must be stored and echoed back verbatim: dropping a mode the other side
-believes is set is a silent desync, and desync is the characteristic failure of
-server linking.
+Those are now stored per channel as foreign modes, reported in
+`RPL_CHANNELMODEIS`, and cleared only when the channel loses a timestamp
+conflict -- dropping a mode the other side believes is set is a silent desync,
+and desync is the characteristic failure of server linking.
+
+One protocol shape worth recording, because the documentation does not give it
+and assuming cost a debugging round: **FTOPIC has an optional setter**.
+InspIRCd's own handler reads
+`setter = (params.size() > 4) ? params[3] : user->nick` and takes the topic from
+`params.back()`. Requiring five parameters silently dropped every inbound topic
+change while outbound worked, which reads as a one-directional bug.

@@ -218,6 +218,12 @@ pub struct Chn {
     excepts: Vec<String>, // +e ban-exception masks (lowercased)
     invex: Vec<String>,  // +I invite-exception masks (lowercased)
     invites: BTreeSet<usize>,
+    /// Modes set by another server that this server does not implement.
+    ///
+    /// They must be kept and echoed back verbatim rather than dropped: the peer
+    /// believes they are set, and silently discarding one is a divergence that
+    /// surfaces later as two servers disagreeing about a channel.
+    foreign_modes: std::collections::BTreeMap<char, Option<String>>,
     pub ops: BTreeSet<usize>,    // connection ids with operator privileges here
     pub voices: BTreeSet<usize>,
     pub members: BTreeSet<usize>,
@@ -247,6 +253,7 @@ impl Chn {
             excepts: Vec::new(),
             invex: Vec::new(),
             invites: BTreeSet::new(),
+            foreign_modes: std::collections::BTreeMap::new(),
             ops: BTreeSet::new(),
             voices: BTreeSet::new(),
             members: BTreeSet::new(),
@@ -305,6 +312,44 @@ impl Chn {
     /// protocol requires the younger channel to discard all of its modes,
     /// including prefixes, bans and every list mode, before taking the
     /// winner's.
+    /// Set or clear the channel key (+k) from a linked server.
+    pub(crate) fn set_key_opt(&mut self, k: Option<String>) {
+        self.chan_key = k.filter(|v| !v.is_empty());
+    }
+
+    /// Set or clear the member limit (+l) from a linked server.
+    pub(crate) fn set_limit_value(&mut self, n: i32) {
+        self.key_limit = n.max(0);
+    }
+
+    /// Grant or remove a prefix mode for a local member.
+    pub(crate) fn set_member_prefix(&mut self, ch: char, cx_id: usize, on: bool) {
+        let set = if ch == 'o' { &mut self.ops } else { &mut self.voices };
+        if on { set.insert(cx_id); } else { set.remove(&cx_id); }
+    }
+
+    /// Record a mode this server does not implement.
+    pub(crate) fn set_foreign_mode(&mut self, ch: char, param: Option<String>, on: bool) {
+        if on {
+            self.foreign_modes.insert(ch, param);
+        } else {
+            self.foreign_modes.remove(&ch);
+        }
+    }
+
+    /// Foreign modes rendered for a burst or a MODE reply, as (flags, params).
+    pub fn foreign_mode_parts(&self) -> (String, Vec<String>) {
+        let mut flags = String::new();
+        let mut params = Vec::new();
+        for (ch, p) in &self.foreign_modes {
+            flags.push(*ch);
+            if let Some(v) = p {
+                params.push(v.clone());
+            }
+        }
+        (flags, params)
+    }
+
     pub(crate) fn clear_all_modes(&mut self) {
         self.invite_only = false;
         self.nomsg = false;
@@ -320,6 +365,7 @@ impl Chn {
         self.invex.clear();
         self.ops.clear();
         self.voices.clear();
+        self.foreign_modes.clear();
     }
 
     pub(crate) fn set_flag(&mut self, ch: char, on: bool) {
@@ -414,8 +460,15 @@ impl Chn {
         if self.moderated { s.push('m'); }
         // +b is a list mode (shown via 367/368), not a simple flag; it is not
         // reported in RPL_CHANNELMODEIS.
+        if self.regonly { s.push('R'); }
         if self.chan_key.is_some() { s.push('k'); }
         if self.key_limit > 0 { s.push('l'); }
+        // Modes another server set that this one does not implement are still
+        // reported: the peer believes they are set, and a client asking this
+        // server should see the same channel it would see there.
+        for ch in self.foreign_modes.keys() {
+            s.push(*ch);
+        }
         s
     }
 
