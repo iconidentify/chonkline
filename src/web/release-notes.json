@@ -1,50 +1,48 @@
 {
-  "generated": "2026-08-16",
-  "model": "llm-nothink",
+  "generated": "2026-08-21",
+  "model": "commit-history",
   "releases": [
     {
-      "title": "The Web Interface & Conformance",
-      "date": "2026-08-16",
-      "summary": "A new web-based dashboard provides live server stats and release notes, while the server achieves full client-compatibility conformance by resolving the final protocol issues.",
+      "title": "Give operators sight and reach during an incident",
+      "date": "2026-08-21",
+      "summary": "1 change in this release.",
+      "highlights": []
+    },
+    {
+      "title": "Close the attack chain that took the operator offline",
+      "date": "2026-08-20",
+      "summary": "8 changes in this release.",
       "highlights": [
-        "New web dashboard displays live server statistics and LLM-generated release notes.",
-        "Achieved full client-compatibility conformance, closing out the P0-P2 issue backlog.",
-        "Fixed malformed MODE broadcasts that previously caused missing targets or stray spaces.",
-        "Session counting in the web view now accurately reflects only registered users."
+        "Bound the reply queue, gate broadcasts, reap idle connections",
+        "Fix a one-line remote kill, close the ingress bypass, harden the edge",
+        "Truncate overlong usernames, and stop health checks eating the limits and logs",
+        "Require the PROXY header now that every path prepends one",
+        "Serve the web property over TLS and add a dedicated load balancer",
+        "Fix a cutover outage in the manifest and size the ceiling against the OOM"
       ]
     },
     {
-      "title": "Accounts, TLS, and Identity",
+      "title": "Web: count only registered sessions; add GitHub/GPL link...",
       "date": "2026-08-16",
-      "summary": "Chonkline now supports secure connections via TLS, user accounts with SASL authentication, and proper server identity, making it a more robust home for regulars.",
+      "summary": "13 changes in this release.",
       "highlights": [
-        "Secure TLS connections available on port 6697 via a ghostunnel sidecar.",
-        "Added user accounts with SASL authentication and IRCv3 capabilities.",
-        "Host cloaking is now supported to protect user privacy.",
-        "Server identity is properly advertised via IRC_SERVER_NAME and RPL_LUSERHOST.",
-        "Fixed RPL_USERHOST to correctly include user@host for strict clients."
+        "Add web property: live stats + LLM-generated release notes",
+        "Client-compatibility conformance: close out P0-P2 issue backlog",
+        "Fix malformed +o/+v MODE broadcast (missing target, stray space)",
+        "Trim closing lines from the MOTD",
+        "Add ChanServ channel registration and a proper MOTD",
+        "Fix NOTICE delivery to users (and CTCP replies)"
       ]
     },
     {
-      "title": "ChanServ, MOTD, and NOTICE Fixes",
-      "date": "2026-08-16",
-      "summary": "Channel registration is now managed by ChanServ, the Message of the Day is cleaner, and private messages (NOTICE) are delivered reliably to all users.",
-      "highlights": [
-        "New ChanServ service allows for proper channel registration.",
-        "MOTD is now trimmed to remove unnecessary closing lines for a cleaner read.",
-        "Fixed NOTICE delivery so private messages and CTCP replies reach the intended users.",
-        "Ensured RPL_MOTDSTART is sent before the MOTD body to prevent client crashes."
-      ]
-    },
-    {
-      "title": "Protocol Polish & Stability",
+      "title": "Echo the actor's own JOIN/PART so client channel buffers...",
       "date": "2026-08-15",
-      "summary": "The core connection experience is smoother with faster reconnections, reliable channel buffers, and fixes for common protocol quirks that caused ghost users or missed events.",
+      "summary": "5 changes in this release.",
       "highlights": [
-        "Hardened reconnection logic with keepalives and fast nick reclaim.",
-        "Clients now see their own JOIN and PART events, ensuring channel buffers open correctly.",
-        "Improved CAP negotiation and PING/PONG handling for a stable handshake.",
-        "Fixed error-numeric targets and ghost user reaping for stricter client compatibility."
+        "Harden reconnect + CAP handshake: keepalive, fast nick reclaim, CAP-END gating",
+        "Fix client-visible protocol bugs: channel echo, error-numeric targets, ghost reap",
+        "Fix client handshake: CAP negotiation, client PING/PONG, nick validation",
+        "Chonkline: Rust IRC server"
       ]
     }
   ]

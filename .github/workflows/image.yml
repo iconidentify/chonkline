@@ -12,6 +12,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the release-notes generator reads `git log`, and the
+          # default shallow clone would give it exactly one commit.
+          fetch-depth: 0
+      # Release notes are baked into the image, and nothing regenerated them --
+      # they sat 5 days stale, still describing a TLS sidecar that had been
+      # removed. Regenerating here means the served notes always match the
+      # commit that built the image.
+      #
+      # SKIP_IF_CURRENT leaves committed notes alone when they already cover
+      # HEAD, so prose written by hand (or by the LLM, which is a self-hosted
+      # localhost proxy CI cannot reach) survives instead of being overwritten.
+      - name: Refresh release notes
+        env:
+          RELNOTES_NO_LLM: "1"
+          RELNOTES_SKIP_IF_CURRENT: "1"
+          RELNOTES_OUT: src/web/release-notes.json
+        run: python3 scripts/gen-release-notes.py
+
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
