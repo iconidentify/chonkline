@@ -199,10 +199,14 @@ async fn admit_and_run(
     acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) {
     let is_tls = acceptor.is_some();
-    let peer = sock
-        .peer_addr()
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "0.0.0.0".into());
+    let peer = match sock.peer_addr() {
+        Ok(a) => a.ip().to_string(),
+        // The socket is already gone -- a health probe that connected and hung
+        // up before we looked. There is no address to judge here, and standing
+        // in a placeholder is worse than useless: it gets matched against the
+        // exemption and trust globs like a real one.
+        Err(_) => return,
+    };
 
     // Resolve the client's real address from the PROXY header the proxy
     // prepends. The stream is *peeked* first: a TLS ClientHello must not be
@@ -216,11 +220,6 @@ async fn admit_and_run(
         // Time-bounded: this runs BEFORE admission control, so a client that
         // sends "PROXY " and then stalls would otherwise hold a task and an fd
         // that no limit counts.
-        if !proxy_trusted_peer(&peer) {
-            crate::log::counted("proxy.untrusted_peer", &peer);
-            refuse(&mut sock, is_tls, "PROXY protocol header not accepted from this address").await;
-            return;
-        }
         let peeked = match tokio::time::timeout(
             Duration::from_secs(10),
             crate::proxyproto::peek_is_header(&sock),
@@ -229,6 +228,15 @@ async fn admit_and_run(
             Err(_) => { crate::log::counted("proxy.timeout", ""); return; }
         };
         match peeked {
+            // The trust decision belongs here, not on accept: a probe that
+            // connects and closes without speaking has claimed nothing, and
+            // logging it as a rejected peer buries real rejections in noise --
+            // the same way probes once filled the log with failed handshakes.
+            crate::proxyproto::Peek::Header if !proxy_trusted_peer(&peer) => {
+                crate::log::counted("proxy.untrusted_peer", &peer);
+                refuse(&mut sock, is_tls, "PROXY protocol header not accepted from this address").await;
+                return;
+            }
             crate::proxyproto::Peek::Header => match tokio::time::timeout(
                 Duration::from_secs(10),
                 crate::proxyproto::read_v1(&mut sock),

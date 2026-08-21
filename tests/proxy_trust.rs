@@ -130,3 +130,26 @@ fn a_trusted_proxy_does_not_exempt_everyone_behind_it() {
         std::env::remove_var(v);
     }
 }
+
+#[test]
+fn a_silent_probe_is_not_logged_as_a_rejected_peer() {
+    // A kubelet tcpSocket probe connects and hangs up without speaking. It has
+    // claimed nothing, so it is not a rejection -- and treating it as one puts
+    // a warning in the log every few seconds forever, which is how real
+    // rejections get missed.
+    let addr = start_trusting("10.9.9.9");
+    for _ in 0..3 {
+        let c = Client::new(&addr);
+        drop(c);
+    }
+    // Nothing to assert on the wire; the point is that this path closes quietly
+    // rather than refusing. A peer that actually sends a header still gets the
+    // refusal, which the neighbouring tests cover.
+    let mut speaks = Client::new(&addr);
+    speaks.send("PROXY TCP4 203.0.113.90 10.0.0.1 1 6667");
+    speaks.send("NICK loud");
+    speaks.send("USER loud 0 * :Loud");
+    let l = speaks.read_until(|l| l.contains("ERROR") || l.contains(" 001 "));
+    assert!(l.contains("ERROR"), "a peer that does claim an address is still refused");
+    std::env::remove_var("IRC_PROXY_TRUSTED");
+}
