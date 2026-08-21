@@ -111,18 +111,42 @@ fn handle_oper(stg: &mut ServerState, id: usize, cmd: &Command) {
     if !(user_ok && pass_ok) {
         let src = stg.find_by_id(id).map(|u| u.real_host.clone()).unwrap_or_default();
         crate::log::auth(id, &src, user_now, "OPER", false);
+        snote(stg, &format!("Failed OPER attempt from {}", src));
         numeric(stg, id, "464", &[user_now, "Password is incorrect"]); // ERR_PASSWDMISMATCH: recipient token then the referenced user name
         return;
     }
     {
         let src = stg.find_by_id(id).map(|u| u.real_host.clone()).unwrap_or_default();
         crate::log::auth(id, &src, user_now, "OPER", true);
+        let who = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
+        snote(stg, &format!("{} is now an IRC operator", who));
     }
     if let Some(u) = stg.find_by_id_mut(id) { u.oper = true; }
     numeric(stg, id, "381", &["You are now an IRC operator"]); // RPL_YOUREOPER (381), not 379 (RPL_WHOISOPERATOR)
     // Reflect the new +o user mode back to the client (MODE self-echo).
     let nick = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
     deliver(stg, id, &proto::line(&stg.prefix(), "MODE", &format!("{} +o", nick)));
+}
+
+/// Broadcast a server notice to every operator carrying user mode +s.
+///
+/// `+s` was parseable, storable and rendered in RPL_UMODEIS, but nothing ever
+/// sent one -- so an operator had no in-band signal that anything was wrong and
+/// learned about incidents from users. This is that signal.
+pub(crate) fn snote(stg: &mut ServerState, text: &str) {
+    let recipients: Vec<usize> = stg
+        .each_user()
+        .filter(|u| u.oper && u.srvnotice)
+        .map(|u| u.id)
+        .collect();
+    if recipients.is_empty() {
+        return;
+    }
+    let p = stg.prefix();
+    for rid in recipients {
+        let nick = stg.find_by_id(rid).map(|u| u.nick.clone()).unwrap_or_default();
+        deliver(stg, rid, &proto::line(&p, "NOTICE", &format!("{} :*** Notice -- {}", nick, text)));
+    }
 }
 
 /// Reject a command from a non-operator with ERR_NOPRIVILEGES (481). Returns
@@ -150,6 +174,39 @@ fn handle_kill(stg: &mut ServerState, id: usize, cmd: &Command) {
     };
     let reason = cmd.params.get(1).filter(|r| !r.is_empty()).map(String::as_str).unwrap_or("Killed by operator");
 
+    // Pattern form: KILL Sol* :flood. During the 2026-08-20 incident the only
+    // option was one KILL per drone against several hundred of them, issued
+    // through a limiter that silently dropped most of them.
+    if target.contains('*') || target.contains('?') {
+        let pat = norm_nick(target);
+        let hits: Vec<usize> = stg
+            .each_user()
+            // Never let a pattern disarm the responders.
+            .filter(|u| !u.oper && crate::bans::glob_match(&pat, &u.nick_key))
+            .map(|u| u.id)
+            .collect();
+        let actor = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
+
+        // Guardrail: refuse a pattern that would take out most of the server
+        // unless it is unambiguous. `KILL *` is almost always a mistake.
+        let total = stg.user_count();
+        if hits.len() > total / 2 && total > 4 {
+            numeric(stg, id, "NOTICE", &[&format!(
+                "Refusing KILL {}: would match {} of {} users. Narrow the pattern.",
+                target, hits.len(), total
+            )]);
+            return;
+        }
+
+        for h in &hits {
+            crate::ops::announce_loss_and_evict(stg, *h, &format!("Killed by {}: {}", actor, reason));
+        }
+        crate::log::oper_action(&actor, "KILL-PATTERN", target, reason);
+        snote(stg, &format!("{} used KILL {} ({} killed)", actor, target, hits.len()));
+        deliver(stg, id, &proto::line(&stg.prefix(), "NOTICE", &format!("{} :Killed {} matching {}", actor, hits.len(), target)));
+        return;
+    }
+
     let Some(target_id) = stg.lookup(&norm_nick(target)).map(|u| u.id) else {
         numeric(stg, id, "401", &[target, "No such nick/channel"]); // ERR_NOSUCHNICK
         return;
@@ -158,6 +215,7 @@ fn handle_kill(stg: &mut ServerState, id: usize, cmd: &Command) {
     let actor = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
     let target_nick = stg.find_by_id(target_id).map(|u| u.nick.clone()).unwrap_or_default();
     crate::log::oper_action(&actor, "KILL", &target_nick, reason);
+    snote(stg, &format!("{} used KILL on {} ({})", actor, target_nick, reason));
 
     let notice = proto::line(&stg.prefix(), "NOTICE", &format!("{} :Killed by {}: {}", target_nick, actor, reason));
     deliver(stg, target_id, &notice);
@@ -192,10 +250,11 @@ fn handle_kline(stg: &mut ServerState, id: usize, cmd: &Command) {
     let actor = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default();
     stg.bans.add(&mask, duration, &actor, &reason);
     crate::log::oper_action(&actor, "KLINE", &mask, &reason);
+    snote(stg, &format!("{} added K-line for {} ({})", actor, mask, reason));
 
     // Remove anyone already connected from a matching address.
     let hits: Vec<usize> = stg
-        .each_user()
+        .each_connection()
         .filter(|u| crate::bans::glob_match(&mask, &u.real_host))
         .map(|u| u.id)
         .collect();
@@ -627,6 +686,32 @@ fn maybe_complete(stg: &mut ServerState, id: usize, realname_this_call: &str) {
         None => return,
     };
 
+    // Anti-bot registration challenge. Both pairing slots are filled, so send a
+    // PING and require any PONG before completing. Real clients answer this
+    // automatically and the user never sees it; a scripted flood that blasts
+    // NICK/USER/JOIN without reading the socket never gets past here.
+    //
+    // Any PONG is accepted, not a matching cookie: matching adds nothing
+    // against a bot that reads the socket, and only risks breaking a client
+    // that echoes the token oddly.
+    if crate::ops::registration_challenge_enabled() {
+        let (challenged, verified) = match stg.find_by_id(id) {
+            Some(u) => (u.reg_challenged, u.reg_verified),
+            None => return,
+        };
+        if !verified {
+            if !challenged {
+                let token = format!("{}-reg-{}", stg.name, id);
+                let p = stg.prefix();
+                deliver(stg, id, &proto::line(&p, "PING", &format!(":{}", token)));
+                if let Some(u) = stg.find_by_id_mut(id) {
+                    u.reg_challenged = true;
+                }
+            }
+            return; // completion resumes from the PONG path
+        }
+    }
+
     // Held-back pairings (round-4): an active reclaim marker on the contested nick defers
     // every synchronous outcome until its asynchronous resolution lands; the filled slots
     // stay parked for completion-on-expiry.
@@ -648,6 +733,7 @@ fn maybe_complete(stg: &mut ServerState, id: usize, realname_this_call: &str) {
         if let Some(u) = stg.find_by_id(id) {
             crate::log::session_registered(id, &u.real_host, &u.host, &u.nick);
         }
+        crate::log::counted("session.new", "");
     }
     match completed {
         Some(nick_display) => {
@@ -3045,11 +3131,65 @@ fn handle_info_reply(stg: &mut ServerState, id: usize, cmd: &Command) {
 
                 match letter_now {
 
-                    b'u' => { let name_now = stg.name.clone(); numeric(stg, id, "242", &[&name_now, &format!("- Server uptime {}s", 0)]); } // normalized trailing shape through the shared chokepoint
+                    // Real uptime; this reported a literal 0 before.
+                    b'u' => { let name_now = stg.name.clone(); let up = stg.uptime_secs(); numeric(stg, id, "242", &[&name_now, &format!("- Server uptime {}s", up)]); }
 
                     b'b' => { let name_now = stg.name.clone(); numeric(stg, id, "213", &[&name_now, &format!("- CLINE {}", 0)]); } // normalized trailing shape through the shared chokepoint
 
                     b'o' => { let name_now = stg.name.clone(); numeric(stg, id, "243", &[&name_now, "*", "operator"]); } // recipient token first through the shared chokepoint
+
+                    // K-lines. The store existed and was unreadable, so an
+                    // operator could not list the bans they had set.
+                    b'K' | b'k' => {
+                        if stg.find_by_id(id).map(|u| u.oper).unwrap_or(false) {
+                            let rows: Vec<(String, String, u64)> = stg
+                                .bans
+                                .list()
+                                .iter()
+                                .map(|b| (b.mask.clone(), b.reason.clone(), b.expiry))
+                                .collect();
+                            for (mask, reason, expiry) in rows {
+                                let when = if expiry == 0 { "permanent".to_string() } else { format!("expires {}", expiry) };
+                                numeric(stg, id, "216", &["K", &mask, &format!("- {} ({})", reason, when)]);
+                            }
+                        } else {
+                            numeric(stg, id, "481", &["Permission Denied- You're not an IRC operator"]);
+                        }
+                    }
+
+                    // Live limits, so an operator can see what is actually in
+                    // force rather than inferring it from the manifest.
+                    b'I' | b'i' => {
+                        if stg.find_by_id(id).map(|u| u.oper).unwrap_or(false) {
+                            let l = &stg.limits;
+                            let rows = [
+                                format!("- max_clients {}", l.max_clients),
+                                format!("- clones_per_ip {}", l.max_clones_per_ip),
+                                format!("- connects_per_window {}", l.max_connects_per_window),
+                                format!("- messages_per_window {}", l.max_messages_per_window),
+                                format!("- flood_violations {}", l.max_violations),
+                                format!("- exempt {}", l.exempt.join(",")),
+                            ];
+                            for r in rows { numeric(stg, id, "215", &["I", &r]); }
+                        } else {
+                            numeric(stg, id, "481", &["Permission Denied- You're not an IRC operator"]);
+                        }
+                    }
+
+                    // Busiest sources right now: the "who is flooding me" query.
+                    b'L' | b'l' => {
+                        if stg.find_by_id(id).map(|u| u.oper).unwrap_or(false) {
+                            let top = stg.sources.top_sources(15);
+                            let total = stg.sources.active_total();
+                            let tracked = stg.sources.tracked_sources();
+                            numeric(stg, id, "211", &["*", &format!("- {} connections from {} sources", total, tracked)]);
+                            for (src, n) in top {
+                                numeric(stg, id, "211", &[&src, &format!("- {} connections", n)]);
+                            }
+                        } else {
+                            numeric(stg, id, "481", &["Permission Denied- You're not an IRC operator"]);
+                        }
+                    }
 
                     _ => {}
 

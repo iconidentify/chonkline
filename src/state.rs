@@ -120,6 +120,13 @@ pub struct Cx {
     /// flushed by the connection's own `CAP END`.
     pub cap_gated_welcome: bool,
 
+    /// Anti-bot registration challenge: a PING was sent and is awaiting any
+    /// PONG. Every real IRC client answers automatically, so this is invisible
+    /// to users while defeating scripted floods that never read the socket.
+    pub reg_challenged: bool,
+    /// The client answered, so registration may complete.
+    pub reg_verified: bool,
+
     pub away: Option<String>,
     pub invis: bool,      // user mode +i (invisible)
     pub wallop: bool,     // user mode +w
@@ -625,6 +632,8 @@ impl ServerState {
             pending_user: None,
             cap_negotiating: false,
             cap_gated_welcome: false,
+            reg_challenged: false,
+            reg_verified: false,
             away: None,
             invis: false,
             wallop: false,
@@ -797,6 +806,12 @@ impl ServerState {
     /// read buffer indefinitely.
     pub fn each_unreg(&self) -> impl Iterator<Item = &Cx> + '_ { self.unreg.values() }
 
+    /// Every live connection, registered or not. A ban that only reaches
+    /// registered users leaves the banned address's half-open sockets in place.
+    pub fn each_connection(&self) -> impl Iterator<Item = &Cx> + '_ {
+        self.users.values().chain(self.unreg.values())
+    }
+
     pub fn user_count(&self) -> usize { self.users.len() }
 
     pub fn chan_count(&self) -> usize { self.chans.len() }
@@ -884,6 +899,8 @@ mod tests {
             pending_user: None,
             cap_negotiating: false,
             cap_gated_welcome: false,
+            reg_challenged: false,
+            reg_verified: false,
             away: None,
             invis: false,
             wallop: false,

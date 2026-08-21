@@ -245,6 +245,20 @@ impl SourceTable {
         self.sources.get(key).map(|s| s.active).unwrap_or(0)
     }
 
+    /// The busiest sources by live connection count, most first. This is the
+    /// "who is flooding me right now" query, which had no answer in-band.
+    pub fn top_sources(&self, n: usize) -> Vec<(String, usize)> {
+        let mut v: Vec<(String, usize)> = self
+            .sources
+            .iter()
+            .filter(|(_, s)| s.active > 0)
+            .map(|(k, s)| (k.clone(), s.active))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.truncate(n);
+        v
+    }
+
     /// Number of tracked sources, so the table's own growth stays observable.
     pub fn tracked_sources(&self) -> usize {
         self.sources.len()

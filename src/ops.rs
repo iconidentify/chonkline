@@ -472,6 +472,12 @@ fn route(
             u.last_rx = Instant::now(); // liveness bookkeeping (RFC 8.4)
         }
 
+        // Operators are exempt from both tiers. Incident response is bursty by
+        // nature -- a mass of KILL/KLINE lines -- and being throttled to ~3
+        // commands per second with no feedback made the response tools
+        // unusable at exactly the moment they were needed.
+        let is_oper = stg.find_by_id(id).map(|u| u.oper).unwrap_or(false);
+
         // Flood control (RFC 8.10), tier 1: the per-connection burst window.
         // Excess over the burst is dropped silently.
         let now = Instant::now();
@@ -481,7 +487,7 @@ fn route(
         // liveness ping, and is evicted for traffic someone else aimed at it --
         // which is exactly how a CTCP reflection flood removes its victim.
         let liveness_cmd = matches!(cmd.name.as_str(), "PING" | "PONG");
-        if over_burst && !liveness_cmd {
+        if over_burst && !liveness_cmd && !is_oper {
             crate::log::flood("dropped");
             return false;
         }
@@ -489,7 +495,7 @@ fn route(
         // Tier 2: the per-source aggregate budget. Without this, spreading
         // traffic across N connections multiplies the tier-1 allowance by N —
         // the limiter weakens in exact proportion to the abuse.
-        {
+        if !is_oper {
             let stg_ref = &mut *stg;
             match stg_ref.sources.charge_message(&stg_ref.limits, src, now) {
                 Ok(()) => {}
@@ -524,6 +530,21 @@ fn route(
         // Round-4 fast-reconnect resolution: an inbound PONG from a connection that
         // holds an unanswered reclaim ping answers every held-back requester with
         // the collision refusal and clears both bookkeeping entries at once.
+        // Any PONG satisfies the registration challenge and resumes the
+        // pairing that was held back for it.
+        if cmd.name == "PONG" {
+            let pending = stg
+                .find_by_id(id)
+                .map(|u| !u.registered && u.reg_challenged && !u.reg_verified)
+                .unwrap_or(false);
+            if pending {
+                if let Some(u) = stg.find_by_id_mut(id) {
+                    u.reg_verified = true;
+                }
+                crate::cmds::complete_pairing_if_ready(&mut stg, id);
+            }
+        }
+
         if cmd.name == "PONG" && stg.ping_outstanding.remove(&id).is_some() {
             if let Some(mark) = stg.grace_reclaim.remove(&id) {
                 for (rid, ref_now) in mark.pairings.iter().chain(mark.renames.iter()) {
@@ -591,6 +612,24 @@ pub fn park_unregistered(
 /// Liveness windows in seconds. Shipped defaults run ~30s ping / ~30s eviction
 /// so a dead client is gone within roughly a minute; tests may shrink both via
 /// environment overrides so reaping stays verifiable at test scale.
+/// Whether the anti-bot registration PING challenge is active.
+///
+/// OPT-IN (CHONKLINE_REG_CHALLENGE=1), deliberately. Every mainstream IRC
+/// client answers a PING automatically, so this is invisible to real users and
+/// fatal to scripted floods that never read the socket -- but a client that
+/// does not answer cannot register at all, and that failure mode is an outage
+/// for whoever runs it. Enable it after confirming the clients your users
+/// actually run, not on the assumption that all of them behave.
+///
+/// The scripted clients in this repo's own e2e suite do not answer, which is a
+/// fair illustration of both the value and the risk.
+pub(crate) fn registration_challenge_enabled() -> bool {
+    matches!(
+        std::env::var("CHONKLINE_REG_CHALLENGE").unwrap_or_default().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// How long a connection may stay unregistered. Real clients complete the
 /// NICK/USER pairing in milliseconds; this only ever catches abandoned or
 /// deliberately idle sockets. Tunable for tests via CHONKLINE_REG_TIMEOUT_SECS.
@@ -708,6 +747,46 @@ pub fn liveness_tick(state: &Arc<Mutex<ServerState>>) {
             send_to(&stg, id, &line);
             stg.ping_outstanding.insert(id, now);
         }
+    }
+}
+
+/// Turn the tick's aggregated counters into server notices for operators.
+///
+/// Thresholded rather than per-event: a flood must not become a notice flood,
+/// which is the same reason the counters are aggregated in the first place. The
+/// thresholds are set so ordinary background noise stays silent and a genuine
+/// incident speaks up on the first tick.
+pub fn broadcast_counter_snotes(state: &Arc<Mutex<ServerState>>, totals: &[(String, String, u64)]) {
+    fn threshold(name: &str) -> u64 {
+        match name {
+            "conn.banned" => 1,        // any ban hit is worth seeing
+            "flood" => 3,
+            "proxy.rejected" | "proxy.unknown" => 5,
+            "conn.refused" => 10,
+            "session.new" => 20,       // a registration burst is the drone-flood signature
+            "reg.timeout" => 20,
+            "output.dropped" => 50,
+            _ => u64::MAX,             // unknown counters stay silent
+        }
+    }
+
+    let notices: Vec<String> = totals
+        .iter()
+        .filter(|(name, _, count)| *count >= threshold(name))
+        .map(|(name, detail, count)| {
+            if detail.is_empty() {
+                format!("{} x{} in the last interval", name, count)
+            } else {
+                format!("{} x{} in the last interval ({})", name, count, detail)
+            }
+        })
+        .collect();
+    if notices.is_empty() {
+        return;
+    }
+    let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
+    for n in notices {
+        crate::cmds::snote(&mut stg, &n);
     }
 }
 

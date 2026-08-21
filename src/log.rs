@@ -187,7 +187,11 @@ pub fn flood(action: &str) {
 }
 
 /// Emit and clear the accumulated counters. Called on the liveness tick.
-pub fn flush_counters() {
+///
+/// Returns the flushed totals so the caller can also surface them in-band as
+/// server notices -- the log alone is not a detection channel, because nobody
+/// is watching it during an incident.
+pub fn flush_counters() -> Vec<(String, String, u64)> {
     let taken = {
         let mut guard = match COUNTS.lock() {
             Ok(g) => g,
@@ -195,15 +199,18 @@ pub fn flush_counters() {
         };
         match guard.as_mut() {
             Some(m) if !m.is_empty() => std::mem::take(m),
-            _ => return,
+            _ => return Vec::new(),
         }
     };
+    let mut out = Vec::with_capacity(taken.len());
     for (key, count) in taken {
         let mut parts = key.splitn(2, ' ');
-        let name = parts.next().unwrap_or("event");
-        let detail = parts.next().unwrap_or("");
-        event(WARN, name, &[("detail", detail), ("count", &count.to_string())]);
+        let name = parts.next().unwrap_or("event").to_string();
+        let detail = parts.next().unwrap_or("").to_string();
+        event(WARN, &name, &[("detail", &detail), ("count", &count.to_string())]);
+        out.push((name, detail, count));
     }
+    out
 }
 
 /// Periodic aggregate state, at a low cadence, so a quiet log still shows the

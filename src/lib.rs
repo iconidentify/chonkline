@@ -173,7 +173,10 @@ pub async fn serve(addr: SocketAddr, cfg: Config) -> std::io::Result<(SocketAddr
                     ops::liveness_tick(&state);
                     // Aggregated refusal/flood counters surface here rather than
                     // one line per event, so a flood cannot flood the log.
-                    log::flush_counters();
+                    let totals = log::flush_counters();
+                    // The log is not a detection channel during an incident;
+                    // surface the same totals in-band to operators on +s.
+                    ops::broadcast_counter_snotes(&state, &totals);
                     if let Ok(stg) = state.lock() {
                         log::heartbeat(stg.user_count(), stg.chan_count(), stg.sources.active_total(), stg.sources.tracked_sources());
                     }

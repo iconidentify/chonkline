@@ -125,6 +125,27 @@ The exemption list is empty by default. It exists for deployments that still
 front the daemon with a local terminator unable to emit a header; such peers
 necessarily share one cloak, since their real address never arrives.
 
+### Anti-bot challenge
+
+| Env var                     | Default   | Meaning                                  |
+|-----------------------------|-----------|------------------------------------------|
+| `CHONKLINE_REG_CHALLENGE`   | *(off)*   | Require a PONG before registration completes |
+| `CHONKLINE_REG_TIMEOUT_SECS`| `60`      | Drop connections that never register     |
+
+With the challenge on, the server sends a `PING` once `NICK` and `USER` are both
+present and completes registration only after any `PONG`. Every mainstream
+client answers automatically, so real users never see it, while a scripted flood
+that blasts `NICK`/`USER`/`JOIN` without reading the socket never registers.
+
+It is **opt-in** on purpose. A client that does not answer cannot connect at
+all, and that failure mode is an outage for whoever runs it — enable it after
+confirming the clients your users actually run. This repo's own scripted e2e
+clients do not answer, which illustrates both the value and the risk.
+
+Any `PONG` is accepted rather than a matching token: matching adds nothing
+against a bot that reads the socket, and only risks breaking a client that
+echoes the token oddly.
+
 ### Limits
 
 | Env var                    | Default | Meaning                                          |
@@ -135,6 +156,17 @@ necessarily share one cloak, since their real address never arrives.
 | `IRC_MAX_MESSAGES_PER_10S` | `60`    | Aggregate messages per 10s from one address      |
 | `IRC_MAX_FLOOD_VIOLATIONS` | `10`    | Budget violations tolerated before disconnect    |
 | `IRC_LIMIT_EXEMPT`         | *(none)*| Comma-separated address patterns exempt from limits |
+
+Per-source bounds key on the **network block**, not the exact address: an IPv6
+/64 is the smallest block routinely assigned to one customer, so keying on the
+full address would let one customer mint effectively unlimited distinct sources
+and defeat every per-source bound. IPv4 keys on the whole address. Cloaks and
+logs always use the exact address, so attribution is unaffected.
+
+`PRIVMSG`/`NOTICE` accept at most 4 distinct targets per line (`TARGMAX`), and
+duplicate targets collapse to one delivery. Both flood tiers charge per input
+line, so an uncapped target list was a large amplifier that cost the sender a
+single unit of budget.
 
 `IRC_LIMIT_EXEMPT` accepts glob patterns (`10.2.*`), because the addresses that
 need exempting are infrastructure — load-balancer health checks and cluster
@@ -158,12 +190,26 @@ disconnected with `ERROR :Excess flood` rather than throttled indefinitely.
 |----------------------------------------|-----------------------------------------------|
 | `KILL <nick> [:reason]`                | Disconnect a user                             |
 | `KLINE <mask> [secs] [:reason]`        | Persistent address ban; `0`/omitted = forever |
+| `KILL <pattern> [:reason]`             | Mass kill by nick glob; never matches operators |
 | `UNKLINE <mask>`                       | Remove a ban by exact mask                    |
+| `STATS K`                              | List active K-lines                           |
+| `STATS I`                              | Live admission limits                         |
+| `STATS L`                              | Busiest sources by connection count           |
+| `MODE <nick> +s`                       | Receive server notices                        |
 
 K-line masks are globs (`*`, `?`) matched against the client's **real address**,
 never the cloak — a cloak match would ban every user at once behind a proxy that
 does not forward client addresses. Bans persist to `IRC_BANS_PATH` and survive a
 restart. Setting one also kills anyone already connected from a matching address.
+
+Operators are exempt from both flood tiers: incident response is bursty by
+nature, and being throttled to roughly three commands a second with no feedback
+made the response tools unusable at the moment they were needed.
+
+**Server notices** (`+s`) report operator actions, failed `OPER` attempts, and
+thresholded totals from each tick — connection refusals, flood disconnects,
+registration bursts, ban hits. They are aggregated rather than per-event, for
+the same reason the log is: a flood must not become a notice flood.
 
 Channel mode `+R` restricts a channel to clients authenticated to a services
 account. It is the one admission control that does not depend on trustworthy

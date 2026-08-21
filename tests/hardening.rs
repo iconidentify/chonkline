@@ -420,3 +420,60 @@ fn identical_targets_collapse_to_one_delivery() {
         "duplicate targets must collapse; saw another copy instead: {second:?}"
     );
 }
+
+#[test]
+fn operators_on_plus_s_receive_server_notices() {
+    // +s parsed, stored and rendered in RPL_UMODEIS, but nothing ever sent a
+    // notice -- so an operator had no in-band signal during an incident.
+    let addr = start_proxied_server();
+
+    let mut op = Client::new(&addr);
+    op.send("PROXY TCP4 203.0.113.96 10.0.0.1 48000 6667");
+    op.send("NICK watcher");
+    op.send("USER watcher 0 * :Watcher");
+    op.read_until(|l| l.contains(" 001 "));
+    op.send("OPER oper secret");
+    op.read_until(|l| l.contains(" 381 "));
+    op.send("MODE watcher +s");
+
+    // A second operator logging in is exactly the kind of event worth seeing.
+    let mut other = Client::new(&addr);
+    other.send("PROXY TCP4 203.0.113.97 10.0.0.1 48001 6667");
+    other.send("NICK secondop");
+    other.send("USER secondop 0 * :Second");
+    other.read_until(|l| l.contains(" 001 "));
+    other.send("OPER oper secret");
+
+    let notice = op.read_until(|l| l.contains("*** Notice"));
+    assert!(
+        notice.contains("secondop") && notice.contains("operator"),
+        "expected a server notice about the new operator: {notice:?}"
+    );
+}
+
+#[test]
+fn a_failed_oper_attempt_is_announced() {
+    let addr = start_proxied_server();
+
+    let mut op = Client::new(&addr);
+    op.send("PROXY TCP4 203.0.113.98 10.0.0.1 48002 6667");
+    op.send("NICK sentry");
+    op.send("USER sentry 0 * :Sentry");
+    op.read_until(|l| l.contains(" 001 "));
+    op.send("OPER oper secret");
+    op.read_until(|l| l.contains(" 381 "));
+    op.send("MODE sentry +s");
+
+    let mut attacker = Client::new(&addr);
+    attacker.send("PROXY TCP4 203.0.113.99 10.0.0.1 48003 6667");
+    attacker.send("NICK guesser");
+    attacker.send("USER guesser 0 * :Guesser");
+    attacker.read_until(|l| l.contains(" 001 "));
+    attacker.send("OPER oper wrongpassword");
+
+    let notice = op.read_until(|l| l.contains("*** Notice"));
+    assert!(
+        notice.contains("Failed OPER"),
+        "a failed OPER attempt must be announced: {notice:?}"
+    );
+}
