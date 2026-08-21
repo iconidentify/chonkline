@@ -81,6 +81,50 @@ commands back to back trips it and the symptom -- a join that never reaches the
 peer -- looks identical to a protocol bug. The harness paces itself for that
 reason.
 
+## Load and stress
+
+`stress.py` escalates: local load, connect/disconnect churn, the same load
+crossing the link, then a split under load. It reports measurements rather than
+pass/fail, because the interesting failures here are partial.
+
+```
+python3 stress.py --clients 80 --msgs 5 --link-clients 20
+```
+
+Last run, 80 local clients and 20 each side of the link:
+
+| | |
+|---|---|
+| local delivery | 31,600 of 31,600 (100%) |
+| cross-link delivery | 2,000 of 2,000 (100%) |
+| send rate sustained | ~46,000 messages/sec |
+| memory | 3.3 MB -> 9.3 MB peak |
+| churn | 240 connect/disconnect cycles, 0 failures, +0.6 MB |
+| after peer killed | survives, still usable |
+| server error lines | 0 |
+
+Two traps this harness fell into, both worth knowing before trusting a number
+from it:
+
+* **Verify preconditions before measuring.** An early run reported 0% cross-link
+  delivery, which read as a serious linking bug. The clients had never
+  registered. A stress test that does not check its own setup produces a
+  confident zero.
+* **Count what IRC actually sends.** A channel message is not echoed back to its
+  sender, so expecting every member to receive it makes a perfect run look like
+  a 1.7% loss.
+
+## Environment notes
+
+Both cost real time, and neither is a server fault:
+
+* **macOS Control Center listens on port 7000** (AirPlay Receiver). The InspIRCd
+  client port is 7010 here for that reason.
+* **Connection limits belong on `<connect>`, not `<class>`.** `<class>` is for
+  OPER classes. With the limits in the wrong block InspIRCd silently fell back to
+  its small defaults and reset every client after the first, which looked
+  exactly like a concurrency bug in the harness.
+
 ## The obligation this creates
 
 Skipping mode validation does not make the modes go away. InspIRCd still sends

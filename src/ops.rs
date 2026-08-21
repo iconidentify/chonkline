@@ -23,6 +23,10 @@ const REPLY_QUEUE: usize = 512;
 /// sustainable rate; bursts above six messages within two seconds have the
 /// excess lines silently dropped.
 const FLOOD_BURST: usize = 6;
+/// Delay added per over-budget line, and the ceiling it accumulates to. A
+/// client that stays over budget is paced rather than silently truncated.
+const FAKELAG_STEP: Duration = Duration::from_millis(300);
+const FAKELAG_MAX: Duration = Duration::from_millis(2000);
 /// Env-tunable (CHONKLINE_FLOOD_WINDOW_MS, default 2000ms) so the test suite can
 /// shrink it; production keeps the 2-second default.
 fn flood_window() -> Duration {
@@ -352,6 +356,7 @@ async fn run_reader<R>(
 {
     let mut buf: Vec<u8> = Vec::with_capacity(proto::MAX_LINE_WITH_CRLF * 2);
     let mut flood: VecDeque<Instant> = VecDeque::new();
+    let mut throttle = Duration::ZERO;
 
     loop {
         // 8 KiB, not 64 KiB. This array lives in the spawned future across the
@@ -382,7 +387,14 @@ async fn run_reader<R>(
             let content: Vec<u8> = buf[..pos].to_vec();
             buf.drain(..term_end);
 
-            if process_segment(&state, id, &mut flood, &content, &src) {
+            if !throttle.is_zero() {
+                // Pace the connection. This is inside the framing loop, so a
+                // burst arriving in one read is spread out rather than all
+                // processed at once.
+                tokio::time::sleep(throttle).await;
+                throttle = Duration::ZERO;
+            }
+            if process_segment(&state, id, &mut flood, &content, &src, &mut throttle) {
                 cleanup_on_eof(&state, id); // idempotent: no-ops when the session left cleanly via QUIT
                 return;
             }
@@ -419,11 +431,14 @@ fn process_segment(
     flood: &mut VecDeque<Instant>,
     seg: &[u8],
     src: &str,
+    throttle: &mut Duration,
 ) -> bool {
     if seg.is_empty() {
         // Still charged: a stream of bare newlines is real framing work, and
         // uncharged it consumed CPU indefinitely without ever being throttled.
-        charge_burst(flood);
+        if charge_burst(flood) {
+            *throttle = (*throttle + FAKELAG_STEP).min(FAKELAG_MAX);
+        }
         return false;
     }
     let text = String::from_utf8_lossy(seg);
@@ -432,10 +447,12 @@ fn process_segment(
         // framing work, so they must be charged. Uncharged, a stream of
         // malformed lines was never throttled and never disconnected the sender.
         None => {
-            charge_burst(flood);
+            if charge_burst(flood) {
+                *throttle = (*throttle + FAKELAG_STEP).min(FAKELAG_MAX);
+            }
             false
         }
-        Some(cmd) => route(state, id, flood, &cmd, src),
+        Some(cmd) => route(state, id, flood, &cmd, src, throttle),
     }
 }
 
@@ -448,6 +465,7 @@ fn route(
     flood: &mut VecDeque<Instant>,
     cmd: &proto::Command,
     src: &str,
+    throttle: &mut Duration,
 ) -> bool {
     if cmd.name.len() == 3 && cmd.name.chars().all(|c| c.is_ascii_digit()) {
         return false; // numeric replies from clients are dropped (RFC 2.4)
@@ -488,8 +506,16 @@ fn route(
         // which is exactly how a CTCP reflection flood removes its victim.
         let liveness_cmd = matches!(cmd.name.as_str(), "PING" | "PONG");
         if over_burst && !liveness_cmd && !is_oper {
-            crate::log::flood("dropped");
-            return false;
+            // Fakelag: delay the connection rather than discard the command.
+            //
+            // Dropping silently loses real work with no feedback -- a client
+            // joining several channels quickly had joins vanish, and the
+            // symptom was indistinguishable from a protocol fault. Delaying
+            // throttles a flood just as effectively while keeping every
+            // command, and a genuinely abusive connection is still closed by
+            // the aggregate budget below.
+            *throttle = (*throttle + FAKELAG_STEP).min(FAKELAG_MAX);
+            crate::log::flood("throttled");
         }
 
         // Tier 2: the per-source aggregate budget. Without this, spreading

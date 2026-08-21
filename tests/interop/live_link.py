@@ -10,7 +10,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 CHONK = os.path.join(ROOT, "target", "release", "irc-server")
 
-INSP_CLIENT, INSP_LINK = 7000, 7001
+INSP_CLIENT, INSP_LINK = 7010, 7001
 CHONK_CLIENT = 7100
 
 def reader(sock, store, stop):
