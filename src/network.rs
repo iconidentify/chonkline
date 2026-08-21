@@ -164,6 +164,38 @@ impl Network {
         self.servers.len()
     }
 
+    /// As `split_server`, but returns the full user records so the caller can
+    /// announce each departure to local clients before they are forgotten.
+    pub fn split_server_detailed(&mut self, sid: &str) -> Vec<RemoteUser> {
+        let uuids = self.collect_subtree_users(sid);
+        uuids.iter().filter_map(|u| self.remove_user(u)).collect()
+    }
+
+    /// UUIDs behind `sid`, removing the servers themselves.
+    fn collect_subtree_users(&mut self, sid: &str) -> Vec<String> {
+        let mut gone = vec![sid.to_string()];
+        loop {
+            let next: Vec<String> = self
+                .servers
+                .values()
+                .filter(|s| gone.contains(&s.via) && !gone.contains(&s.sid))
+                .map(|s| s.sid.clone())
+                .collect();
+            if next.is_empty() {
+                break;
+            }
+            gone.extend(next);
+        }
+        for s in &gone {
+            self.servers.remove(s);
+        }
+        self.users
+            .values()
+            .filter(|u| gone.contains(&u.sid))
+            .map(|u| u.uuid.clone())
+            .collect()
+    }
+
     /// Remove a server and everything behind it, returning the UUIDs of every
     /// user lost. A split takes the whole subtree, not just the neighbour.
     pub fn split_server(&mut self, sid: &str) -> Vec<String> {
@@ -400,5 +432,42 @@ mod tests {
         let sids = n.sids_in_channel("#test");
         assert!(sids.contains("1IN"));
         assert!(!sids.contains("3IN"), "a server with no member must not be sent the message");
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn user(uuid: &str, sid: &str, nick: &str) -> RemoteUser {
+        RemoteUser {
+            uuid: uuid.into(), sid: sid.into(), nick: nick.into(),
+            nick_key: nick.to_lowercase(), user: "u".into(), host: "h".into(),
+            real_host: "h".into(), realname: "r".into(), ts: 1, modes: "+".into(),
+            chans: BTreeSet::new(), away: None, oper: false,
+        }
+    }
+
+    #[test]
+    fn a_detailed_split_returns_records_for_announcing() {
+        let mut n = Network::new("2CH");
+        n.add_server(RemoteServer { sid: "1IN".into(), name: "a".into(), desc: String::new(), hop: 1, via: "1IN".into(), bursting: false });
+        n.add_server(RemoteServer { sid: "3IN".into(), name: "b".into(), desc: String::new(), hop: 2, via: "1IN".into(), bursting: false });
+        let mut far = user("3INAAAAAA", "3IN", "two");
+        far.chans.insert("#hop".into());
+        n.add_user(far);
+        n.add_user(user("1INAAAAAA", "1IN", "one"));
+
+        // Splitting the FAR server must take only its users.
+        let lost = n.split_server_detailed("3IN");
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].nick, "two", "records carry enough to announce a quit");
+        assert!(lost[0].chans.contains("#hop"), "and the channels they were in");
+        assert!(n.by_nick("one").is_some(), "the nearer server is untouched");
+
+        // Splitting the near one now takes what remains.
+        let lost = n.split_server_detailed("1IN");
+        assert_eq!(lost.len(), 1);
+        assert_eq!(n.server_count(), 0);
     }
 }

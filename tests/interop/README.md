@@ -125,16 +125,55 @@ Both cost real time, and neither is a server fault:
   its small defaults and reset every client after the first, which looked
   exactly like a concurrency bug in the harness.
 
+## Multi-server
+
+`multihop.py` builds `chonkline -- insp1 -- insp2` and drives traffic that must
+traverse the intermediate hop. `conf2/` is the second InspIRCd; `conf/` gains an
+`<autoconnect>` to it.
+
+```
+python3 multihop.py
+```
+
+Fourteen checks: the InspIRCd pair links; chonkline links to insp1; a user two
+hops away is visible and attributed to the correct server; channel traffic and
+private messages cross both ways through the intermediate; NAMES lists users
+from both remote servers; killing the far server removes only its users, leaves
+the nearer server's intact, and the near link keeps passing traffic.
+
+Two bugs this found that a single-peer test cannot reach:
+
+* **A relayed `SERVER` has a different shape from the handshake form.** On the
+  wire: `:1IN SERVER insp2.test 3IN hidden=0 :InspIRCd Link Test` -- no
+  password, no unused field, and optional `key=value` data after the SID. Taking
+  the SID by index picked up the description, so the far server was recorded
+  under a nonsense id and its users were attributed to nothing.
+
+* **A split removed users from the network table without telling local
+  clients.** They stayed in channel lists and NAMES output until the client
+  reconnected. Dropping the record is not the same as announcing the quit, and
+  an unannounced split just looks like the other side going quiet.
+
+The test also polls for the InspIRCd pair to finish linking rather than sleeping
+a fixed time. An unformed topology makes every later check fail for the wrong
+reason, which is how the first run reported twelve failures that were all one
+problem.
+
 ## Coverage
 
 `live_link_full.py` is the functional surface, twenty checks against a live
 InspIRCd 4.11.0:
 
 link established; remote joins seen; channel messages both ways; NAMES and WHOIS
-resolving remote users with their owning server; topic both ways; modes both
-ways; a mode chonkline does not implement not desyncing the link; private
-messages both ways; nick change; part; rejoin; quit; split detected; server
-survives the split; server usable after it.
+resolving remote users with their owning server; topic both ways; a remote `+o`
+grant; modes both ways; a mode chonkline does not implement not desyncing the
+link; private messages both ways; nick change; part; rejoin; quit; split
+detected; server survives the split; server usable after it.
+
+One behaviour worth knowing before reading a failure here: the channel InspIRCd
+bursts is `+nt`, so a non-op cannot set its topic. Once inbound modes are
+applied chonkline enforces that correctly, and a test that sets a topic without
+first granting op fails for the right reason.
 
 ## The obligation this creates
 

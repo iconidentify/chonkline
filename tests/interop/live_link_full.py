@@ -98,6 +98,13 @@ try:
     ci.clear(); cc.clear()
     ci.send("TOPIC #bridge :topic from inspircd")
     R["topic_insp_to_chonk"] = cc.wait("topic from inspircd", 6)
+    # The channel is +t (InspIRCd bursts +nt), so a non-op cannot set the topic
+    # -- and now that inbound modes are applied, chonkline correctly enforces
+    # that. Grant op across the link first, which also exercises remote +o.
+    ci.clear(); cc.clear()
+    ci.send("MODE #bridge +o chonkuser")
+    R["remote_op_grant"] = cc.wait("MODE", 6)
+    time.sleep(1)
     ci.clear(); cc.clear()
     cc.send("TOPIC #bridge :topic from chonkline")
     R["topic_chonk_to_insp"] = ci.wait("topic from chonkline", 6)
@@ -159,7 +166,7 @@ finally:
 print("=" * 62)
 order = ["link_up","insp_sees_remote_join","chan_chonk_to_insp","chan_insp_to_chonk",
          "names_shows_remote","whois_finds_remote","whois_names_their_server",
-         "topic_insp_to_chonk","topic_chonk_to_insp","mode_insp_to_chonk","survives_unknown_mode",
+         "topic_insp_to_chonk","remote_op_grant","topic_chonk_to_insp","mode_insp_to_chonk","survives_unknown_mode",
          "priv_chonk_to_insp","priv_insp_to_chonk","nick_propagates","part_propagates",
          "rejoin_propagates","quit_propagates","split_detected","chonkline_survives_split","usable_after_split"]
 for k in order:

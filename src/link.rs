@@ -234,12 +234,22 @@ impl LinkSession {
     }
 
     fn on_server(&mut self, cmd: &Command, source: &str) -> Vec<Event> {
-        // A prefixed SERVER introduces a server further out on the tree.
+        // A prefixed SERVER introduces a server further out on the tree. Its
+        // shape differs from the handshake form: there is no password and no
+        // unused field, and optional key=value data may follow the SID, e.g.
+        //   :1IN SERVER insp2.test 3IN hidden=0 :InspIRCd Link Test
+        // Reading the SID by index therefore picks up the description. Find the
+        // parameter that actually is a SID instead.
         if !source.is_empty() && self.peer_sid.is_some() {
-            // 1205: <name> <pass> <unused> <sid> :<desc>
             let name = cmd.params.first().cloned().unwrap_or_default();
-            let sid = cmd.params.get(3).cloned().unwrap_or_default();
-            let desc = cmd.params.get(4).cloned().unwrap_or_default();
+            let sid = cmd
+                .params
+                .iter()
+                .skip(1)
+                .find(|p| crate::network::valid_sid(p))
+                .cloned()
+                .unwrap_or_default();
+            let desc = cmd.params.last().cloned().unwrap_or_default();
             if sid.is_empty() {
                 return Vec::new();
             }
@@ -855,17 +865,30 @@ pub async fn run_session(
 
     // Teardown: the peer and everything behind it is gone.
     if let Some(sid) = registered_sid {
-        let lost = {
-            let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
-            stg.links.retain(|l| l.sid != sid);
-            stg.network.split_server(&sid)
-        };
-        crate::log::event(crate::log::WARN, "link.closed", &[("sid", &sid), ("users_lost", &lost.len().to_string())]);
         let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
-        crate::cmds::snote(&mut stg, &format!("Server {} split, {} users lost", sid, lost.len()));
+        stg.links.retain(|l| l.sid != sid);
+        let lost = announce_split(&mut stg, &sid, "Link closed");
+        crate::log::event(crate::log::WARN, "link.closed", &[("sid", &sid), ("users_lost", &lost.to_string())]);
     } else {
         crate::log::event(crate::log::WARN, "link.failed", &[("peer", &peer)]);
     }
+}
+
+/// Remove a server and everything behind it, telling local clients about every
+/// user that vanished.
+///
+/// Dropping them from the network table is not enough: a local client still has
+/// those users in its channel list and will keep showing them until it is told
+/// they quit. A split that is not announced looks to a user like the other side
+/// simply went quiet.
+fn announce_split(stg: &mut ServerState, sid: &str, reason: &str) -> usize {
+    let lost = stg.network.split_server_detailed(sid);
+    let count = lost.len();
+    for user in &lost {
+        crate::cmds::announce_remote_quit(stg, user, &format!("*.net *.split ({})", reason));
+    }
+    crate::cmds::snote(stg, &format!("Server {} split ({}), {} users lost", sid, reason, count));
+    count
 }
 
 /// Apply one protocol event to server state.
@@ -923,8 +946,7 @@ fn apply_event(state: &Arc<Mutex<ServerState>>, ev: Event) {
             }
         }
         Event::ServerSplit { sid, reason } => {
-            let lost = stg.network.split_server(&sid);
-            crate::cmds::snote(&mut stg, &format!("Server {} split ({}), {} users lost", sid, reason, lost.len()));
+            announce_split(&mut stg, &sid, &reason);
         }
         Event::BurstComplete => {
             crate::log::event(crate::log::INFO, "link.burst_complete", &[]);
@@ -1071,5 +1093,51 @@ mod protocol_extra_tests {
         assert!(ev.is_empty());
         assert!(s.take_outbound().is_empty(), "a PONG must not be answered");
         assert_ne!(s.phase, Phase::Dead);
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    fn cfg() -> LinkConfig {
+        LinkConfig { sid: "2CH".into(), name: "chonk.test".into(), desc: "d".into(),
+                     send_password: "pw".into(), recv_password: "pw".into() }
+    }
+    fn linked() -> LinkSession {
+        let mut s = LinkSession::new(cfg(), true);
+        s.begin();
+        s.take_outbound();
+        s.handle_line("SERVER insp.test pw 0 1IN :InspIRCd");
+        s.take_outbound();
+        s
+    }
+
+    #[test]
+    fn a_relayed_server_has_no_password_or_unused_field() {
+        // Observed on the wire from InspIRCd 4.11:
+        //   :1IN SERVER insp2.test 3IN hidden=0 :InspIRCd Link Test
+        // Reading the SID positionally picks up the description instead, and
+        // the far server is then recorded under a nonsense id -- which shows up
+        // much later as WHOIS attributing its users to nothing.
+        let mut s = linked();
+        match s.handle_line(":1IN SERVER insp2.test 3IN hidden=0 :InspIRCd Link Test").as_slice() {
+            [Event::ServerIntroduced { sid, name, via, desc }] => {
+                assert_eq!(sid, "3IN");
+                assert_eq!(name, "insp2.test");
+                assert_eq!(via, "1IN", "reached through the peer that introduced it");
+                assert_eq!(desc, "InspIRCd Link Test");
+            }
+            other => panic!("expected a server introduction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_relayed_server_without_extra_data_still_parses() {
+        let mut s = linked();
+        match s.handle_line(":1IN SERVER insp2.test 3IN :Some Description").as_slice() {
+            [Event::ServerIntroduced { sid, .. }] => assert_eq!(sid, "3IN"),
+            other => panic!("expected a server introduction, got {other:?}"),
+        }
     }
 }
