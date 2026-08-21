@@ -146,6 +146,43 @@ Any `PONG` is accepted rather than a matching token: matching adds nothing
 against a bot that reads the socket, and only risks breaking a client that
 echoes the token oddly.
 
+### Server linking
+
+chonkline speaks the InspIRCd spanning-tree protocol and can join an InspIRCd
+network as a peer. Off unless `IRC_SID` is set.
+
+| Env var             | Default   | Meaning                                       |
+|---------------------|-----------|-----------------------------------------------|
+| `IRC_SID`           | *(off)*   | This server's id, `[0-9][A-Z0-9]{2}`          |
+| `IRC_LINK_PORT`     | *(none)*  | Listen for inbound links                      |
+| `IRC_LINK_PEERS`    | *(none)*  | `host:port[:fingerprint]`, comma separated    |
+| `IRC_LINK_PASSWORD` | *(empty)* | Shared with the peer's `<link>` block         |
+| `IRC_LINK_TLS`      | *(off)*   | TLS for links (use it off loopback)           |
+
+Protocol 1205 is offered, which InspIRCd v3 and v4 both accept, so one build
+links to either.
+
+**Transport.** Set `IRC_LINK_TLS=1` for anything that is not loopback: a link
+otherwise carries every user's traffic and the link password in the clear. Peers
+are authenticated by pinning a SHA-256 certificate fingerprint rather than by a
+CA chain, because certificates on server links are routinely self-signed and
+there is no authority to appeal to. An outbound peer given no pin is refused --
+an unauthenticated TLS link is encrypted against an observer and wide open to
+whoever answers that address. The server logs its own fingerprint as
+`link.fingerprint` at startup; that is what the other operator needs.
+
+**Modes.** chonkline never advertises `CAPAB CHANMODES`, `USERMODES` or
+`EXTBANS`. InspIRCd compares those only when a peer sends them, so staying quiet
+is what lets a smaller mode set link at all; sending a set that differs is
+refused. Modes it does not implement still arrive, and are stored per channel
+and reported rather than dropped, because dropping one the peer believes is set
+is a silent divergence.
+
+**Interoperability testing** lives in `tests/interop/` and runs against a real
+InspIRCd: handshake and refusal probes, a twenty-one check functional suite, a
+three-server multi-hop topology, TLS links with a pinned fingerprint, and a load
+and stress harness.
+
 ### Limits
 
 | Env var                    | Default | Meaning                                          |

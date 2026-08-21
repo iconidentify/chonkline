@@ -178,3 +178,134 @@ mod tests {
         assert!(configured().is_none());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Server links
+// ---------------------------------------------------------------------------
+
+use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use tokio_rustls::rustls::pki_types::{ServerName, UnixTime};
+use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use tokio_rustls::TlsConnector;
+
+/// Verifies a peer by pinned SHA-256 certificate fingerprint.
+///
+/// Server links routinely use self-signed certificates, so a public CA chain is
+/// the wrong trust model: there is no authority to appeal to. Pinning the exact
+/// certificate is what InspIRCd does (`<link fingerprint="...">`) and is
+/// stronger than CA validation for this purpose -- it authenticates *that* peer
+/// rather than anyone a CA vouches for.
+#[derive(Debug)]
+struct PinnedCert {
+    expected: Vec<u8>,
+    provider: std::sync::Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedCert {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        let got = crate::crypto::sha256(end_entity.as_ref());
+        if got.as_slice() == self.expected.as_slice() {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(TlsError::General(format!(
+                "link certificate fingerprint mismatch: expected {}, got {}",
+                crate::crypto::hex(&self.expected),
+                crate::crypto::hex(&got)
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        tokio_rustls::rustls::crypto::verify_tls12_signature(
+            message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        tokio_rustls::rustls::crypto::verify_tls13_signature(
+            message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Parse a fingerprint written as hex, tolerating the colon-separated form
+/// people paste out of other tooling.
+pub fn parse_fingerprint(s: &str) -> Option<Vec<u8>> {
+    let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if clean.len() != 64 {
+        return None; // SHA-256 is 32 bytes
+    }
+    (0..32)
+        .map(|i| u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+/// Build a TLS connector for an outbound link.
+///
+/// Requires a pinned fingerprint. Refusing to connect without one is
+/// deliberate: an unauthenticated TLS link is encrypted against a passive
+/// observer but wide open to anyone who can answer on that address, and it
+/// carries the link password.
+pub fn link_connector(fingerprint: &str) -> Result<TlsConnector, String> {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let expected = parse_fingerprint(fingerprint)
+        .ok_or_else(|| "link fingerprint must be 64 hex characters (SHA-256)".to_string())?;
+    let provider = tokio_rustls::rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .ok_or_else(|| "no crypto provider installed".to_string())?;
+
+    let cfg = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(PinnedCert { expected, provider }))
+        .with_no_client_auth();
+    Ok(TlsConnector::from(std::sync::Arc::new(cfg)))
+}
+
+/// SHA-256 fingerprint of our own certificate, for an operator to hand to the
+/// other side. Printed at startup when link TLS is on.
+pub fn own_fingerprint(cert_path: &str) -> Option<String> {
+    let pem = std::fs::read_to_string(cert_path).ok()?;
+    let der = pem_blocks(&pem, "CERTIFICATE").into_iter().next()?;
+    Some(crate::crypto::hex(&crate::crypto::sha256(&der)))
+}
+
+#[cfg(test)]
+mod link_tls_tests {
+    use super::*;
+
+    #[test]
+    fn fingerprints_parse_in_both_common_forms() {
+        let plain = "a".repeat(64);
+        assert!(parse_fingerprint(&plain).is_some());
+        let colons = (0..32).map(|_| "aa").collect::<Vec<_>>().join(":");
+        assert_eq!(parse_fingerprint(&colons).map(|v| v.len()), Some(32));
+        assert!(parse_fingerprint("tooshort").is_none());
+        assert!(parse_fingerprint(&"a".repeat(63)).is_none());
+    }
+
+    #[test]
+    fn a_connector_needs_a_valid_fingerprint() {
+        assert!(link_connector("nonsense").is_err(),
+            "refusing without a usable pin is the point: an unauthenticated link carries the password");
+        assert!(link_connector(&"ab".repeat(32)).is_ok());
+    }
+}

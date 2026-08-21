@@ -3,3 +3,4 @@
 tests/interop/logs/
 tests/interop/data/
 tests/interop/*.log
+tests/interop/linkcert.*

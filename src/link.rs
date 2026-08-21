@@ -750,6 +750,24 @@ pub fn configured() -> Option<(LinkConfig, Option<u16>, Vec<String>)> {
     Some((cfg, listen, peers))
 }
 
+/// Whether inbound links should expect TLS (IRC_LINK_TLS=1).
+fn link_tls_enabled() -> bool {
+    matches!(
+        std::env::var("IRC_LINK_TLS").unwrap_or_default().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn clone_cfg(c: &LinkConfig) -> LinkConfig {
+    LinkConfig {
+        sid: c.sid.clone(),
+        name: c.name.clone(),
+        desc: c.desc.clone(),
+        send_password: c.send_password.clone(),
+        recv_password: c.recv_password.clone(),
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -758,16 +776,18 @@ fn now_secs() -> u64 {
 }
 
 /// Drive one link to completion over an established stream.
-pub async fn run_session(
+pub async fn run_session<S>(
     state: Arc<Mutex<ServerState>>,
-    stream: TcpStream,
+    stream: S,
+    peer: String,
     cfg: LinkConfig,
     outbound_link: bool,
-) {
-    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let our_sid = cfg.sid.clone();
     let mut session = LinkSession::new(cfg, outbound_link);
-    let (rd, mut wr) = stream.into_split();
+    let (rd, mut wr) = tokio::io::split(stream);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(LINK_QUEUE);
 
     tokio::spawn(async move {
@@ -793,6 +813,7 @@ pub async fn run_session(
     session.begin();
     flush(&mut session, &tx);
     crate::log::event(crate::log::INFO, "link.open", &[("peer", &peer), ("dir", if outbound_link { "out" } else { "in" })]);
+    let peer = peer.clone();
 
     let mut lines = BufReader::new(rd).lines();
     let mut registered_sid: Option<String> = None;
@@ -967,37 +988,89 @@ pub async fn serve_links(state: Arc<Mutex<ServerState>>, port: u16, cfg: LinkCon
             return;
         }
     };
-    crate::log::event(crate::log::INFO, "link.listening", &[("port", &port.to_string())]);
+    // Links carry every user's traffic and the link password, so TLS is the
+    // expected transport between servers on anything but a loopback test.
+    let tls_acceptor = if link_tls_enabled() {
+        match crate::tls::configured() {
+            Some((_, cert, key)) => match crate::tls::acceptor_from_files(&cert, &key) {
+                Ok(a) => {
+                    if let Some(fp) = crate::tls::own_fingerprint(&cert) {
+                        crate::log::event(crate::log::INFO, "link.fingerprint", &[("sha256", &fp)]);
+                    }
+                    Some(a)
+                }
+                Err(e) => {
+                    crate::log::event(crate::log::ERROR, "link.tls_config_failed", &[("error", &e)]);
+                    None
+                }
+            },
+            None => {
+                crate::log::event(crate::log::ERROR, "link.tls_no_cert", &[]);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    crate::log::event(crate::log::INFO, "link.listening",
+        &[("port", &port.to_string()), ("tls", if tls_acceptor.is_some() { "yes" } else { "no" })]);
     loop {
         let (sock, _) = match listener.accept().await {
             Ok(p) => p,
             Err(_) => continue,
         };
         let st = state.clone();
-        let c = LinkConfig {
-            sid: cfg.sid.clone(),
-            name: cfg.name.clone(),
-            desc: cfg.desc.clone(),
-            send_password: cfg.send_password.clone(),
-            recv_password: cfg.recv_password.clone(),
-        };
-        tokio::spawn(async move { run_session(st, sock, c, false).await });
+        let c = clone_cfg(&cfg);
+        let acceptor = tls_acceptor.clone();
+        let addr = sock.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+        tokio::spawn(async move {
+            match acceptor {
+                Some(acc) => match acc.accept(sock).await {
+                    Ok(tls) => run_session(st, tls, addr, c, false).await,
+                    Err(_) => crate::log::counted("link.tls_handshake_failed", &addr),
+                },
+                None => run_session(st, sock, addr, c, false).await,
+            }
+        });
     }
 }
 
 /// Keep an outbound link to `peer` up, retrying with a fixed backoff.
 pub async fn maintain_peer(state: Arc<Mutex<ServerState>>, peer: String, cfg: LinkConfig) {
+    // A peer is "host:port" or "host:port:fingerprint". The fingerprint pins the
+    // far side's certificate; without one an outbound TLS link is encrypted but
+    // unauthenticated, which is not much use when it carries the password.
+    let (addr, fingerprint) = match peer.rsplit_once(':') {
+        Some((head, tail)) if tail.len() >= 32 && !tail.chars().all(|c| c.is_ascii_digit()) => {
+            (head.to_string(), Some(tail.to_string()))
+        }
+        _ => (peer.clone(), None),
+    };
     loop {
-        match TcpStream::connect(&peer).await {
+        match TcpStream::connect(&addr).await {
             Ok(sock) => {
-                let c = LinkConfig {
-                    sid: cfg.sid.clone(),
-                    name: cfg.name.clone(),
-                    desc: cfg.desc.clone(),
-                    send_password: cfg.send_password.clone(),
-                    recv_password: cfg.recv_password.clone(),
-                };
-                run_session(state.clone(), sock, c, true).await;
+                let c = clone_cfg(&cfg);
+                match fingerprint.as_deref() {
+                    Some(fp) => match crate::tls::link_connector(fp) {
+                        Ok(connector) => {
+                            // The name is irrelevant to a pinned verifier, but
+                            // rustls requires one.
+                            let sni = tokio_rustls::rustls::pki_types::ServerName::try_from("link.invalid")
+                                .expect("literal name");
+                            match connector.connect(sni, sock).await {
+                                Ok(tls) => run_session(state.clone(), tls, addr.clone(), c, true).await,
+                                Err(e) => {
+                                    crate::log::event(crate::log::ERROR, "link.tls_failed",
+                                        &[("peer", &addr), ("error", &e.to_string())]);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            crate::log::event(crate::log::ERROR, "link.tls_config_failed", &[("error", &e)]);
+                        }
+                    },
+                    None => run_session(state.clone(), sock, addr.clone(), c, true).await,
+                }
             }
             Err(e) => {
                 crate::log::counted("link.connect_failed", &peer);
