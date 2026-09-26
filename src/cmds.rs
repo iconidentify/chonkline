@@ -8,6 +8,16 @@ const MAX_USER_LEN: usize = 10;
 const MAX_TARGETS: usize = 4;
 use crate::state::{norm_nick, ServerState};
 
+/// Identity fold for channel names, masks and keys. Same mapping as `norm_nick`.
+trait Rfc1459Fold {
+    fn fold_rfc1459(&self) -> String;
+}
+impl Rfc1459Fold for str {
+    fn fold_rfc1459(&self) -> String {
+        norm_nick(self)
+    }
+}
+
 /// Route a parsed command against the locked state. Returns true when the
 /// session must be closed afterwards (QUIT/ERROR paths). All replies flow to
 /// the sender's reply queue through `deliver`, which is safe under the lock.
@@ -419,15 +429,60 @@ fn deliver(stg: &mut ServerState, id: usize, line: &str) {
     }
 }
 
-/// Deliver a user-visible event line, prepending an IRCv3 `@time=` tag for
-/// recipients that negotiated `server-time`. Used for every relayed message and
-/// membership event so bouncers and loggers get accurate timestamps.
+/// Connection id of the user named by a relayed line's `nick!user@host` prefix.
+/// A `NICK` line still carries the pre-rename nick, so that command falls back
+/// to the user@host which did not change.
+fn sender_id_from_line(stg: &ServerState, base_line: &str) -> Option<usize> {
+    let rest = base_line.strip_prefix(':')?;
+    let (nick, rest) = rest.split_once('!')?;
+    let (user, hostpart) = rest.split_once('@')?;
+    let host = hostpart.split_whitespace().next().unwrap_or("");
+    if let Some(u) = stg.lookup(&norm_nick(nick)) {
+        return Some(u.id);
+    }
+    let verb = base_line.split_whitespace().nth(1).unwrap_or("");
+    if verb == "NICK" {
+        return stg.each_user().find(|u| u.user == user && u.host == host).map(|u| u.id);
+    }
+    None
+}
+
+/// Deliver a user-visible event line, adding the tags this recipient negotiated.
+/// `server-time` adds `@time=`. A recipient with `message-tags` also receives
+/// `bot` when the sender has user mode +B, and `account` (or `account=*`) when
+/// they negotiated `account-tag`.
 fn relay_tagged(stg: &mut ServerState, target_id: usize, base_line: &str) {
-    let with_time = stg.find_by_id(target_id).map(|u| u.caps.server_time).unwrap_or(false);
-    if with_time {
-        deliver(stg, target_id, &format!("@time={} {}", proto::ircv3_timestamp(), base_line));
-    } else {
+    let (want_time, want_tags, want_account) = stg
+        .find_by_id(target_id)
+        .map(|u| (u.caps.server_time, u.caps.message_tags, u.caps.account_tag))
+        .unwrap_or((false, false, false));
+    let sender = sender_id_from_line(stg, base_line);
+    let (bot, account) = match sender.and_then(|sid| stg.find_by_id(sid)) {
+        Some(u) => (u.bot, Some(u.account.clone())),
+        None => (false, None),
+    };
+
+    let mut tags: Vec<String> = Vec::new();
+    if want_time {
+        tags.push(format!("time={}", proto::ircv3_timestamp()));
+    }
+    if want_tags && bot {
+        tags.push("bot".to_string());
+    }
+    // `account` is Some only when the line came from a real user. Logged-out
+    // users are `Some(None)` and are reported as `account=*`.
+    if want_tags && want_account {
+        if let Some(acct) = account {
+            match acct {
+                Some(name) => tags.push(format!("account={}", proto::escape_tag_value(&name))),
+                None => tags.push("account=*".to_string()),
+            }
+        }
+    }
+    if tags.is_empty() {
         deliver(stg, target_id, base_line);
+    } else {
+        deliver(stg, target_id, &format!("@{} {}", tags.join(";"), base_line));
     }
 }
 
@@ -810,8 +865,9 @@ const MOTD: &[&str] = &[
     "",
     "    *  TLS on port 6697, plaintext on 6667",
     "    *  SASL PLAIN authentication at connect time",
-    "    *  IRCv3: server-time, away-notify, extended-join,",
-    "              account-notify, multi-prefix",
+    "    *  IRCv3: message-tags, server-time, account-tag,",
+    "              away-notify, extended-join, account-notify,",
+    "              multi-prefix, bot mode (+B)",
     "    *  Your address is cloaked -- other users never see your IP",
     "",
     "  Services -- claim and protect your identity:",
@@ -847,9 +903,9 @@ fn welcome_sequence(stg: &mut ServerState, id: usize, _nick_snapshot_at_completi
     numeric(stg, id, "003", &["This server is continuously created"]);
     // RPL_MYINFO: servername, version, user modes, channel modes actually supported.
     let myinfo_srv = stg.name.clone();
-    numeric(stg, id, "004", &[&myinfo_srv, stg.version, "iow", "biklmnotv"]);
+    numeric(stg, id, "004", &[&myinfo_srv, stg.version, "iowB", "biklmnotv"]);
     // RPL_ISUPPORT: advertise only tokens the server genuinely honors.
-    numeric(stg, id, "005", &["CHANTYPES=#", "PREFIX=(ov)@+", "CHANMODES=beI,k,l,imntR", "STATUSMSG=@+", "EXCEPTS=e", "INVEX=I", "CASEMAPPING=rfc1459", "NICKLEN=30", "CHANNELLEN=50", "TOPICLEN=390", "TARGMAX=PRIVMSG:4,NOTICE:4", "NETWORK=Chonkbase", ":are supported by this server"]);
+    numeric(stg, id, "005", &["CHANTYPES=#", "PREFIX=(ov)@+", "CHANMODES=beI,k,l,imntR", "STATUSMSG=@+", "EXCEPTS=e", "INVEX=I", "CASEMAPPING=rfc1459", "BOT=B", "NICKLEN=30", "CHANNELLEN=50", "TOPICLEN=390", "TARGMAX=PRIVMSG:4,NOTICE:4", "NETWORK=Chonkbase", ":are supported by this server"]);
 
     let users = stg.user_count();
     let invis = stg.invis_count();
@@ -917,7 +973,7 @@ fn handle_join(stg: &mut ServerState, id: usize, cmd: &Command) {
         }
         let key = keys.as_ref().and_then(|ks| ks.get(idx)).map(String::as_str).unwrap_or("");
 
-        let chan_key_norm = raw.to_lowercase();
+        let chan_key_norm = raw.fold_rfc1459();
         let display = raw.to_string();
 
         if stg.chan(&chan_key_norm).is_some() {
@@ -1017,7 +1073,7 @@ fn join_existing(stg: &mut ServerState, id: usize, norm: &str, key: &str) {
 
     let chan_key_now: Option<String> = stg.chan(norm).and_then(|c| c.chan_key()).map(String::from);
     if let Some(ck) = chan_key_now {
-        if key.to_lowercase() != ck {
+        if key.fold_rfc1459() != ck {
             deliver_join_denied(stg, id, 475, &display); // RFC numeric 475 (+k)
             return;
         }
@@ -1098,7 +1154,7 @@ fn joiner_replies(stg: &mut ServerState, id: usize, display: &str) {
     let multi = stg.find_by_id(id).map(|u| u.caps.multi_prefix).unwrap_or(false);
     let uhin = stg.find_by_id(id).map(|u| u.caps.userhost_in_names).unwrap_or(false);
     let mut nicks: Vec<String> = Vec::new();
-    if let Some(c) = stg.chan(&display.to_lowercase()) {
+    if let Some(c) = stg.chan(&display.fold_rfc1459()) {
         for mid in c.members.iter() {
             if let Some(u) = find_member_by_id(stg, *mid) {
                 let marker = if multi { c.all_markers(*mid) } else { c.marker(*mid).to_string() };
@@ -1106,9 +1162,9 @@ fn joiner_replies(stg: &mut ServerState, id: usize, display: &str) {
             }
         }
     }
-    nicks.extend(remote_names(stg, &display.to_lowercase()));
+    nicks.extend(remote_names(stg, &display.fold_rfc1459()));
     let listing: String = nicks.join(" ");
-    let sym = stg.chan(&display.to_lowercase()).map(names_symbol).unwrap_or("=");
+    let sym = stg.chan(&display.fold_rfc1459()).map(names_symbol).unwrap_or("=");
     numeric(stg, id, "353", &[sym, display, &format!(":{}", listing)]); // RFC 353: =/*/@ visibility symbol then channel
     numeric(stg, id, "366", &[display, "End of /NAMES list"]); // RFC numeric 366
 }
@@ -1173,7 +1229,7 @@ fn handle_part(stg: &mut ServerState, id: usize, cmd: &Command) {
     let reason: Option<&str> = if cmd.params.len() > 1 { Some(cmd.params[1].as_str()) } else { None };
 
     for raw in list.split(',').filter(|c| !c.is_empty()) {
-        let norm = raw.to_lowercase();
+        let norm = raw.fold_rfc1459();
         if stg.chan(&norm).is_none() {
             deliver_nosuch_channel(stg, id, raw); // RFC numeric 403
             continue;
@@ -1227,7 +1283,7 @@ fn deliver_chanop_privs_needed(stg: &mut ServerState, id: usize, chan: &str) {
 /// (333, who set it and when) when a topic is present, else RPL_NOTOPIC (331).
 /// Clients such as WeeChat rely on 333 to render "topic set by X at T".
 fn send_topic_state(stg: &mut ServerState, id: usize, display: &str) {
-    let key = display.to_lowercase();
+    let key = display.fold_rfc1459();
     let (topic, setter, time) = match stg.chan(&key) {
         Some(c) => (c.topic.clone(), c.topic_setter.clone(), c.topic_time),
         None => (String::new(), String::new(), 0),
@@ -1250,7 +1306,7 @@ fn handle_topic(stg: &mut ServerState, id: usize, cmd: &Command) {
         deliver_need_more_params(stg, id, "TOPIC");
         return;
     };
-    let norm = raw.to_lowercase();
+    let norm = raw.fold_rfc1459();
 
     if stg.chan(&norm).is_none() {
         deliver_nosuch_channel(stg, id, raw); // RFC numeric 403
@@ -1330,7 +1386,7 @@ fn handle_mode(stg: &mut ServerState, id: usize, cmd: &Command) {
 /// place; key/limit/ban/member-privilege terms consume following tokens for their
 /// targets. Member-privilege changes broadcast with the acting operator's prefix.
 fn mode_channel(stg: &mut ServerState, id: usize, raw: &str, terms_in: &[String]) {
-    let norm = raw.to_lowercase();
+    let norm = raw.fold_rfc1459();
 
     if stg.chan(&norm).is_none() {
         deliver_nosuch_channel(stg, id, raw); // RFC numeric 403
@@ -1610,7 +1666,7 @@ fn deliver_user_not_in_channel(stg: &mut ServerState, id: usize, nick: &str, cha
 /// answering a bare channel-mode query: channel + mode string first, then one
 /// banid line each, closed by the end-of-ban-list reply.
 fn mode_channel_query(stg: &mut ServerState, id: usize, raw: &str) {
-    let norm = raw.to_lowercase();
+    let norm = raw.fold_rfc1459();
     // Scalars first, so no shared channel borrow outlives the reply deliveries.
     let Some(ms) = stg.chan(&norm).map(|c| c.mode_string()) else { return };
     let is_member = stg.chan(&norm).map(|c| c.is_member(id)).unwrap_or(false);
@@ -1640,7 +1696,7 @@ fn mode_channel_query(stg: &mut ServerState, id: usize, raw: &str) {
 
 /// RPL_BANLIST (367) for each active ban, closed by RPL_ENDOFBANLIST (368).
 fn mode_ban_list(stg: &mut ServerState, id: usize, raw: &str) {
-    let norm = raw.to_lowercase();
+    let norm = raw.fold_rfc1459();
     let banmasks: Vec<String> = stg.chan(&norm).map(|c| c.ban_mask_list().to_vec()).unwrap_or_default();
     for mask in banmasks.iter() {
         numeric(stg, id, "367", &[raw, mask]); // RFC numeric 367: channel + banid
@@ -1650,7 +1706,7 @@ fn mode_ban_list(stg: &mut ServerState, id: usize, raw: &str) {
 
 /// RPL_EXCEPTLIST (348) per +e mask, closed by RPL_ENDOFEXCEPTLIST (349).
 fn mode_except_list(stg: &mut ServerState, id: usize, raw: &str) {
-    let norm = raw.to_lowercase();
+    let norm = raw.fold_rfc1459();
     let masks: Vec<String> = stg.chan(&norm).map(|c| c.except_mask_list().to_vec()).unwrap_or_default();
     for m in masks.iter() {
         numeric(stg, id, "348", &[raw, m]);
@@ -1660,7 +1716,7 @@ fn mode_except_list(stg: &mut ServerState, id: usize, raw: &str) {
 
 /// RPL_INVITELIST (346) per +I mask, closed by RPL_ENDOFINVITELIST (347).
 fn mode_invex_list(stg: &mut ServerState, id: usize, raw: &str) {
-    let norm = raw.to_lowercase();
+    let norm = raw.fold_rfc1459();
     let masks: Vec<String> = stg.chan(&norm).map(|c| c.invex_mask_list().to_vec()).unwrap_or_default();
     for m in masks.iter() {
         numeric(stg, id, "346", &[raw, m]);
@@ -1683,7 +1739,7 @@ fn handle_invite(stg: &mut ServerState, id: usize, cmd: &Command) {
         return;
     };
 
-    let norm = raw_chan.to_lowercase();
+    let norm = raw_chan.fold_rfc1459();
     if stg.chan(&norm).is_none() {
         deliver_nosuch_channel(stg, id, raw_chan); // RFC numeric 403
         return;
@@ -1739,9 +1795,10 @@ fn deliver_already_on_channel(stg: &mut ServerState, id: usize, chan: &str) {
 fn deliver_nosuch_nick(stg: &mut ServerState, id: usize, referenced: &str) {
     numeric(stg, id, "401", &[referenced, "No such nick/channel"]); // recipient token first via the shared chokepoint; the referenced name follows once, never duplicated into text
 }
-/// User-mode side (RFC 4.2.3.2): self-only mutations over i/s/w/o; "+o" is ignored
-/// per spec while "-o" may deop freely; unknown flags refuse with numeric-501 and
-/// queries answer via numeric-221 shape confirmation of the resulting state.
+/// User-mode side (RFC 4.2.3.2): self-only mutations over i/s/w/o/B; "+o" is ignored
+/// per spec while "-o" may deop freely; +B is the IRCv3 bot mode the client sets
+/// on itself. Unknown flags refuse with numeric-501 and queries answer via
+/// numeric-221 shape confirmation of the resulting state.
 fn mode_user(stg: &mut ServerState, id: usize, cmd: &Command, nick_param: &str) {
     let own = stg.find_by_id(id).map(|u| u.nick_key.clone());
     match (own.as_deref(), norm_nick(nick_param).as_str()) {
@@ -1764,7 +1821,7 @@ fn mode_user(stg: &mut ServerState, id: usize, cmd: &Command, nick_param: &str) 
         let on = matches!(term.as_bytes()[0], b'+');
         for ch in term[1..].chars() {
             match ch {
-                'i' | 's' | 'w' | 'o' => applied.push((ch, on)),
+                'i' | 's' | 'w' | 'o' | 'B' => applied.push((ch, on)),
                 _ => { deliver_501_for(stg, id, &ch.to_string()); return; } // RFC numeric 501
             }
         }
@@ -1776,6 +1833,7 @@ fn mode_user(stg: &mut ServerState, id: usize, cmd: &Command, nick_param: &str) 
                 'i' => u.invis = *on,
                 's' => u.srvnotice = *on,
                 'w' => u.wallop = *on,
+                'B' => u.bot = *on,
                 // "+o" self-elevation is ignored per spec; "-o" may deop freely.
                 'o' if !*on => u.oper = false,
                 _ => {}
@@ -1798,7 +1856,7 @@ fn handle_names(stg: &mut ServerState, id: usize, cmd: &Command) {
     };
 
     for raw in list.split(',').filter(|c| !c.is_empty()) {
-        let norm_key = raw.to_lowercase();
+        let norm_key = raw.fold_rfc1459();
         if stg.chan(&norm_key).is_none() {
             continue; // unknown channels are skipped silently per spec convention
         }
@@ -1847,7 +1905,7 @@ fn handle_list(stg: &mut ServerState, id: usize, cmd: &Command) {
     deliver_list_start(stg, id); // RFC numeric 321 bracket opens the enumeration
 
     let summaries: Vec<(String, String, Vec<usize>)> = stg.chans_iter().filter_map(|(_key, c)| {
-        if !crate::state::wildcard_match(mask, &c.display) && !crate::state::wildcard_match(&mask.to_lowercase(), &c.display.to_lowercase()) {
+        if !crate::state::wildcard_match(mask, &c.display) && !crate::state::wildcard_match(&mask.fold_rfc1459(), &c.display.fold_rfc1459()) {
             return None; // mask does not match this channel's display name
         }
         let hidden = (c.is_private() || c.is_secret()) && !c.is_member(id);
@@ -1890,7 +1948,7 @@ fn handle_kick(stg: &mut ServerState, id: usize, cmd: &Command) {
         deliver_need_more_params(stg, id, "KICK");
         return;
     };
-    let norm_key = raw_chan.to_lowercase();
+    let norm_key = raw_chan.fold_rfc1459();
 
     if stg.chan(&norm_key).is_none() {
         deliver_nosuch_channel(stg, id, raw_chan); // RFC numeric 403
@@ -2019,7 +2077,7 @@ fn handle_privmsg(stg: &mut ServerState, id: usize, cmd: &Command, is_priv: bool
     let mut seen: Vec<String> = Vec::with_capacity(MAX_TARGETS);
     let mut over = false;
     for raw in recips_raw.split(',').filter(|c| !c.is_empty()) {
-        let key = raw.to_lowercase();
+        let key = raw.fold_rfc1459();
         if seen.iter().any(|s| *s == key) {
             continue; // same target twice in one line is one delivery
         }
@@ -2175,7 +2233,7 @@ fn handle_chanserv(stg: &mut ServerState, id: usize, text: &str, is_priv: bool) 
                 chanserv_notice(stg, id, "Syntax: REGISTER #channel");
                 return;
             }
-            let key = chan.to_lowercase();
+            let key = chan.fold_rfc1459();
             if stg.chanreg.is_registered(&key) {
                 chanserv_notice(stg, id, &format!("\x02{}\x02 is already registered.", chan));
                 return;
@@ -2200,19 +2258,19 @@ fn handle_chanserv(stg: &mut ServerState, id: usize, text: &str, is_priv: bool) 
         }
         "DROP" => {
             let account = stg.find_by_id(id).and_then(|u| u.account.clone()).unwrap_or_default();
-            if !stg.chanreg.is_registered(&chan.to_lowercase()) {
+            if !stg.chanreg.is_registered(&chan.fold_rfc1459()) {
                 chanserv_notice(stg, id, "That channel is not registered.");
                 return;
             }
-            if !stg.chanreg.is_founder(&chan.to_lowercase(), &account) {
+            if !stg.chanreg.is_founder(&chan.fold_rfc1459(), &account) {
                 chanserv_notice(stg, id, "Only the channel founder may drop it.");
                 return;
             }
-            stg.chanreg.drop_channel(&chan.to_lowercase());
+            stg.chanreg.drop_channel(&chan.fold_rfc1459());
             chanserv_notice(stg, id, &format!("Channel \x02{}\x02 dropped.", chan));
         }
         "INFO" => {
-            match stg.chanreg.get(&chan.to_lowercase()) {
+            match stg.chanreg.get(&chan.fold_rfc1459()) {
                 Some(reg) => {
                     let (disp, founder) = (reg.display.clone(), reg.founder_display.clone());
                     chanserv_notice(stg, id, &format!("\x02{}\x02 -- founder: \x02{}\x02", disp, founder));
@@ -2449,7 +2507,7 @@ pub(crate) fn apply_remote_mode(stg: &mut ServerState, target: &str, ts: u64, mo
     if !valid_channel(target) {
         return; // user modes on remote users are their server's business
     }
-    let key = target.to_lowercase();
+    let key = target.fold_rfc1459();
     if stg.chan(&key).is_none() {
         return;
     }
@@ -2640,7 +2698,7 @@ fn deliver_to_server_mask(stg: &mut ServerState, id: usize, raw: &str, text: &st
 
     let host_now: String = raw[1..].to_string();
 
-    if !crate::state::wildcard_match(&host_now, &stg.prefix().to_lowercase()) {
+    if !crate::state::wildcard_match(&host_now, &stg.prefix().fold_rfc1459()) {
         if is_priv { deliver_nosuch_nick(stg, id, raw); }
         return;
     }
@@ -2682,7 +2740,7 @@ fn deliver_to_channel_status(
     text: &str,
     is_priv: bool,
 ) {
-    let norm = chan.to_lowercase();
+    let norm = chan.fold_rfc1459();
     if stg.chan(&norm).is_none() {
         if is_priv { deliver_nosuch_channel(stg, id, full_target); }
         return;
@@ -2712,7 +2770,7 @@ fn deliver_to_channel_status(
 }
 
 fn deliver_to_channel(stg: &mut ServerState, id: usize, raw: &str, text: &str, is_priv: bool) {
-    let norm_key: String = raw.to_lowercase();
+    let norm_key: String = raw.fold_rfc1459();
 
     if stg.chan(&norm_key).is_none() {
         if is_priv { deliver_nosuch_channel(stg, id, raw); }
@@ -2746,7 +2804,7 @@ fn split_user_at_host(token: &str) -> Option<(String, String)> {
     let at_now: Option<usize> = token.rfind('@');
 
     match at_now {
-        Some(at_idx) if at_idx > 0 && token[at_idx + 1..].len() > 0 => Some((token[..at_idx].to_lowercase(), token[at_idx + 1..].to_lowercase())),
+        Some(at_idx) if at_idx > 0 && token[at_idx + 1..].len() > 0 => Some((token[..at_idx].fold_rfc1459(), token[at_idx + 1..].fold_rfc1459())),
         _ => None,
     }
 }
@@ -2765,7 +2823,7 @@ fn deliver_to_userhost(
 ) {
 
     let candidates_now: Vec<usize> = stg.each_user()
-        .filter(|u| u.user.to_lowercase() == user_part_now && crate::state::wildcard_match(host_mask_now, &u.host.to_lowercase()))
+        .filter(|u| u.user.fold_rfc1459() == user_part_now && crate::state::wildcard_match(host_mask_now, &u.host.fold_rfc1459()))
         .map(|u| u.id)
 
         .collect::<Vec<usize>>();
@@ -2947,6 +3005,11 @@ fn handle_whois(stg: &mut ServerState, id: usize, cmd: &Command) {
                 numeric(stg, id, "313", &[&format!("{} is operating as an IRC Operator", nick_now)]);
             }
 
+            // RPL_WHOISBOT (335): the target has set IRCv3 bot mode (+B).
+            if stg.find_by_id(tid).map(|t| t.bot).unwrap_or(false) {
+                numeric(stg, id, "335", &[&nick_now, "is a bot"]);
+            }
+
 
             if let Some(note_now) = away_now.clone() {
                 numeric(stg, id, "301", &[&nick_now, &format!(":{}", note_now)]);
@@ -3029,7 +3092,7 @@ fn handle_who(stg: &mut ServerState, id: usize, cmd: &Command) {
 
     let Some(req_user_now) = stg.find_by_id(id) else { return; };
 
-    let masked_now: String = mask_raw_now.to_lowercase();
+    let masked_now: String = mask_raw_now.fold_rfc1459();
 
     let is_channel_name_now: bool = valid_channel(mask_raw_now);
 
@@ -3179,6 +3242,9 @@ fn who_marker_for(stg: &ServerState, req_id: usize, target: &crate::state::Cx) -
     if target.oper {
         flags.push('*');
     }
+    if target.bot {
+        flags.push('B');
+    }
 
     // Channel status on the first channel shared with the requester.
     let shared = stg.find_by_id(req_id).and_then(|req| {
@@ -3200,7 +3266,9 @@ fn who_marker_for(stg: &ServerState, req_id: usize, target: &crate::state::Cx) -
 /// that is not actually implemented.
 const SUPPORTED_CAPS: &[&str] = &[
     "sasl",
+    "message-tags",
     "server-time",
+    "account-tag",
     "away-notify",
     "extended-join",
     "account-notify",
@@ -3229,6 +3297,8 @@ fn set_cap(caps: &mut crate::state::Caps, name: &str, on: bool) {
         "chghost" => caps.chghost = on,
         "cap-notify" => caps.cap_notify = on,
         "sasl" => caps.sasl = on,
+        "message-tags" => caps.message_tags = on,
+        "account-tag" => caps.account_tag = on,
         _ => {}
     }
 }
@@ -3563,7 +3633,7 @@ fn to_local_members(stg: &mut ServerState, chan_key: &str, line: &str) {
 
 /// A remote user joined a channel: local members must see the JOIN.
 pub(crate) fn announce_remote_join(stg: &mut ServerState, chan: &str, uuid: &str) {
-    let key = chan.to_lowercase();
+    let key = chan.fold_rfc1459();
     if let Some(pfx) = remote_prefix(stg, uuid) {
         let line = proto::line(&pfx, "JOIN", chan);
         to_local_members(stg, &key, &line);
@@ -3571,7 +3641,7 @@ pub(crate) fn announce_remote_join(stg: &mut ServerState, chan: &str, uuid: &str
 }
 
 pub(crate) fn announce_remote_part(stg: &mut ServerState, chan: &str, uuid: &str, reason: &str) {
-    let key = chan.to_lowercase();
+    let key = chan.fold_rfc1459();
     if let Some(pfx) = remote_prefix(stg, uuid) {
         let tail = if reason.is_empty() { chan.to_string() } else { format!("{} :{}", chan, reason) };
         let line = proto::line(&pfx, "PART", &tail);
@@ -3607,7 +3677,7 @@ pub(crate) fn adopt_remote_channel(
     ts: u64,
     members: &[(String, String)],
 ) {
-    let key = chan.to_lowercase();
+    let key = chan.fold_rfc1459();
     let ours = stg.chan(&key).map(|c| c.created_at);
     match ours {
         Some(our_ts) if our_ts > ts => {
@@ -3636,7 +3706,7 @@ pub(crate) fn adopt_remote_channel(
 }
 
 pub(crate) fn adopt_remote_topic(stg: &mut ServerState, chan: &str, ts: u64, setter: &str, topic: &str) {
-    let key = chan.to_lowercase();
+    let key = chan.fold_rfc1459();
     if let Some(c) = stg.chan_mut(&key) {
         c.topic = topic.to_string();
         c.topic_setter = setter.to_string();
@@ -3660,7 +3730,7 @@ pub(crate) fn deliver_remote_message(
     let verb = if notice { "NOTICE" } else { "PRIVMSG" };
 
     if valid_channel(target) {
-        let key = target.to_lowercase();
+        let key = target.fold_rfc1459();
         let line = proto::line(&pfx, verb, &format!("{} :{}", target, text));
         to_local_members(stg, &key, &line);
         stg.note_message();

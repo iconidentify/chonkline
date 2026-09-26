@@ -5,7 +5,7 @@
 //! Format (one channel per line, tab-separated):
 //!   <key>\t<display>\t<founder>\t<base64 topic>
 //!
-//! `key` is the lowercased channel name; `founder` is the founder's account
+//! `key` is the rfc1459-folded channel name; `founder` is the founder's account
 //! display name (compared case-insensitively via nick folding).
 
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ pub struct ChanReg {
 
 pub struct ChannelRegistry {
     path: Option<String>,
-    map: HashMap<String, ChanReg>, // key = channel.to_lowercase()
+    map: HashMap<String, ChanReg>, // key = norm_nick(channel)
 }
 
 impl ChannelRegistry {
@@ -41,11 +41,11 @@ impl ChannelRegistry {
     }
 
     pub fn is_registered(&self, chan_key: &str) -> bool {
-        self.map.contains_key(&chan_key.to_lowercase())
+        self.map.contains_key(&norm_nick(chan_key))
     }
 
     pub fn get(&self, chan_key: &str) -> Option<&ChanReg> {
-        self.map.get(&chan_key.to_lowercase())
+        self.map.get(&norm_nick(chan_key))
     }
 
     pub fn count(&self) -> usize {
@@ -55,13 +55,13 @@ impl ChannelRegistry {
     /// True when `account` (any case) is the registered founder of the channel.
     pub fn is_founder(&self, chan_key: &str, account: &str) -> bool {
         self.map
-            .get(&chan_key.to_lowercase())
+            .get(&norm_nick(chan_key))
             .map(|r| norm_nick(&r.founder_display) == norm_nick(account))
             .unwrap_or(false)
     }
 
     pub fn register(&mut self, chan_key: &str, display: &str, founder_display: &str) -> Result<(), &'static str> {
-        let key = chan_key.to_lowercase();
+        let key = norm_nick(chan_key);
         if self.map.contains_key(&key) {
             return Err("channel already registered");
         }
@@ -78,7 +78,7 @@ impl ChannelRegistry {
     }
 
     pub fn drop_channel(&mut self, chan_key: &str) -> bool {
-        let removed = self.map.remove(&chan_key.to_lowercase()).is_some();
+        let removed = self.map.remove(&norm_nick(chan_key)).is_some();
         if removed {
             self.save();
         }
@@ -87,7 +87,7 @@ impl ChannelRegistry {
 
     /// Persist a new topic for a registered channel (no-op if unregistered).
     pub fn set_topic(&mut self, chan_key: &str, topic: &str) {
-        if let Some(reg) = self.map.get_mut(&chan_key.to_lowercase()) {
+        if let Some(reg) = self.map.get_mut(&norm_nick(chan_key)) {
             reg.topic = topic.to_string();
             self.save();
         }
@@ -116,14 +116,16 @@ impl ChannelRegistry {
 
 fn parse_line(line: &str) -> Option<(String, ChanReg)> {
     let mut it = line.split('\t');
-    let key = it.next()?.to_string();
+    let stored = it.next()?.to_string();
     let display = it.next()?.to_string();
     let founder_display = it.next()?.to_string();
     let topic = String::from_utf8(base64_decode(it.next()?)?).ok()?;
-    if key.is_empty() || founder_display.is_empty() {
+    if stored.is_empty() || display.is_empty() || founder_display.is_empty() {
         return None;
     }
-    Some((key, ChanReg { display, founder_display, topic }))
+    // Recompute the key from the display name so a file written before the
+    // rfc1459 fold still finds #foo{bar} under #foo[bar].
+    Some((norm_nick(&display), ChanReg { display, founder_display, topic }))
 }
 
 #[cfg(test)]
@@ -138,6 +140,9 @@ mod tests {
         assert!(r.is_founder("#rust", "alice"));
         assert!(!r.is_founder("#rust", "bob"));
         assert!(r.register("#RUST", "#RUST", "Bob").is_err()); // duplicate
+        assert!(r.register("#Foo[bar]", "#Foo[bar]", "Ann").is_ok());
+        assert!(r.is_registered("#foo{bar}"));
+        assert!(r.drop_channel("#foo{bar}"));
         r.set_topic("#rust", "hello world");
         assert_eq!(r.get("#rust").unwrap().topic, "hello world");
         assert!(r.drop_channel("#rust"));

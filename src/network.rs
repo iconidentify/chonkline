@@ -357,7 +357,7 @@ mod tests {
             uuid: uuid.into(),
             sid: sid.into(),
             nick: nick.into(),
-            nick_key: nick.to_lowercase(),
+            nick_key: crate::state::norm_nick(nick),
             user: "u".into(),
             host: "h".into(),
             real_host: "h".into(),
@@ -442,7 +442,7 @@ mod split_tests {
     fn user(uuid: &str, sid: &str, nick: &str) -> RemoteUser {
         RemoteUser {
             uuid: uuid.into(), sid: sid.into(), nick: nick.into(),
-            nick_key: nick.to_lowercase(), user: "u".into(), host: "h".into(),
+            nick_key: crate::state::norm_nick(nick), user: "u".into(), host: "h".into(),
             real_host: "h".into(), realname: "r".into(), ts: 1, modes: "+".into(),
             chans: BTreeSet::new(), away: None, oper: false,
         }
