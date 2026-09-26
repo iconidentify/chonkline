@@ -953,7 +953,7 @@ fn apply_event(state: &Arc<Mutex<ServerState>>, ev: Event) {
             stg.network.rename_user(&uuid, &nick, &key);
         }
         Event::ChannelJoin { chan, ts, modes: _, members } => {
-            let key = chan.to_lowercase();
+            let key = crate::state::norm_nick(&chan);
             for (_, uuid) in &members {
                 if let Some(u) = stg.network.user_mut(uuid) {
                     u.chans.insert(key.clone());
@@ -962,14 +962,14 @@ fn apply_event(state: &Arc<Mutex<ServerState>>, ev: Event) {
             crate::cmds::adopt_remote_channel(&mut stg, &chan, ts, &members);
         }
         Event::RemoteJoin { chan, uuid } => {
-            let key = chan.to_lowercase();
+            let key = crate::state::norm_nick(&chan);
             if let Some(u) = stg.network.user_mut(&uuid) {
                 u.chans.insert(key.clone());
             }
             crate::cmds::announce_remote_join(&mut stg, &chan, &uuid);
         }
         Event::RemotePart { chan, uuid, reason } => {
-            let key = chan.to_lowercase();
+            let key = crate::state::norm_nick(&chan);
             if let Some(u) = stg.network.user_mut(&uuid) {
                 u.chans.remove(&key);
             }

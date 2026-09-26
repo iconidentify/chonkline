@@ -21,13 +21,16 @@ pub const RENAME_WINDOW: Duration = Duration::from_secs(120);
 // Nickname normalization (RFC 2.2) and wildcard matching
 // ---------------------------------------------------------------------------
 
-/// Fold Scandinavian character pairs and lowercase, so nick comparison is
-/// case-insensitive with {}| treated as the equivalents of []\ (RFC 2.2).
+/// `CASEMAPPING=rfc1459`. ASCII letters fold to lowercase, and the pairs
+/// `{}|^` and `[]\~` are the same character: the canonical form is `[]\~`.
+/// Idempotent, so a key may be folded more than once.
 pub fn norm_nick(s: &str) -> String {
     s.chars()
         .map(|c| match c.to_ascii_lowercase() {
             '{' => '[',
+            '}' => ']',
             '|' => '\\',
+            '^' => '~',
             c => c,
         })
         .collect()
@@ -61,6 +64,8 @@ pub struct Caps {
     pub chghost: bool,            // CHGHOST notifications on host change
     pub cap_notify: bool,         // CAP NEW/DEL notifications
     pub sasl: bool,               // SASL authentication was requested
+    pub message_tags: bool,       // general @tag transport (IRCv3 message-tags)
+    pub account_tag: bool,        // account= tag on user commands
 }
 
 impl Caps {
@@ -76,6 +81,8 @@ impl Caps {
         if self.chghost { v.push("chghost"); }
         if self.cap_notify { v.push("cap-notify"); }
         if self.sasl { v.push("sasl"); }
+        if self.message_tags { v.push("message-tags"); }
+        if self.account_tag { v.push("account-tag"); }
         v.join(" ")
     }
 }
@@ -132,8 +139,9 @@ pub struct Cx {
     pub wallop: bool,     // user mode +w
     pub srvnotice: bool,  // user mode +s
     pub oper: bool,       // user mode +o (IRC operator)
+    pub bot: bool,        // user mode +B (IRCv3 bot mode)
 
-    pub chans: BTreeSet<String>, // joined channel keys
+    pub chans: BTreeSet<String>, // joined channel keys, rfc1459-folded
     pub connected_at: Instant,
     pub last_rx: Instant,
     close_notify: Option<Arc<Notify>>,
@@ -162,6 +170,7 @@ impl Cx {
         if self.srvnotice { s.push('s'); }
         if self.wallop { s.push('w'); }
         if self.oper { s.push('o'); }
+        if self.bot { s.push('B'); }
         s
     }
 
@@ -172,6 +181,7 @@ impl Cx {
         if self.wallop { parts.push("wallops"); }
         if self.srvnotice { parts.push("server notices"); }
         if self.oper { parts.push("IRC operator"); }
+        if self.bot { parts.push("bot"); }
         if parts.is_empty() { "normal user".to_string() } else { parts.join(", ") }
     }
 
@@ -180,13 +190,13 @@ impl Cx {
         format!(
             "{}!{}@{}",
             self.nick_key,
-            self.user.to_lowercase(),
-            self.host.to_lowercase()
+            norm_nick(&self.user),
+            norm_nick(&self.host)
         )
     }
 
     pub fn matches_ban(&self, mask: &str) -> bool {
-        let m = mask.to_lowercase();
+        let m = norm_nick(mask);
         if m.contains('!') || m.contains('@') {
             wildcard_match(&m, &self.composite_key())
         } else {
@@ -423,12 +433,12 @@ impl Chn {
     }
 
     pub(crate) fn set_channel_key(&mut self, key: &str) {
-        let k = key.to_lowercase();
+        let k = norm_nick(key);
         self.chan_key = if k.is_empty() { None } else { Some(k) };
     }
 
     pub(crate) fn add_ban(&mut self, mask: &str) {
-        let m = mask.to_lowercase();
+        let m = norm_nick(mask);
         if !self.bans.contains(&m) {
             self.bans.push(m);
         }
@@ -436,7 +446,7 @@ impl Chn {
 
     pub(crate) fn remove_ban(&mut self, mask: &str) -> bool {
         let before = self.bans.len();
-        self.bans.retain(|b| b != &mask.to_lowercase());
+        self.bans.retain(|b| b != &norm_nick(mask));
         self.bans.len() < before
     }
 
@@ -444,12 +454,12 @@ impl Chn {
 
     // +e ban exceptions and +I invite exceptions: same list-mode shape as +b.
     pub(crate) fn add_except(&mut self, mask: &str) {
-        let m = mask.to_lowercase();
+        let m = norm_nick(mask);
         if !self.excepts.contains(&m) { self.excepts.push(m); }
     }
     pub(crate) fn remove_except(&mut self, mask: &str) -> bool {
         let before = self.excepts.len();
-        self.excepts.retain(|b| b != &mask.to_lowercase());
+        self.excepts.retain(|b| b != &norm_nick(mask));
         self.excepts.len() < before
     }
     pub fn except_mask_list(&self) -> &[String] { &self.excepts }
@@ -459,12 +469,12 @@ impl Chn {
     }
 
     pub(crate) fn add_invex(&mut self, mask: &str) {
-        let m = mask.to_lowercase();
+        let m = norm_nick(mask);
         if !self.invex.contains(&m) { self.invex.push(m); }
     }
     pub(crate) fn remove_invex(&mut self, mask: &str) -> bool {
         let before = self.invex.len();
-        self.invex.retain(|b| b != &mask.to_lowercase());
+        self.invex.retain(|b| b != &norm_nick(mask));
         self.invex.len() < before
     }
     pub fn invex_mask_list(&self) -> &[String] { &self.invex }
@@ -751,6 +761,7 @@ impl ServerState {
             wallop: false,
             srvnotice: false,
             oper: false,
+            bot: false,
             chans: BTreeSet::new(),
             connected_at: Instant::now(),
             last_rx: Instant::now(),
@@ -850,10 +861,11 @@ impl ServerState {
         self.history.iter().rev().collect::<Vec<&HistEntry>>()
     }
 
-    /// Channel access. Keys are lowercased display names ("#foo").
-    pub fn chan(&self, key: &str) -> Option<&Chn> { self.chans.get(key) }
+    /// Channel access. The key is folded with `CASEMAPPING=rfc1459` here, so
+    /// callers may pass either the raw name or an already-folded key.
+    pub fn chan(&self, key: &str) -> Option<&Chn> { self.chans.get(&norm_nick(key)) }
 
-    pub fn chan_mut(&mut self, key: &str) -> Option<&mut Chn> { self.chans.get_mut(key) }
+    pub fn chan_mut(&mut self, key: &str) -> Option<&mut Chn> { self.chans.get_mut(&norm_nick(key)) }
 
     pub fn chans_iter(&self) -> impl Iterator<Item = (&String, &Chn)> + '_ {
         self.chans.iter()
@@ -864,11 +876,12 @@ impl ServerState {
     /// invoking creation; the first joining user becomes its operator and is
     /// admitted here together with subsequent joins handled elsewhere.
     pub fn chan_or_create(&mut self, key: &str, display: String) -> &mut Chn {
-        if !self.chans.contains_key(key) {
+        let key = norm_nick(key);
+        if !self.chans.contains_key(&key) {
             let fresh = Chn::new(&display); // privileges granted by the caller via admit_as_op
-            self.chans.insert(key.to_string(), fresh);
+            self.chans.insert(key.clone(), fresh);
         }
-        self.chans.get_mut(key).unwrap()
+        self.chans.get_mut(&key).unwrap()
     }
 
     /// Remove a connection from whichever table holds it (registered or not).
@@ -975,7 +988,7 @@ impl ServerState {
 
     /// Local connection ids in a channel, for delivering remote traffic.
     pub fn local_members(&self, chan_key: &str) -> Vec<usize> {
-        self.chans.get(chan_key).map(|c| c.members.iter().copied().collect()).unwrap_or_default()
+        self.chans.get(&norm_nick(chan_key)).map(|c| c.members.iter().copied().collect()).unwrap_or_default()
     }
 
     pub fn user_count(&self) -> usize { self.users.len() }
@@ -1003,7 +1016,7 @@ impl ServerState {
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
         for ck in &chans {
-            if let Some(c) = self.chans.get(ck) {
+            if let Some(c) = self.chans.get(&norm_nick(ck)) {
                 for &mid in &c.members {
                     if mid != id && seen.insert(mid) {
                         out.push(mid);
@@ -1020,10 +1033,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn folds_scaro_chars() {
+    fn folds_rfc1459_pairs() {
         assert_eq!(norm_nick("Wi{Z"), "wi[z");
-        assert_eq!(norm_nick("A|B}"), "a\\b}");
+        assert_eq!(norm_nick("A|B}"), "a\\b]");
         assert_eq!(norm_nick("AbcDEF"), "abcdef");
+        // The Matrix-bridge suffix and a channel name must each collapse.
+        assert_eq!(norm_nick("nate[m]"), norm_nick("nate{m}"));
+        assert_eq!(norm_nick("#Foo[bar]"), norm_nick("#foo{bar}"));
+        assert_eq!(norm_nick("x^y"), norm_nick("X~Y"));
+        assert_eq!(norm_nick(&norm_nick("A{b}|^")), norm_nick("a[b]\\~"));
     }
 
     #[test]
@@ -1040,11 +1058,15 @@ mod tests {
     #[test]
     fn composite_ban_matching() {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let cx = test_cx(1, tx);
+        let mut cx = test_cx(1, tx);
         assert!(cx.matches_ban("alice*"));
         assert!(!cx.matches_ban("bob*"));
         assert!(cx.matches_ban("*!*@example.edu"));
         assert!(!cx.matches_ban("*!*@other.net"));
+        cx.nick_key = norm_nick("nate[m]");
+        cx.host = "h{ost}".into();
+        assert!(cx.matches_ban("nate{m}"));
+        assert!(cx.matches_ban("*!*@h[ost]"));
     }
 
     fn test_cx(id: usize, tx: Sender<String>) -> Cx {
@@ -1072,6 +1094,7 @@ mod tests {
             wallop: false,
             srvnotice: false,
             oper: false,
+            bot: false,
             chans: BTreeSet::new(),
             connected_at: Instant::now(),
             last_rx: Instant::now(),

@@ -54,7 +54,7 @@ fn cap_ls_advertises_supported_caps() {
     let mut c = client(&addr);
     send(&mut c, "CAP LS 302");
     let ls = drain_until(&mut c, "LS :", 3);
-    for cap in ["sasl", "server-time", "away-notify", "extended-join", "account-notify", "multi-prefix"] {
+    for cap in ["sasl", "message-tags", "server-time", "account-tag", "away-notify", "extended-join", "account-notify", "multi-prefix"] {
         assert!(ls.contains(cap), "CAP LS missing {cap}: {ls:?}");
     }
     assert!(ls.contains("sasl=PLAIN"), "CAP LS 302 should carry sasl=PLAIN: {ls:?}");
@@ -599,4 +599,83 @@ fn invite_exception_bypasses_invite_only() {
     send(&mut u, "JOIN #iex");
     let uj = drain_until(&mut u, "#iex", 3);
     assert!(uj.contains("JOIN") && !uj.contains(" 473 "), "invex did not bypass +i: {uj:?}");
+}
+
+#[test]
+fn rfc1459_folds_nicks_and_channels() {
+    let addr = start_server();
+    let mut a = client(&addr);
+    send(&mut a, "NICK nate[m]");
+    send(&mut a, "USER nate[m] 0 * :nate");
+    let welcome = drain_until(&mut a, " 005 ", 3);
+    assert!(welcome.contains(" 001 "), "registration did not complete: {welcome:?}");
+    assert!(welcome.contains("CASEMAPPING=rfc1459"), "005 dropped the casemap token: {welcome:?}");
+    assert!(welcome.contains("BOT=B"), "005 missing BOT=B: {welcome:?}");
+
+    let mut b = client(&addr);
+    send(&mut b, "NICK nate{m}");
+    send(&mut b, "USER nate 0 * :nate");
+    let clash = drain_until(&mut b, " 433 ", 3);
+    assert!(clash.contains(" 433 "), "nate{{m}} was not treated as nate[m]: {clash:?}");
+
+    send(&mut a, "JOIN #Foo[bar]");
+    let _ = drain_until(&mut a, " 366 ", 3);
+    let mut c = client(&addr);
+    register(&mut c, "other");
+    send(&mut c, "JOIN #foo{bar}");
+    let joined = drain_until(&mut c, " 366 ", 3);
+    assert!(joined.contains("nate[m]"), "folded channel did not contain the first member: {joined:?}");
+}
+
+#[test]
+fn bot_and_account_tags_follow_message_tags() {
+    let addr = start_server();
+
+    let mut bot = client(&addr);
+    register(&mut bot, "robit");
+    send(&mut bot, "PRIVMSG NickServ :REGISTER secret");
+    let reg = drain_until(&mut bot, "registered", 3);
+    assert!(reg.contains("registered"), "account was not created: {reg:?}");
+    send(&mut bot, "MODE robit +B");
+    let modes = drain_until(&mut bot, " 221 ", 3);
+    assert!(modes.contains("+") && modes.contains('B'), "bot mode not recorded: {modes:?}");
+
+    let mut tagged = client(&addr);
+    send(&mut tagged, "CAP REQ :message-tags account-tag");
+    let ack = drain_until(&mut tagged, "ACK", 3);
+    assert!(ack.contains("message-tags") && ack.contains("account-tag"), "caps not acked: {ack:?}");
+    send(&mut tagged, "CAP END");
+    register(&mut tagged, "tagged");
+    send(&mut tagged, "JOIN #bots");
+    let _ = drain_until(&mut tagged, " 366 ", 3);
+
+    let mut plain = client(&addr);
+    register(&mut plain, "plain");
+    send(&mut plain, "JOIN #bots");
+    let _ = drain_until(&mut plain, " 366 ", 3);
+    let _ = drain_until(&mut tagged, "plain", 2);
+
+    send(&mut bot, "JOIN #bots");
+    let _ = drain_until(&mut bot, " 366 ", 3);
+    send(&mut bot, "PRIVMSG #bots :hello from the bot");
+    // A client-tagged command must still be parsed and delivered.
+    send(&mut bot, "@+draft/reply=abc PRIVMSG #bots :tagged hello");
+
+    let seen = drain_until(&mut tagged, "tagged hello", 3);
+    let hello = seen.lines().find(|l| l.contains("hello from the bot")).unwrap_or("");
+    assert!(!hello.is_empty(), "no hello: {seen:?}");
+    let (tags, _) = hello.split_once(' ').expect("tagged line");
+    let parts: Vec<&str> = tags.trim_start_matches('@').split(';').collect();
+    assert!(parts.iter().any(|t| *t == "bot"), "bot tag missing: {hello:?}");
+    assert!(parts.iter().any(|t| *t == "account=robit"), "account tag missing: {hello:?}");
+    assert!(seen.contains("tagged hello"), "client-tagged PRIVMSG was dropped: {seen:?}");
+
+    let bare = drain_until(&mut plain, "tagged hello", 3);
+    let plain_hello = bare.lines().find(|l| l.contains("hello from the bot")).unwrap_or("");
+    assert!(!plain_hello.is_empty(), "plain missed hello: {bare:?}");
+    assert!(plain_hello.starts_with(":robit!"), "client without message-tags saw a tag: {plain_hello:?}");
+
+    send(&mut tagged, "WHOIS robit");
+    let whois = drain_until(&mut tagged, " 318 ", 3);
+    assert!(whois.contains(" 335 "), "WHOIS missing RPL_WHOISBOT: {whois:?}");
 }

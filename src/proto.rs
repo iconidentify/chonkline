@@ -75,6 +75,22 @@ fn civil_from_epoch(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
     (year, m, d, h, mi, s)
 }
 
+/// Escape a message-tag value per the IRCv3 message-tags spec.
+pub fn escape_tag_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            ';' => out.push_str("\\:"),
+            ' ' => out.push_str("\\s"),
+            '\\' => out.push_str("\\\\"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// IRCv3 `server-time` timestamp: ISO-8601 UTC with milliseconds, e.g.
 /// `2026-08-16T08:12:34.567Z`.
 pub fn ircv3_timestamp() -> String {
@@ -91,6 +107,14 @@ pub fn ircv3_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_message_tags_then_the_command() {
+        let c = parse("@+draft/reply=abc;time=2020-01-01T00:00:00.000Z PRIVMSG #chan :hello world").unwrap();
+        assert_eq!(c.name, "PRIVMSG");
+        assert_eq!(c.params, vec!["#chan", "hello world"]);
+        assert!(parse("@tag-without-a-space").is_none());
+    }
 
     #[test]
     fn parses_plain_and_trailing() {
@@ -153,6 +177,18 @@ mod tests {
 /// Parse one message per the RFC 2.3 grammar: optional `:<prefix>` then command name, then space-separated parameters with a token-boundary trailing marker. Lines over length, containing NULs, or missing commands are rejected silently.
 pub fn parse(line: &str) -> Option<Command> {
     if line.len() > MAX_CONTENT_BYTES || line.is_empty() || line.bytes().any(|b| b == 0x00) {
+        return None;
+    }
+    // IRCv3 message-tags: `@tags ` is stripped before the RFC 2.3 grammar.
+    // Client tags are accepted so a tagged command is not dropped; this server
+    // does not relay tags it did not generate itself.
+    let line = if let Some(rest) = line.strip_prefix('@') {
+        let sp = rest.find(|c: char| c.is_ascii_whitespace())?;
+        rest[sp..].trim_start()
+    } else {
+        line
+    };
+    if line.is_empty() {
         return None;
     }
 
