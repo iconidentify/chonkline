@@ -928,3 +928,96 @@ fn bot_and_account_tags_follow_message_tags() {
         "WHOIS missing RPL_WHOISBOT: {whois:?}"
     );
 }
+
+#[test]
+fn ban_and_kick_stop_channel_messages() {
+    // A +b used to affect only JOIN. Kick removed the nick from the names list
+    // and the ban was announced, but PRIVMSG to the channel kept being delivered.
+    let addr = start_server();
+    let mut op = client(&addr);
+    register(&mut op, "mod");
+    send(&mut op, "JOIN #lobby");
+    let _ = drain_until(&mut op, " 366 ", 3);
+
+    let mut biff = client(&addr);
+    register(&mut biff, "biff");
+    send(&mut biff, "JOIN #lobby");
+    let _ = drain_until(&mut biff, " 366 ", 3);
+
+    let mut hearer = client(&addr);
+    register(&mut hearer, "hearer");
+    send(&mut hearer, "JOIN #lobby");
+    let _ = drain_until(&mut hearer, " 366 ", 3);
+    let _ = drain_until(&mut op, "hearer", 2);
+
+    send(&mut biff, "PRIVMSG #lobby :before");
+    let before = drain_until(&mut hearer, "before", 3);
+    assert!(
+        before.contains("before"),
+        "a member could not speak before the ban: {before:?}"
+    );
+
+    send(&mut op, "MODE #lobby +b *!*@*");
+    let _ = drain_until(&mut op, "MODE #lobby +b", 2);
+
+    // Still joined, but the ban now blocks both PRIVMSG and NOTICE. NOTICE
+    // stays silent: no second 404.
+    send(&mut biff, "PRIVMSG #lobby :banned-still-in");
+    send(&mut biff, "NOTICE #lobby :banned-notice");
+    send(&mut op, "KICK #lobby biff :flood");
+    send(&mut biff, "PRIVMSG #lobby :after-kick");
+
+    let from_biff = drain_for(&mut biff, 1);
+    let kicks = from_biff.matches(" 404 ").count();
+    assert!(
+        from_biff.contains("KICK #lobby biff"),
+        "biff was not kicked: {from_biff:?}"
+    );
+    assert_eq!(
+        kicks, 2,
+        "banned speech should be two 404s (PRIVMSG in channel, PRIVMSG after kick) and NOTICE must stay silent: {from_biff:?}"
+    );
+
+    let heard = drain_for(&mut hearer, 1);
+    assert!(
+        heard.contains("KICK #lobby biff"),
+        "hearer missed the kick: {heard:?}"
+    );
+    for leaked in ["banned-still-in", "banned-notice", "after-kick"] {
+        assert!(
+            !heard.contains(leaked),
+            "channel still received {leaked} after ban/kick: {heard:?}"
+        );
+    }
+
+    // +e overrides the ban. With no +n, the kicked user can speak again.
+    send(&mut op, "MODE #lobby +e *!*@*");
+    let _ = drain_until(&mut op, "MODE #lobby +e", 2);
+    send(&mut biff, "PRIVMSG #lobby :excepted");
+    let excepted = drain_until(&mut hearer, "excepted", 3);
+    assert!(
+        excepted.contains("excepted"),
+        "+e did not let the outsider speak: {excepted:?}"
+    );
+
+    // +n then blocks outsiders and still lets members speak.
+    send(&mut op, "MODE #lobby +n");
+    let _ = drain_until(&mut op, "MODE #lobby +n", 2);
+    send(&mut biff, "PRIVMSG #lobby :outsider");
+    let outsider = drain_until(&mut biff, " 404 ", 3);
+    assert!(
+        outsider.contains(" 404 "),
+        "+n let a non-member speak: {outsider:?}"
+    );
+    send(&mut hearer, "PRIVMSG #lobby :member-speaks");
+    let member = drain_until(&mut op, "member-speaks", 3);
+    assert!(
+        member.contains("member-speaks"),
+        "+n silenced a member: {member:?}"
+    );
+    let quiet = drain_for(&mut hearer, 1);
+    assert!(
+        !quiet.contains("outsider"),
+        "+n outsider line was delivered: {quiet:?}"
+    );
+}

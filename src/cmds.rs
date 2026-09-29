@@ -3466,10 +3466,11 @@ fn deliver_one_recipient(stg: &mut ServerState, id: usize, raw: &str, text: &str
     }
 
     if valid_channel(raw) {
-        deliver_to_channel(stg, id, raw, text, is_priv);
-        // A channel may hold members on other servers. Relaying after local
-        // delivery keeps the local view authoritative if the link is down.
-        relay_to_links(stg, id, raw, text, is_priv);
+        // A refused send must not cross the link either, or the peer would
+        // still show a line this server told the sender it rejected.
+        if deliver_to_channel(stg, id, raw, text, is_priv) {
+            relay_to_links(stg, id, raw, text, is_priv);
+        }
         return;
     }
 
@@ -3775,7 +3776,32 @@ fn deliver_to_server_mask(stg: &mut ServerState, id: usize, raw: &str, text: &st
     }
 }
 
-/// Channel dispatch honoring +i/+n and moderated(+m) gates under locked reply policies.
+/// True when this client must not send to the channel.
+///
+/// A `+b` mask blocks speech, not only joining. Kick removes membership and
+/// nothing else, so without this check a banned user keeps talking from
+/// outside — the ban is announced, the nick leaves the names list, and the
+/// lines still arrive. `+e` overrides the ban. `+n` blocks outsiders only;
+/// members still speak. `+m` blocks anyone who is not op or voice. `+i`
+/// blocks outsiders.
+fn channel_send_denied(stg: &ServerState, id: usize, norm: &str) -> bool {
+    let banned = match (stg.find_by_id(id), stg.chan(norm)) {
+        (Some(u), Some(c)) => c.ban_match(u).is_some() && !c.except_match(u),
+        (None, Some(_)) => true,
+        _ => return true,
+    };
+    match stg.chan(norm) {
+        Some(c) => {
+            let member = c.is_member(id);
+            banned
+                || (c.nomsg() && !member)
+                || (c.moderated() && !c.is_op(id) && !c.is_voiced(id))
+                || (c.invite_only() && !member)
+        }
+        None => true,
+    }
+}
+
 /// STATUSMSG target parse: "@#chan" or "+#chan" -> (prefix, channel).
 fn split_statusmsg(raw: &str) -> Option<(char, &str)> {
     let mut chars = raw.chars();
@@ -3811,15 +3837,7 @@ fn deliver_to_channel_status(
         }
         return;
     }
-    let gate_denied = match stg.chan(&norm) {
-        Some(c) => {
-            c.nomsg()
-                || (c.moderated() && !c.is_op(id) && !c.is_voiced(id))
-                || (c.invite_only() && !c.is_member(id))
-        }
-        None => true,
-    };
-    if gate_denied {
+    if channel_send_denied(stg, id, &norm) {
         if is_priv {
             numeric(stg, id, "404", &[full_target, "Cannot send to channel"]);
         }
@@ -3853,14 +3871,22 @@ fn deliver_to_channel_status(
     }
 }
 
-fn deliver_to_channel(stg: &mut ServerState, id: usize, raw: &str, text: &str, is_priv: bool) {
+/// Deliver one channel message. Returns false when the send was refused, so
+/// the caller does not relay it to other servers.
+fn deliver_to_channel(
+    stg: &mut ServerState,
+    id: usize,
+    raw: &str,
+    text: &str,
+    is_priv: bool,
+) -> bool {
     let norm_key: String = raw.fold_rfc1459();
 
     if stg.chan(&norm_key).is_none() {
         if is_priv {
             deliver_nosuch_channel(stg, id, raw);
         }
-        return;
+        return false;
     }
 
     let members_now: Vec<usize> = stg
@@ -3868,20 +3894,11 @@ fn deliver_to_channel(stg: &mut ServerState, id: usize, raw: &str, text: &str, i
         .map(|c| c.members.iter().copied().collect::<Vec<usize>>())
         .unwrap_or_default();
 
-    let gate_denied: bool = match stg.chan(&norm_key) {
-        Some(c) => {
-            c.nomsg()
-                || (c.moderated() && !c.is_op(id) && !c.is_voiced(id))
-                || (c.invite_only() && !c.is_member(id))
-        }
-        None => true,
-    };
-
-    if gate_denied {
+    if channel_send_denied(stg, id, &norm_key) {
         if is_priv {
             numeric(stg, id, "404", &[raw, "Cannot send to channel"]);
         } // recipient token first via the shared chokepoint
-        return;
+        return false;
     }
 
     let prefix_now: String = stg.find_by_id(id).map(|u| u.prefix()).unwrap_or_default();
@@ -3901,6 +3918,7 @@ fn deliver_to_channel(stg: &mut ServerState, id: usize, raw: &str, text: &str, i
             ),
         );
     }
+    true
 }
 
 /// Split a user@host recipient token into its two lowercased parts.
