@@ -36,6 +36,12 @@ pub fn norm_nick(s: &str) -> String {
         .collect()
 }
 
+/// Nicknames and account names held by services. Compared under `norm_nick`,
+/// so `NickServ` and `nickserv` are the same reservation.
+pub fn is_service_name(s: &str) -> bool {
+    matches!(norm_nick(s).as_str(), "nickserv" | "chanserv")
+}
+
 /// Wildcard matcher: '*' matches any run (including empty), '?' a single byte.
 pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     // Delegates to the iterative matcher. The previous implementation built a
@@ -46,7 +52,6 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     crate::bans::glob_match(pattern, text)
 }
 
-
 // ---------------------------------------------------------------------------
 // Client / user record
 // ---------------------------------------------------------------------------
@@ -55,34 +60,64 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 /// the server genuinely honors are ever advertised or set here.
 #[derive(Debug, Clone, Default)]
 pub struct Caps {
-    pub server_time: bool,        // message @time= tags (RFC: ircv3 server-time)
-    pub away_notify: bool,        // AWAY broadcasts to shared-channel peers
-    pub extended_join: bool,      // JOIN carries account + realname
-    pub account_notify: bool,     // ACCOUNT messages on login/logout
-    pub multi_prefix: bool,       // all membership prefixes in NAMES/WHO
-    pub userhost_in_names: bool,  // NAMES lists nick!user@host
-    pub chghost: bool,            // CHGHOST notifications on host change
-    pub cap_notify: bool,         // CAP NEW/DEL notifications
-    pub sasl: bool,               // SASL authentication was requested
-    pub message_tags: bool,       // general @tag transport (IRCv3 message-tags)
-    pub account_tag: bool,        // account= tag on user commands
+    pub server_time: bool,       // message @time= tags (RFC: ircv3 server-time)
+    pub away_notify: bool,       // AWAY broadcasts to shared-channel peers
+    pub extended_join: bool,     // JOIN carries account + realname
+    pub account_notify: bool,    // ACCOUNT messages on login/logout
+    pub multi_prefix: bool,      // all membership prefixes in NAMES/WHO
+    pub userhost_in_names: bool, // NAMES lists nick!user@host
+    pub chghost: bool,           // CHGHOST notifications on host change
+    pub cap_notify: bool,        // CAP NEW/DEL notifications
+    pub sasl: bool,              // SASL authentication was requested
+    pub message_tags: bool,      // general @tag transport (IRCv3 message-tags)
+    pub account_tag: bool,       // account= tag on user commands
+    pub batch: bool,             // IRCv3 batch framing
+    pub labeled_response: bool,  // correlate replies; applied only with batch
 }
 
 impl Caps {
     /// Space-separated list of the caps currently enabled (for `CAP LIST`).
     pub fn enabled_list(&self) -> String {
         let mut v: Vec<&str> = Vec::new();
-        if self.server_time { v.push("server-time"); }
-        if self.away_notify { v.push("away-notify"); }
-        if self.extended_join { v.push("extended-join"); }
-        if self.account_notify { v.push("account-notify"); }
-        if self.multi_prefix { v.push("multi-prefix"); }
-        if self.userhost_in_names { v.push("userhost-in-names"); }
-        if self.chghost { v.push("chghost"); }
-        if self.cap_notify { v.push("cap-notify"); }
-        if self.sasl { v.push("sasl"); }
-        if self.message_tags { v.push("message-tags"); }
-        if self.account_tag { v.push("account-tag"); }
+        if self.server_time {
+            v.push("server-time");
+        }
+        if self.away_notify {
+            v.push("away-notify");
+        }
+        if self.extended_join {
+            v.push("extended-join");
+        }
+        if self.account_notify {
+            v.push("account-notify");
+        }
+        if self.multi_prefix {
+            v.push("multi-prefix");
+        }
+        if self.userhost_in_names {
+            v.push("userhost-in-names");
+        }
+        if self.chghost {
+            v.push("chghost");
+        }
+        if self.cap_notify {
+            v.push("cap-notify");
+        }
+        if self.sasl {
+            v.push("sasl");
+        }
+        if self.message_tags {
+            v.push("message-tags");
+        }
+        if self.account_tag {
+            v.push("account-tag");
+        }
+        if self.batch {
+            v.push("batch");
+        }
+        if self.labeled_response {
+            v.push("labeled-response");
+        }
         v.join(" ")
     }
 }
@@ -100,7 +135,7 @@ pub struct Cx {
     /// Normalized key used for all comparisons.
     pub nick_key: String,
     pub user: String,
-    pub host: String, // cloaked host shown to other users (see ops::cloak_host)
+    pub host: String,      // cloaked host shown to other users (see ops::cloak_host)
     pub real_host: String, // true peer address, revealed only to operators
     pub realname: String,
     pub registered: bool,
@@ -116,8 +151,8 @@ pub struct Cx {
     pub sasl_mech: Option<String>,
 
     // Slots filled while the client completes the NICK/USER registration pair.
-    pub pending_nick: Option<String>,  // display form chosen so far
-    pub pending_user: Option<String>,  // user part of a USER command seen so far
+    pub pending_nick: Option<String>, // display form chosen so far
+    pub pending_user: Option<String>, // user part of a USER command seen so far
 
     /// CAP negotiation state (RFCv3): set when the client begins capability
     /// negotiation, cleared on `CAP END`. While set, the registration welcome
@@ -127,6 +162,12 @@ pub struct Cx {
     /// flushed by the connection's own `CAP END`.
     pub cap_gated_welcome: bool,
 
+    /// Batches opened toward this client. The reference only has to be unique
+    /// for batches this connection has not finished yet; a monotonic counter
+    /// is enough because each reply is one batch and it is closed in the same
+    /// write.
+    pub batch_seq: u64,
+
     /// Anti-bot registration challenge: a PING was sent and is awaiting any
     /// PONG. Every real IRC client answers automatically, so this is invisible
     /// to users while defeating scripted floods that never read the socket.
@@ -135,11 +176,11 @@ pub struct Cx {
     pub reg_verified: bool,
 
     pub away: Option<String>,
-    pub invis: bool,      // user mode +i (invisible)
-    pub wallop: bool,     // user mode +w
-    pub srvnotice: bool,  // user mode +s
-    pub oper: bool,       // user mode +o (IRC operator)
-    pub bot: bool,        // user mode +B (IRCv3 bot mode)
+    pub invis: bool,     // user mode +i (invisible)
+    pub wallop: bool,    // user mode +w
+    pub srvnotice: bool, // user mode +s
+    pub oper: bool,      // user mode +o (IRC operator)
+    pub bot: bool,       // user mode +B (IRCv3 bot mode)
 
     pub chans: BTreeSet<String>, // joined channel keys, rfc1459-folded
     pub connected_at: Instant,
@@ -166,23 +207,47 @@ impl Cx {
     /// User mode string as reported by RPL_UMODEIS.
     pub fn user_mode_string(&self) -> String {
         let mut s = String::from("+");
-        if self.invis { s.push('i'); }
-        if self.srvnotice { s.push('s'); }
-        if self.wallop { s.push('w'); }
-        if self.oper { s.push('o'); }
-        if self.bot { s.push('B'); }
+        if self.invis {
+            s.push('i');
+        }
+        if self.srvnotice {
+            s.push('s');
+        }
+        if self.wallop {
+            s.push('w');
+        }
+        if self.oper {
+            s.push('o');
+        }
+        if self.bot {
+            s.push('B');
+        }
         s
     }
 
     /// User-mode description used in reply trailing text.
     pub fn user_mode_text(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
-        if self.invis { parts.push("invisible"); }
-        if self.wallop { parts.push("wallops"); }
-        if self.srvnotice { parts.push("server notices"); }
-        if self.oper { parts.push("IRC operator"); }
-        if self.bot { parts.push("bot"); }
-        if parts.is_empty() { "normal user".to_string() } else { parts.join(", ") }
+        if self.invis {
+            parts.push("invisible");
+        }
+        if self.wallop {
+            parts.push("wallops");
+        }
+        if self.srvnotice {
+            parts.push("server notices");
+        }
+        if self.oper {
+            parts.push("IRC operator");
+        }
+        if self.bot {
+            parts.push("bot");
+        }
+        if parts.is_empty() {
+            "normal user".to_string()
+        } else {
+            parts.join(", ")
+        }
     }
 
     /// The composite identity a ban mask is matched against.
@@ -215,18 +280,18 @@ pub struct Chn {
     pub topic_setter: String, // nick that last set the topic (for RPL_TOPICWHOTIME)
     pub topic_time: u64,      // unix seconds when the topic was set
     pub created_at: u64,      // unix seconds the channel was created (RPL_CREATIONTIME)
-    invite_only: bool,   // +i (invite-only)
-    nomsg: bool,         // +n (no external messages)
-    private: bool,       // +p
-    secret: bool,        // +s
-    op_topic: bool,      // +t
-    moderated: bool,     // +m
-    regonly: bool,       // +R (registered accounts only)
-    pub key_limit: i32,  // +l; 0 = unlimited
+    invite_only: bool,        // +i (invite-only)
+    nomsg: bool,              // +n (no external messages)
+    private: bool,            // +p
+    secret: bool,             // +s
+    op_topic: bool,           // +t
+    moderated: bool,          // +m
+    regonly: bool,            // +R (registered accounts only)
+    pub key_limit: i32,       // +l; 0 = unlimited
     chan_key: Option<String>, // +k
-    bans: Vec<String>,   // +b masks (lowercased)
-    excepts: Vec<String>, // +e ban-exception masks (lowercased)
-    invex: Vec<String>,  // +I invite-exception masks (lowercased)
+    bans: Vec<String>,        // +b masks (lowercased)
+    excepts: Vec<String>,     // +e ban-exception masks (lowercased)
+    invex: Vec<String>,       // +I invite-exception masks (lowercased)
     invites: BTreeSet<usize>,
     /// Modes set by another server that this server does not implement.
     ///
@@ -234,7 +299,7 @@ pub struct Chn {
     /// believes they are set, and silently discarding one is a divergence that
     /// surfaces later as two servers disagreeing about a channel.
     foreign_modes: std::collections::BTreeMap<char, Option<String>>,
-    pub ops: BTreeSet<usize>,    // connection ids with operator privileges here
+    pub ops: BTreeSet<usize>, // connection ids with operator privileges here
     pub voices: BTreeSet<usize>,
     pub members: BTreeSet<usize>,
 }
@@ -270,21 +335,43 @@ impl Chn {
         }
     }
 
-    pub fn is_private(&self) -> bool { self.private }
-    pub fn is_secret(&self) -> bool { self.secret }
-    pub fn invite_only(&self) -> bool { self.invite_only }
-    pub fn nomsg(&self) -> bool { self.nomsg }
-    pub fn op_topic(&self) -> bool { self.op_topic }
-    pub fn moderated(&self) -> bool { self.moderated }
+    pub fn is_private(&self) -> bool {
+        self.private
+    }
+    pub fn is_secret(&self) -> bool {
+        self.secret
+    }
+    pub fn invite_only(&self) -> bool {
+        self.invite_only
+    }
+    pub fn nomsg(&self) -> bool {
+        self.nomsg
+    }
+    pub fn op_topic(&self) -> bool {
+        self.op_topic
+    }
+    pub fn moderated(&self) -> bool {
+        self.moderated
+    }
     /// +R: only clients authenticated to a services account may join. This is
     /// the one admission control that works without trustworthy addresses,
     /// which makes it the usable lever during an identity outage.
-    pub fn regonly(&self) -> bool { self.regonly }
-    pub fn chan_key(&self) -> Option<&str> { self.chan_key.as_deref() }
+    pub fn regonly(&self) -> bool {
+        self.regonly
+    }
+    pub fn chan_key(&self) -> Option<&str> {
+        self.chan_key.as_deref()
+    }
 
-    pub fn is_member(&self, cx_id: usize) -> bool { self.members.contains(&cx_id) }
-    pub fn is_op(&self, cx_id: usize) -> bool { self.ops.contains(&cx_id) }
-    pub fn is_voiced(&self, cx_id: usize) -> bool { self.voices.contains(&cx_id) }
+    pub fn is_member(&self, cx_id: usize) -> bool {
+        self.members.contains(&cx_id)
+    }
+    pub fn is_op(&self, cx_id: usize) -> bool {
+        self.ops.contains(&cx_id)
+    }
+    pub fn is_voiced(&self, cx_id: usize) -> bool {
+        self.voices.contains(&cx_id)
+    }
 
     /// Marker ('@' op / '+' voice) shown in NAMES-style listings.
     pub fn marker(&self, cx_id: usize) -> &'static str {
@@ -313,7 +400,10 @@ impl Chn {
 
     /// First active ban mask matching a user's identity, if any.
     pub fn ban_match(&self, target: &Cx) -> Option<&str> {
-        self.bans.iter().find(|b| target.matches_ban(b)).map(String::as_str)
+        self.bans
+            .iter()
+            .find(|b| target.matches_ban(b))
+            .map(String::as_str)
     }
 
     // Mutators used by the MODE command handler.
@@ -330,13 +420,27 @@ impl Chn {
     pub fn burst_mode_parts(&self) -> (String, Vec<String>) {
         let mut flags = String::from("+");
         let mut params: Vec<String> = Vec::new();
-        if self.invite_only { flags.push('i'); }
-        if self.nomsg { flags.push('n'); }
-        if self.private { flags.push('p'); }
-        if self.secret { flags.push('s'); }
-        if self.op_topic { flags.push('t'); }
-        if self.moderated { flags.push('m'); }
-        if self.regonly { flags.push('R'); }
+        if self.invite_only {
+            flags.push('i');
+        }
+        if self.nomsg {
+            flags.push('n');
+        }
+        if self.private {
+            flags.push('p');
+        }
+        if self.secret {
+            flags.push('s');
+        }
+        if self.op_topic {
+            flags.push('t');
+        }
+        if self.moderated {
+            flags.push('m');
+        }
+        if self.regonly {
+            flags.push('R');
+        }
         if let Some(k) = &self.chan_key {
             flags.push('k');
             params.push(k.clone());
@@ -363,8 +467,16 @@ impl Chn {
 
     /// Grant or remove a prefix mode for a local member.
     pub(crate) fn set_member_prefix(&mut self, ch: char, cx_id: usize, on: bool) {
-        let set = if ch == 'o' { &mut self.ops } else { &mut self.voices };
-        if on { set.insert(cx_id); } else { set.remove(&cx_id); }
+        let set = if ch == 'o' {
+            &mut self.ops
+        } else {
+            &mut self.voices
+        };
+        if on {
+            set.insert(cx_id);
+        } else {
+            set.remove(&cx_id);
+        }
     }
 
     /// Record a mode this server does not implement.
@@ -450,19 +562,25 @@ impl Chn {
         self.bans.len() < before
     }
 
-    pub fn ban_mask_list(&self) -> &[String] { &self.bans }
+    pub fn ban_mask_list(&self) -> &[String] {
+        &self.bans
+    }
 
     // +e ban exceptions and +I invite exceptions: same list-mode shape as +b.
     pub(crate) fn add_except(&mut self, mask: &str) {
         let m = norm_nick(mask);
-        if !self.excepts.contains(&m) { self.excepts.push(m); }
+        if !self.excepts.contains(&m) {
+            self.excepts.push(m);
+        }
     }
     pub(crate) fn remove_except(&mut self, mask: &str) -> bool {
         let before = self.excepts.len();
         self.excepts.retain(|b| b != &norm_nick(mask));
         self.excepts.len() < before
     }
-    pub fn except_mask_list(&self) -> &[String] { &self.excepts }
+    pub fn except_mask_list(&self) -> &[String] {
+        &self.excepts
+    }
     /// True when a user's identity matches any +e exception (exempt from bans).
     pub fn except_match(&self, target: &Cx) -> bool {
         self.excepts.iter().any(|m| target.matches_ban(m))
@@ -470,38 +588,66 @@ impl Chn {
 
     pub(crate) fn add_invex(&mut self, mask: &str) {
         let m = norm_nick(mask);
-        if !self.invex.contains(&m) { self.invex.push(m); }
+        if !self.invex.contains(&m) {
+            self.invex.push(m);
+        }
     }
     pub(crate) fn remove_invex(&mut self, mask: &str) -> bool {
         let before = self.invex.len();
         self.invex.retain(|b| b != &norm_nick(mask));
         self.invex.len() < before
     }
-    pub fn invex_mask_list(&self) -> &[String] { &self.invex }
+    pub fn invex_mask_list(&self) -> &[String] {
+        &self.invex
+    }
     /// True when a user's identity matches any +I invite exception (bypasses +i).
     pub fn invex_match(&self, target: &Cx) -> bool {
         self.invex.iter().any(|m| target.matches_ban(m))
     }
 
     /// Invite bookkeeping.
-    pub(crate) fn invite(&mut self, cx_id: usize) { self.invites.insert(cx_id); }
-    pub fn invited(&self, cx_id: usize) -> bool { self.invites.contains(&cx_id) }
-    pub(crate) fn consume_invite(&mut self, cx_id: usize) { self.invites.remove(&cx_id); }
+    pub(crate) fn invite(&mut self, cx_id: usize) {
+        self.invites.insert(cx_id);
+    }
+    pub fn invited(&self, cx_id: usize) -> bool {
+        self.invites.contains(&cx_id)
+    }
+    pub(crate) fn consume_invite(&mut self, cx_id: usize) {
+        self.invites.remove(&cx_id);
+    }
 
     /// Channel mode string as reported by RPL_CHANNELMODEIS.
     pub fn mode_string(&self) -> String {
         let mut s = String::from("+");
-        if self.invite_only { s.push('i'); }
-        if self.nomsg { s.push('n'); }
-        if self.private { s.push('p'); }
-        if self.secret { s.push('s'); }
-        if self.op_topic { s.push('t'); }
-        if self.moderated { s.push('m'); }
+        if self.invite_only {
+            s.push('i');
+        }
+        if self.nomsg {
+            s.push('n');
+        }
+        if self.private {
+            s.push('p');
+        }
+        if self.secret {
+            s.push('s');
+        }
+        if self.op_topic {
+            s.push('t');
+        }
+        if self.moderated {
+            s.push('m');
+        }
         // +b is a list mode (shown via 367/368), not a simple flag; it is not
         // reported in RPL_CHANNELMODEIS.
-        if self.regonly { s.push('R'); }
-        if self.chan_key.is_some() { s.push('k'); }
-        if self.key_limit > 0 { s.push('l'); }
+        if self.regonly {
+            s.push('R');
+        }
+        if self.chan_key.is_some() {
+            s.push('k');
+        }
+        if self.key_limit > 0 {
+            s.push('l');
+        }
         // Modes another server set that this one does not implement are still
         // reported: the peer believes they are set, and a client asking this
         // server should see the same channel it would see there.
@@ -512,12 +658,20 @@ impl Chn {
     }
 
     pub(crate) fn grant(&mut self, cx_id: usize, op: bool) {
-        if op { self.ops.insert(cx_id); } else { self.voices.insert(cx_id); }
+        if op {
+            self.ops.insert(cx_id);
+        } else {
+            self.voices.insert(cx_id);
+        }
     }
 
-    pub(crate) fn revoke_op(&mut self, cx_id: usize) -> bool { self.ops.remove(&cx_id) }
+    pub(crate) fn revoke_op(&mut self, cx_id: usize) -> bool {
+        self.ops.remove(&cx_id)
+    }
 
-    pub(crate) fn revoke_voice(&mut self, cx_id: usize) -> bool { self.voices.remove(&cx_id) }
+    pub(crate) fn revoke_voice(&mut self, cx_id: usize) -> bool {
+        self.voices.remove(&cx_id)
+    }
 
     /// Remove a member and any privileges held there. Returns whether the user
     /// was present along with whether operators remain afterwards.
@@ -544,7 +698,9 @@ impl Chn {
     }
 
     /// User count for LIST replies.
-    pub fn member_count(&self) -> usize { self.members.len() }
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -573,9 +729,9 @@ pub struct ServerState {
     pub version: &'static str,
     pub started_at: Instant,
 
-    users: HashMap<String, Cx>,   // nick_key -> registered user
-    unreg: HashMap<usize, Cx>,    // connection id -> pre-registration record
-    chans: HashMap<String, Chn>,  // channel key (lowercased) -> channel
+    users: HashMap<String, Cx>,  // nick_key -> registered user
+    unreg: HashMap<usize, Cx>,   // connection id -> pre-registration record
+    chans: HashMap<String, Chn>, // channel key (lowercased) -> channel
     history: VecDeque<HistEntry>,
 
     pub oper_user: String,
@@ -598,9 +754,9 @@ pub struct ServerState {
     pub chanreg: crate::channels::ChannelRegistry,
 
     // ---- lifetime statistics (surfaced by the web property) ----
-    pub total_connections: u64,  // registered client sessions since start (excludes health checks)
-    pub peak_users: usize,       // high-water mark of concurrent registered users
-    pub messages_relayed: u64,   // PRIVMSG/NOTICE lines relayed
+    pub total_connections: u64, // registered client sessions since start (excludes health checks)
+    pub peak_users: usize,      // high-water mark of concurrent registered users
+    pub messages_relayed: u64,  // PRIVMSG/NOTICE lines relayed
 
     /// Path to the LLM-generated release-notes JSON served by the web property.
     pub release_notes_path: Option<String>,
@@ -618,6 +774,22 @@ pub struct ServerState {
     pub network: crate::network::Network,
     /// Live links to directly-connected peers.
     pub links: Vec<crate::link::LinkHandle>,
+
+    /// Connection whose command is being dispatched. Lines addressed back to
+    /// it are held in `reply_buf` and queued as one write, so a full reply
+    /// queue waits instead of discarding the tail of a LIST/WHO/NAMES burst.
+    pub reply_for: Option<usize>,
+    /// Label to echo, already checked against the negotiated caps and the
+    /// 64-byte limit. `None` when this command is not a labeled response.
+    pub reply_label: Option<String>,
+    /// The command delivered the client's own PRIVMSG/NOTICE back to them.
+    /// That copy is not a labeled response, and it is not an empty command,
+    /// so it must not grow an ACK.
+    pub reply_self_msg: bool,
+    /// When set, `deliver` skips the reply buffer. Used for the one line that
+    /// is the client's own message coming back.
+    pub bypass_reply_capture: bool,
+    pub reply_buf: Vec<String>,
 }
 
 impl ServerState {
@@ -647,7 +819,9 @@ impl ServerState {
             ping_outstanding: HashMap::new(),
             grace_reclaim: HashMap::new(),
             accounts: crate::accounts::AccountStore::load(std::env::var("IRC_ACCOUNTS_PATH").ok()),
-            chanreg: crate::channels::ChannelRegistry::load(std::env::var("IRC_CHANNELS_PATH").ok()),
+            chanreg: crate::channels::ChannelRegistry::load(
+                std::env::var("IRC_CHANNELS_PATH").ok(),
+            ),
             limits: crate::limits::Limits::default(),
             sources: crate::limits::SourceTable::new(),
             bans: crate::bans::BanStore::load(std::env::var("IRC_BANS_PATH").ok()),
@@ -655,6 +829,11 @@ impl ServerState {
                 &std::env::var("IRC_SID").unwrap_or_else(|_| "0CL".into()),
             ),
             links: Vec::new(),
+            reply_for: None,
+            reply_label: None,
+            reply_self_msg: false,
+            bypass_reply_capture: false,
+            reply_buf: Vec::new(),
             total_connections: 0,
             peak_users: 0,
             messages_relayed: 0,
@@ -679,7 +858,9 @@ impl ServerState {
     }
 
     /// Server name prefixed with the trailing-marker colon for reply lines.
-    pub fn prefix(&self) -> String { format!(":{}", self.name) }
+    pub fn prefix(&self) -> String {
+        format!(":{}", self.name)
+    }
 
     /// Find a registered user by normalized nick key. If not present directly,
     /// walk recent nickname changes (RFC 8.9) within the recency window.
@@ -690,9 +871,11 @@ impl ServerState {
                 return Some(u);
             }
             let now = Instant::now();
-            let hop = self.history.iter().rev().find(|h| {
-                h.old_key == *cur && now.duration_since(h.at) <= RENAME_WINDOW
-            });
+            let hop = self
+                .history
+                .iter()
+                .rev()
+                .find(|h| h.old_key == *cur && now.duration_since(h.at) <= RENAME_WINDOW);
             match hop {
                 Some(h) => cur = &h.new_key,
                 None => return None,
@@ -723,7 +906,9 @@ impl ServerState {
 
     // ---- user-table accessors ----------------------------------------------
 
-    pub fn unreg_mut(&mut self, id: usize) -> Option<&mut Cx> { self.unreg.get_mut(&id) }
+    pub fn unreg_mut(&mut self, id: usize) -> Option<&mut Cx> {
+        self.unreg.get_mut(&id)
+    }
 
     /// Park the pre-registration record for a freshly accepted connection. The
     /// reply queue and close-notify are wired so pairing slots can fill before
@@ -754,6 +939,7 @@ impl ServerState {
             pending_user: None,
             cap_negotiating: false,
             cap_gated_welcome: false,
+            batch_seq: 0,
             reg_challenged: false,
             reg_verified: false,
             away: None,
@@ -785,7 +971,10 @@ impl ServerState {
         if let Some(u) = self.unreg.get_mut(&id) {
             return Some(u);
         }
-        self.users.iter_mut().find(|(_, u)| u.id == id).map(|(_, u)| u)
+        self.users
+            .iter_mut()
+            .find(|(_, u)| u.id == id)
+            .map(|(_, u)| u)
     }
 
     /// Complete registration. Returns None when the nick is already taken; the
@@ -798,7 +987,10 @@ impl ServerState {
         host: String,
         realname: &str,
     ) -> Option<&Cx> {
-        let mut cx = match self.unreg.remove(&id) { Some(c) => c, None => return None };
+        let mut cx = match self.unreg.remove(&id) {
+            Some(c) => c,
+            None => return None,
+        };
         let nick_key = norm_nick(nick_display);
         if self.users.contains_key(&nick_key) {
             self.unreg.insert(id, cx);
@@ -821,21 +1013,27 @@ impl ServerState {
     }
 
     /// Whether a normalized nick key is currently free.
-    pub fn nick_free(&self, key: &str) -> bool { !self.users.contains_key(key) }
+    pub fn nick_free(&self, key: &str) -> bool {
+        !self.users.contains_key(key)
+    }
 
     /// Apply a rename for an already-registered connection (callers verify the
     /// target key is free first). Records the change per RFC 8.9; joined channels
     /// are untouched, so renames keep their memberships.
     pub fn apply_rename(&mut self, id: usize, new_display: &str) {
         let old_key = match self.find_by_id(id).map(|u| u.nick_key.clone()) {
-            Some(k) => k, None => return,
+            Some(k) => k,
+            None => return,
         };
         let new_key = norm_nick(new_display);
         if old_key == new_key {
             return; // cosmetic re-casing: dropped (key-normalized equality)
         }
         self.record_rename(&old_key, &new_key, id);
-        let mut cx = match self.users.remove(&old_key) { Some(c) => c, None => return };
+        let mut cx = match self.users.remove(&old_key) {
+            Some(c) => c,
+            None => return,
+        };
         cx.nick = new_display.to_string();
         let insert_key = new_key.clone();
         cx.nick_key = new_key;
@@ -844,7 +1042,9 @@ impl ServerState {
 
     /// Record a nickname change in the history required by RFC 8.9.
     pub fn record_rename(&mut self, old_key: &str, new_key: &str, cx_id: usize) {
-        if old_key == new_key { return; }
+        if old_key == new_key {
+            return;
+        }
         self.history.push_back(HistEntry {
             old_key: old_key.to_string(),
             new_key: new_key.to_string(),
@@ -863,9 +1063,13 @@ impl ServerState {
 
     /// Channel access. The key is folded with `CASEMAPPING=rfc1459` here, so
     /// callers may pass either the raw name or an already-folded key.
-    pub fn chan(&self, key: &str) -> Option<&Chn> { self.chans.get(&norm_nick(key)) }
+    pub fn chan(&self, key: &str) -> Option<&Chn> {
+        self.chans.get(&norm_nick(key))
+    }
 
-    pub fn chan_mut(&mut self, key: &str) -> Option<&mut Chn> { self.chans.get_mut(&norm_nick(key)) }
+    pub fn chan_mut(&mut self, key: &str) -> Option<&mut Chn> {
+        self.chans.get_mut(&norm_nick(key))
+    }
 
     pub fn chans_iter(&self) -> impl Iterator<Item = (&String, &Chn)> + '_ {
         self.chans.iter()
@@ -890,7 +1094,11 @@ impl ServerState {
             u.signal_close();
             return Some(u);
         }
-        let key = self.users.values().find(|u| u.id == id).map(|u| u.nick_key.clone())?;
+        let key = self
+            .users
+            .values()
+            .find(|u| u.id == id)
+            .map(|u| u.nick_key.clone())?;
         let mut u = self.users.remove(&key)?;
         u.signal_close();
         Some(u)
@@ -934,7 +1142,9 @@ impl ServerState {
     /// covers only registered users, which meant parked connections were never
     /// pinged and never evicted -- an idle socket held an admission slot and its
     /// read buffer indefinitely.
-    pub fn each_unreg(&self) -> impl Iterator<Item = &Cx> + '_ { self.unreg.values() }
+    pub fn each_unreg(&self) -> impl Iterator<Item = &Cx> + '_ {
+        self.unreg.values()
+    }
 
     /// Every live connection, registered or not. A ban that only reaches
     /// registered users leaves the banned address's half-open sockets in place.
@@ -953,8 +1163,17 @@ impl ServerState {
             .filter_map(|u| {
                 let uuid = self.network.local_uuid(u.id)?;
                 Some(crate::link::uid_line(
-                    sid, uuid, now, &u.nick, &u.real_host, &u.host, &u.user,
-                    &u.real_host, now, "+", &u.realname,
+                    sid,
+                    uuid,
+                    now,
+                    &u.nick,
+                    &u.real_host,
+                    &u.host,
+                    &u.user,
+                    &u.real_host,
+                    now,
+                    "+",
+                    &u.realname,
                 ))
             })
             .collect()
@@ -971,8 +1190,12 @@ impl ServerState {
                     .filter_map(|id| {
                         let uuid = self.network.local_uuid(*id)?.clone();
                         let mut prefix = String::new();
-                        if c.ops.contains(id) { prefix.push('o'); }
-                        if c.voices.contains(id) { prefix.push('v'); }
+                        if c.ops.contains(id) {
+                            prefix.push('o');
+                        }
+                        if c.voices.contains(id) {
+                            prefix.push('v');
+                        }
                         Some((prefix, uuid))
                     })
                     .collect();
@@ -981,23 +1204,41 @@ impl ServerState {
                 }
                 let _ = key;
                 let (flags, params) = c.burst_mode_parts();
-                Some(crate::link::fjoin_line_with_params(sid, &c.display, c.created_at, &flags, &params, &members))
+                Some(crate::link::fjoin_line_with_params(
+                    sid,
+                    &c.display,
+                    c.created_at,
+                    &flags,
+                    &params,
+                    &members,
+                ))
             })
             .collect()
     }
 
     /// Local connection ids in a channel, for delivering remote traffic.
     pub fn local_members(&self, chan_key: &str) -> Vec<usize> {
-        self.chans.get(&norm_nick(chan_key)).map(|c| c.members.iter().copied().collect()).unwrap_or_default()
+        self.chans
+            .get(&norm_nick(chan_key))
+            .map(|c| c.members.iter().copied().collect())
+            .unwrap_or_default()
     }
 
-    pub fn user_count(&self) -> usize { self.users.len() }
+    pub fn user_count(&self) -> usize {
+        self.users.len()
+    }
 
-    pub fn chan_count(&self) -> usize { self.chans.len() }
+    pub fn chan_count(&self) -> usize {
+        self.chans.len()
+    }
 
-    pub fn invis_count(&self) -> usize { self.users.values().filter(|u| u.invis).count() }
+    pub fn invis_count(&self) -> usize {
+        self.users.values().filter(|u| u.invis).count()
+    }
 
-    pub fn oper_count(&self) -> usize { self.users.values().filter(|u| u.oper).count() }
+    pub fn oper_count(&self) -> usize {
+        self.users.values().filter(|u| u.oper).count()
+    }
 
     /// Iteration over registered users (shared) for broadcasts.
     pub fn each_user(&self) -> impl Iterator<Item = &Cx> + '_ {
@@ -1042,6 +1283,9 @@ mod tests {
         assert_eq!(norm_nick("#Foo[bar]"), norm_nick("#foo{bar}"));
         assert_eq!(norm_nick("x^y"), norm_nick("X~Y"));
         assert_eq!(norm_nick(&norm_nick("A{b}|^")), norm_nick("a[b]\\~"));
+        assert!(is_service_name("NickServ"));
+        assert!(is_service_name("chanserv"));
+        assert!(!is_service_name("nickserve"));
     }
 
     #[test]
@@ -1087,6 +1331,7 @@ mod tests {
             pending_user: None,
             cap_negotiating: false,
             cap_gated_welcome: false,
+            batch_seq: 0,
             reg_challenged: false,
             reg_verified: false,
             away: None,
@@ -1105,9 +1350,8 @@ mod tests {
     #[test]
     fn lookup_walks_recent_renames() {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let mut state = ServerState::new(
-            "srv", "o", "p", "loc1", "loc2", "a@b.c", "127.0.0.1 6697"
-        );
+        let mut state =
+            ServerState::new("srv", "o", "p", "loc1", "loc2", "a@b.c", "127.0.0.1 6697");
         // Simulate a registered user directly: register needs an unreg record,
         // so exercise the history-walk predicate in isolation instead.
         state.record_rename("oldnick", "newnick", 1);
@@ -1115,7 +1359,6 @@ mod tests {
         let _: tokio::sync::mpsc::Sender<String> = tx;
     }
 }
-
 
 #[cfg(test)]
 mod wildcard_tests {

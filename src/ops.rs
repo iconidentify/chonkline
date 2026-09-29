@@ -16,7 +16,9 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Per-connection reply queue depth. At ~200 bytes/line this bounds one
 /// connection's queued output near 100 KiB, so the 512-client ceiling implies a
-/// provable worst case rather than an open-ended one.
+/// provable worst case rather than an open-ended one. A command's own reply is
+/// a single queue item (so LIST cannot be truncated mid-burst); that item is
+/// bounded by how many channels and members the server is willing to hold.
 const REPLY_QUEUE: usize = 512;
 
 /// Per-connection flood window (RFC 8.10): one message per two seconds is the
@@ -30,7 +32,10 @@ const FAKELAG_MAX: Duration = Duration::from_millis(2000);
 /// Env-tunable (CHONKLINE_FLOOD_WINDOW_MS, default 2000ms) so the test suite can
 /// shrink it; production keeps the 2-second default.
 fn flood_window() -> Duration {
-    let ms: u64 = std::env::var("CHONKLINE_FLOOD_WINDOW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+    let ms: u64 = std::env::var("CHONKLINE_FLOOD_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
     Duration::from_millis(ms.max(1))
 }
 
@@ -129,7 +134,10 @@ fn proxy_trusted_peer(peer: &str) -> bool {
 /// share a single cloak, since their real address never arrives.
 fn proxy_exempt_peer(peer: &str) -> bool {
     match std::env::var("IRC_PROXY_PROTOCOL_EXEMPT") {
-        Ok(list) => list.split(',').map(str::trim).any(|e| !e.is_empty() && e == peer),
+        Ok(list) => list
+            .split(',')
+            .map(str::trim)
+            .any(|e| !e.is_empty() && e == peer),
         Err(_) => false,
     }
 }
@@ -154,10 +162,7 @@ fn arm_keepalive(sock: &TcpStream) {
 }
 
 /// Accept one plaintext client connection, run its read/write tasks, return the id.
-pub fn spawn_connection(
-    state: &Arc<Mutex<ServerState>>,
-    sock: TcpStream,
-) -> usize {
+pub fn spawn_connection(state: &Arc<Mutex<ServerState>>, sock: TcpStream) -> usize {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     arm_keepalive(&sock);
 
@@ -212,7 +217,11 @@ async fn admit_and_run(
     // prepends. The stream is *peeked* first: a TLS ClientHello must not be
     // consumed by a header read, so bytes are only taken once they are known to
     // begin a header. That also makes Optional mode safe on the TLS port.
-    let mode = if is_tls { tls_proxy_mode() } else { proxy_mode() };
+    let mode = if is_tls {
+        tls_proxy_mode()
+    } else {
+        proxy_mode()
+    };
     // Set only when the address below came from a header that arrived on a
     // path we explicitly trust. That is what makes the claim actionable.
     let mut trusted_header = false;
@@ -223,9 +232,14 @@ async fn admit_and_run(
         let peeked = match tokio::time::timeout(
             Duration::from_secs(10),
             crate::proxyproto::peek_is_header(&sock),
-        ).await {
+        )
+        .await
+        {
             Ok(p) => p,
-            Err(_) => { crate::log::counted("proxy.timeout", ""); return; }
+            Err(_) => {
+                crate::log::counted("proxy.timeout", "");
+                return;
+            }
         };
         match peeked {
             // The trust decision belongs here, not on accept: a probe that
@@ -234,13 +248,21 @@ async fn admit_and_run(
             // the same way probes once filled the log with failed handshakes.
             crate::proxyproto::Peek::Header if !proxy_trusted_peer(&peer) => {
                 crate::log::counted("proxy.untrusted_peer", &peer);
-                refuse(&mut sock, is_tls, "PROXY protocol header not accepted from this address").await;
+                refuse(
+                    &mut sock,
+                    is_tls,
+                    "PROXY protocol header not accepted from this address",
+                )
+                .await;
                 return;
             }
             crate::proxyproto::Peek::Header => match tokio::time::timeout(
                 Duration::from_secs(10),
                 crate::proxyproto::read_v1(&mut sock),
-            ).await.unwrap_or(crate::proxyproto::Header::Invalid) {
+            )
+            .await
+            .unwrap_or(crate::proxyproto::Header::Invalid)
+            {
                 crate::proxyproto::Header::Source(addr) => {
                     trusted_header = proxy_trust_configured();
                     addr
@@ -251,7 +273,12 @@ async fn admit_and_run(
                 // bypass every limit. Refuse instead.
                 crate::proxyproto::Header::Unknown => {
                     crate::log::counted("proxy.unknown", &peer);
-                    refuse(&mut sock, is_tls, "PROXY protocol header carries no client address").await;
+                    refuse(
+                        &mut sock,
+                        is_tls,
+                        "PROXY protocol header carries no client address",
+                    )
+                    .await;
                     return;
                 }
                 crate::proxyproto::Header::Empty => return, // hung up mid-header
@@ -295,7 +322,11 @@ async fn admit_and_run(
     // So use the claimed address when it arrived over an explicitly trusted
     // path, and the peer otherwise. An untrusted peer cannot supply a header at
     // all, so the two agree exactly when it matters.
-    let exempt_key = if trusted_header { limit_key.as_str() } else { peer.as_str() };
+    let exempt_key = if trusted_header {
+        limit_key.as_str()
+    } else {
+        peer.as_str()
+    };
     let exempt = {
         let stg = state.lock().unwrap_or_else(|e| e.into_inner());
         crate::limits::SourceTable::is_exempt(&stg.limits, exempt_key)
@@ -341,7 +372,13 @@ async fn admit_and_run(
     // seconds and would otherwise be ~95% of the log, rotating the real events
     // out of retention within hours. The security-relevant event is a session
     // reaching registration, logged from the registration path instead.
-    crate::log::conn_open_peer(id, &real_host, &host, &peer, if is_tls { "tls" } else { "plain" });
+    crate::log::conn_open_peer(
+        id,
+        &real_host,
+        &host,
+        &peer,
+        if is_tls { "tls" } else { "plain" },
+    );
 
     // The handshake happens only after admission, so a refused connection never
     // costs a key exchange — which matters precisely when refusals are frequent.
@@ -358,7 +395,9 @@ async fn admit_and_run(
                 Ok(_) => {}
             }
             match acc.accept(sock).await {
-                Ok(stream) => run_session(&state, id, stream, &host, &real_host, &limit_key, exempt).await,
+                Ok(stream) => {
+                    run_session(&state, id, stream, &host, &real_host, &limit_key, exempt).await
+                }
                 Err(e) => {
                     crate::log::counted("tls.handshake_failed", &real_host);
                     let _ = e;
@@ -373,8 +412,11 @@ async fn admit_and_run(
     let nick = {
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
         let stg = &mut *guard;
-        stg.sources.release(&stg.limits, &limit_key, exempt, Instant::now());
-        stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_default()
+        stg.sources
+            .release(&stg.limits, &limit_key, exempt, Instant::now());
+        stg.find_by_id(id)
+            .map(|u| u.nick.clone())
+            .unwrap_or_default()
     };
     crate::log::conn_close(id, &real_host, &nick, "closed");
 }
@@ -384,7 +426,9 @@ async fn admit_and_run(
 /// is simply closed.
 async fn refuse(sock: &mut TcpStream, is_tls: bool, reason: &str) {
     if !is_tls {
-        let _ = sock.write_all(format!("ERROR :{}\r\n", reason).as_bytes()).await;
+        let _ = sock
+            .write_all(format!("ERROR :{}\r\n", reason).as_bytes())
+            .await;
     }
     let _ = sock.shutdown().await;
 }
@@ -419,7 +463,14 @@ async fn run_session<S>(
     });
 
     let notify = Arc::new(Notify::new());
-    park_unregistered(state, id, host.to_string(), real_host.to_string(), tx.clone(), notify.clone());
+    park_unregistered(
+        state,
+        id,
+        host.to_string(),
+        real_host.to_string(),
+        tx.clone(),
+        notify.clone(),
+    );
 
     run_reader(state.clone(), id, rd, notify, limit_key.to_string(), exempt).await;
 }
@@ -478,7 +529,18 @@ async fn run_reader<R>(
                 tokio::time::sleep(throttle).await;
                 throttle = Duration::ZERO;
             }
-            if process_segment(&state, id, &mut flood, &content, &src, exempt, &mut throttle) {
+            if process_segment(
+                &state,
+                id,
+                &mut flood,
+                &content,
+                &src,
+                exempt,
+                &mut throttle,
+                &notify,
+            )
+            .await
+            {
                 cleanup_on_eof(&state, id); // idempotent: no-ops when the session left cleanly via QUIT
                 return;
             }
@@ -509,7 +571,7 @@ fn charge_burst(flood: &mut VecDeque<Instant>) -> bool {
     flood.len() > FLOOD_BURST
 }
 
-fn process_segment(
+async fn process_segment(
     state: &Arc<Mutex<ServerState>>,
     id: usize,
     flood: &mut VecDeque<Instant>,
@@ -517,6 +579,7 @@ fn process_segment(
     src: &str,
     exempt: bool,
     throttle: &mut Duration,
+    notify: &Arc<Notify>,
 ) -> bool {
     if seg.is_empty() {
         // Still charged: a stream of bare newlines is real framing work, and
@@ -537,14 +600,28 @@ fn process_segment(
             }
             false
         }
-        Some(cmd) => route(state, id, flood, &cmd, src, exempt, throttle),
+        Some(cmd) => route(state, id, flood, &cmd, src, exempt, throttle, notify).await,
+    }
+}
+
+/// Queue `blob` if it fits. A full queue waits until the writer drains a slot
+/// or the connection is closed; the line is not dropped. Returns true when the
+/// session is gone and the reader should exit.
+async fn write_reply(tx: &mpsc::Sender<String>, notify: &Notify, blob: String) -> bool {
+    if blob.is_empty() {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        _ = notify.notified() => true,
+        res = tx.send(blob) => res.is_err(),
     }
 }
 
 /// Session-level gates applied before command dispatch: prefix authenticity
 /// (RFC 2.3), numeric-reply drops (RFC 2.4), the flood limit (RFC 8.10) and
 /// the registration gate. Returns true when the session must close.
-fn route(
+async fn route(
     state: &Arc<Mutex<ServerState>>,
     id: usize,
     flood: &mut VecDeque<Instant>,
@@ -552,12 +629,13 @@ fn route(
     src: &str,
     exempt: bool,
     throttle: &mut Duration,
+    notify: &Notify,
 ) -> bool {
     if cmd.name.len() == 3 && cmd.name.chars().all(|c| c.is_ascii_digit()) {
         return false; // numeric replies from clients are dropped (RFC 2.4)
     }
 
-    let quit = {
+    let (quit, pending) = {
         let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(pfx) = &cmd.prefix {
@@ -607,9 +685,13 @@ fn route(
         // Tier 2: the per-source aggregate budget. Without this, spreading
         // traffic across N connections multiplies the tier-1 allowance by N —
         // the limiter weakens in exact proportion to the abuse.
+        let mut disconnect = false;
         if !is_oper {
             let stg_ref = &mut *stg;
-            match stg_ref.sources.charge_message(&stg_ref.limits, src, exempt, now) {
+            match stg_ref
+                .sources
+                .charge_message(&stg_ref.limits, src, exempt, now)
+            {
                 Ok(()) => {}
                 Err(false) => {
                     crate::log::flood("dropped");
@@ -618,66 +700,135 @@ fn route(
                 Err(true) => {
                     // Persistent offenders are closed rather than throttled
                     // forever, which is what clients expect from an ircd.
-                    crate::log::flood("disconnected");
-                    let line = proto::line("", "ERROR", ":Excess flood");
-                    if let Some(u) = stg_ref.find_by_id(id) {
-                        if u.tx.try_send(line).is_err() { crate::log::counted("output.dropped", ""); }
+                    disconnect = true;
+                }
+            }
+        }
+        let decided = if disconnect {
+            crate::log::flood("disconnected");
+            crate::cmds::begin_reply(&mut stg, id, cmd);
+            crate::cmds::deliver(&mut stg, id, &proto::line("", "ERROR", ":Excess flood"));
+            let blob = crate::cmds::finish_reply(&mut stg, id);
+            (true, take_pending(&stg, id, blob))
+        } else {
+            // From here, every line addressed back to this connection is part of
+            // the command's reply and is queued atomically after dispatch.
+            crate::cmds::begin_reply(&mut stg, id, cmd);
+
+            // Registration gate: everything but the pairing commands requires a
+            // completed NICK/USER registration.
+            let open = match cmd.name.as_str() {
+                "NICK" | "USER" | "PASS" | "CAP" | "AUTHENTICATE" | "PING" | "PONG" => true,
+                _ => stg.find_by_id(id).map(|u| u.registered).unwrap_or(false),
+            };
+            if !open {
+                deliver_not_registered(&mut stg, id);
+                let blob = crate::cmds::finish_reply(&mut stg, id);
+                (false, take_pending(&stg, id, blob))
+            } else {
+                // Round-4 fast-reconnect resolution: an inbound PONG from a connection that
+                // holds an unanswered reclaim ping answers every held-back requester with
+                // the collision refusal and clears both bookkeeping entries at once.
+                // Any PONG satisfies the registration challenge and resumes the
+                // pairing that was held back for it.
+                if cmd.name == "PONG" {
+                    let pending = stg
+                        .find_by_id(id)
+                        .map(|u| !u.registered && u.reg_challenged && !u.reg_verified)
+                        .unwrap_or(false);
+                    if pending {
+                        if let Some(u) = stg.find_by_id_mut(id) {
+                            u.reg_verified = true;
+                        }
+                        crate::cmds::complete_pairing_if_ready(&mut stg, id);
                     }
-                    return true;
                 }
-            }
-        }
 
-        // Registration gate: everything but the pairing commands requires a
-        // completed NICK/USER registration.
-        let open = match cmd.name.as_str() {
-            "NICK" | "USER" | "PASS" | "CAP" | "AUTHENTICATE" | "PING" | "PONG" => true,
-            _ => stg.find_by_id(id).map(|u| u.registered).unwrap_or(false),
+                if cmd.name == "PONG" && stg.ping_outstanding.remove(&id).is_some() {
+                    if let Some(mark) = stg.grace_reclaim.remove(&id) {
+                        for (rid, ref_now) in mark.pairings.iter().chain(mark.renames.iter()) {
+                            crate::cmds::deliver_nickname_in_use(&mut stg, *rid, ref_now);
+                        }
+                    }
+                }
+
+                let quit = crate::cmds::dispatch(&mut stg, id, cmd);
+                let blob = crate::cmds::finish_reply(&mut stg, id);
+                (quit, take_pending(&stg, id, blob))
+            }
         };
-        if !open {
-            deliver_not_registered(&mut stg, id);
-            return false;
-        }
-
-        // Round-4 fast-reconnect resolution: an inbound PONG from a connection that
-        // holds an unanswered reclaim ping answers every held-back requester with
-        // the collision refusal and clears both bookkeeping entries at once.
-        // Any PONG satisfies the registration challenge and resumes the
-        // pairing that was held back for it.
-        if cmd.name == "PONG" {
-            let pending = stg
-                .find_by_id(id)
-                .map(|u| !u.registered && u.reg_challenged && !u.reg_verified)
-                .unwrap_or(false);
-            if pending {
-                if let Some(u) = stg.find_by_id_mut(id) {
-                    u.reg_verified = true;
-                }
-                crate::cmds::complete_pairing_if_ready(&mut stg, id);
-            }
-        }
-
-        if cmd.name == "PONG" && stg.ping_outstanding.remove(&id).is_some() {
-            if let Some(mark) = stg.grace_reclaim.remove(&id) {
-                for (rid, ref_now) in mark.pairings.iter().chain(mark.renames.iter()) {
-                    crate::cmds::deliver_nickname_in_use(&mut stg, *rid, ref_now);
-                }
-            }
-        }
-
-        crate::cmds::dispatch(&mut stg, id, cmd)
+        decided
     };
+    // The state lock is released with the block above, before this wait.
+    if flush_pending(notify, pending).await {
+        return true;
+    }
     quit
+}
+
+/// A reply that did not fit in the queue. The blob is owned so the state lock
+/// can be dropped before the wait.
+struct PendingReply {
+    tx: mpsc::Sender<String>,
+    blob: String,
+}
+
+/// Queue `blob` now when there is a free slot. `Some` means the reader has to
+/// wait outside the state lock; a closed queue is reported as a pending reply
+/// whose send will fail and close the session.
+fn take_pending(stg: &ServerState, id: usize, blob: String) -> Option<PendingReply> {
+    if blob.is_empty() {
+        return None;
+    }
+    let tx = stg.find_by_id(id)?.tx.clone();
+    match tx.try_send(blob) {
+        Ok(()) => None,
+        Err(mpsc::error::TrySendError::Full(blob)) => Some(PendingReply { tx, blob }),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            // The writer is gone. Hand back an already-closed send so the
+            // caller takes the same exit as a failed wait.
+            Some(PendingReply {
+                tx,
+                blob: "\r\n".into(),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod reply_queue_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_full_queue_still_delivers_the_whole_reply() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send("busy".into()).unwrap();
+        let notify = Notify::new();
+        let blob = "321\r\n322\r\n323\r\n".to_string();
+        let send = write_reply(&tx, &notify, blob);
+        let recv = async {
+            assert_eq!(rx.recv().await.unwrap(), "busy");
+            assert_eq!(rx.recv().await.unwrap(), "321\r\n322\r\n323\r\n");
+        };
+        let (closed, ()) = tokio::join!(send, recv);
+        assert!(!closed);
+    }
+}
+
+async fn flush_pending(notify: &Notify, pending: Option<PendingReply>) -> bool {
+    let Some(pending) = pending else { return false };
+    write_reply(&pending.tx, notify, pending.blob).await
 }
 
 /// ERR_NOTREGISTERED (RFC numeric 451).
 fn deliver_not_registered(stg: &mut ServerState, id: usize) {
     let p = stg.prefix();
-    let nick = stg.find_by_id(id).map(|u| u.nick.clone()).unwrap_or_else(|| "*".into());
+    let nick = stg
+        .find_by_id(id)
+        .map(|u| u.nick.clone())
+        .unwrap_or_else(|| "*".into());
     let line = proto::line(&p, "451", &format!("{} :You have not registered", nick));
-    if let Some(u) = stg.find_by_id(id) {
-        if u.tx.try_send(line).is_err() { crate::log::counted("output.dropped", ""); }
-    }
+    crate::cmds::deliver(stg, id, &line);
 }
 
 /// Natural-closure path (EOF or socket death): when the session still holds an
@@ -693,7 +844,7 @@ fn cleanup_on_eof(state: &Arc<Mutex<ServerState>>, id: usize) {
                 send_to(&stg, mid, &line); // only channel peers witness the quit
             }
         }
-        Some(_) => {} // unregistered: nothing to announce
+        Some(_) => {}   // unregistered: nothing to announce
         None => return, // already gone via QUIT/kill/etc.
     }
     stg.eject_user(id);
@@ -737,7 +888,9 @@ pub fn park_unregistered(
 /// fair illustration of both the value and the risk.
 pub(crate) fn registration_challenge_enabled() -> bool {
     matches!(
-        std::env::var("CHONKLINE_REG_CHALLENGE").unwrap_or_default().as_str(),
+        std::env::var("CHONKLINE_REG_CHALLENGE")
+            .unwrap_or_default()
+            .as_str(),
         "1" | "true" | "yes" | "on"
     )
 }
@@ -754,12 +907,18 @@ fn registration_window() -> Duration {
 }
 
 fn eviction_window() -> std::time::Duration {
-    let secs: u64 = std::env::var("CHONKLINE_EVICTION_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    let secs: u64 = std::env::var("CHONKLINE_EVICTION_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
     std::time::Duration::from_secs(secs.max(1))
 }
 
 fn ping_after_window() -> std::time::Duration {
-    let secs: u64 = std::env::var("CHONKLINE_PING_AFTER_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    let secs: u64 = std::env::var("CHONKLINE_PING_AFTER_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
     std::time::Duration::from_secs(secs.max(1))
 }
 
@@ -777,12 +936,18 @@ fn ping_after_window() -> std::time::Duration {
 /// targeted disconnect loop against any named user for one 12-byte line every
 /// three seconds. 60s is long enough that only genuinely absent clients qualify.
 pub(crate) fn reclaim_silence_window() -> std::time::Duration {
-    let secs: u64 = std::env::var("CHONKLINE_RECLAIM_SILENCE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+    let secs: u64 = std::env::var("CHONKLINE_RECLAIM_SILENCE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
     std::time::Duration::from_secs(secs)
 }
 
 pub(crate) fn reclaim_grace_window() -> std::time::Duration {
-    let secs: u64 = std::env::var("CHONKLINE_RECLAIM_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let secs: u64 = std::env::var("CHONKLINE_RECLAIM_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     std::time::Duration::from_secs(secs.max(1))
 }
 
@@ -802,7 +967,9 @@ pub fn reclaim_tick(state: &Arc<Mutex<ServerState>>) {
         .collect();
 
     for holder_id in expired_now {
-        let Some(mark) = stg.grace_reclaim.remove(&holder_id) else { continue; };
+        let Some(mark) = stg.grace_reclaim.remove(&holder_id) else {
+            continue;
+        };
         stg.ping_outstanding.remove(&holder_id);
         announce_loss_and_evict(&mut stg, holder_id, "Ghost: not answering reclaim ping");
         for (rid, _ref_now) in mark.pairings {
@@ -838,9 +1005,7 @@ pub fn liveness_tick(state: &Arc<Mutex<ServerState>>) {
     let expired: Vec<usize> = stg
         .ping_outstanding
         .iter()
-        .filter_map(|(&id, &at)| {
-            (now.duration_since(at) > eviction_window()).then_some(id)
-        })
+        .filter_map(|(&id, &at)| (now.duration_since(at) > eviction_window()).then_some(id))
         .collect();
     for id in expired {
         stg.ping_outstanding.remove(&id);
@@ -871,14 +1036,14 @@ pub fn liveness_tick(state: &Arc<Mutex<ServerState>>) {
 pub fn broadcast_counter_snotes(state: &Arc<Mutex<ServerState>>, totals: &[(String, String, u64)]) {
     fn threshold(name: &str) -> u64 {
         match name {
-            "conn.banned" => 1,        // any ban hit is worth seeing
+            "conn.banned" => 1, // any ban hit is worth seeing
             "flood" => 3,
             "proxy.rejected" | "proxy.unknown" => 5,
             "conn.refused" => 10,
-            "session.new" => 20,       // a registration burst is the drone-flood signature
+            "session.new" => 20, // a registration burst is the drone-flood signature
             "reg.timeout" => 20,
             "output.dropped" => 50,
-            _ => u64::MAX,             // unknown counters stay silent
+            _ => u64::MAX, // unknown counters stay silent
         }
     }
 
@@ -905,7 +1070,9 @@ pub fn broadcast_counter_snotes(state: &Arc<Mutex<ServerState>>, totals: &[(Stri
 /// Send one pre-formed line to a connection's reply queue (best effort).
 fn send_to(stg: &ServerState, id: usize, line: &str) {
     if let Some(u) = stg.find_by_id(id) {
-        if u.tx.try_send(line.to_string()).is_err() { crate::log::counted("output.dropped", ""); }
+        if u.tx.try_send(line.to_string()).is_err() {
+            crate::log::counted("output.dropped", "");
+        }
     }
 }
 
@@ -921,4 +1088,3 @@ pub(crate) fn announce_loss_and_evict(stg: &mut ServerState, id: usize, reason: 
     stg.drop_empty_channels();
     let _ = stg.evict(id);
 }
-

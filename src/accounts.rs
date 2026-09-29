@@ -79,6 +79,9 @@ impl AccountStore {
         if key.is_empty() {
             return Err("invalid account name");
         }
+        if crate::state::is_service_name(&key) {
+            return Err("that name is reserved");
+        }
         if self.map.contains_key(&key) {
             return Err("account already registered");
         }
@@ -89,8 +92,36 @@ impl AccountStore {
         let hash = pbkdf2_sha256(pass.as_bytes(), &salt, ITERS, HASH_LEN);
         self.map.insert(
             key,
-            Account { name: name.to_string(), salt, hash, iters: ITERS },
+            Account {
+                name: name.to_string(),
+                salt,
+                hash,
+                iters: ITERS,
+            },
         );
+        self.save();
+        Ok(())
+    }
+
+    /// Replace the password of an existing account. A fresh salt is used, so a
+    /// captured old hash cannot be replayed against the new password. The
+    /// caller has to decide who is allowed to ask (an identified session, and
+    /// usually the current password).
+    pub fn set_password(&mut self, name: &str, new_pass: &str) -> Result<(), &'static str> {
+        let key = norm_nick(name);
+        if new_pass.is_empty() {
+            return Err("password required");
+        }
+        let salt = random_salt();
+        let hash = pbkdf2_sha256(new_pass.as_bytes(), &salt, ITERS, HASH_LEN);
+        {
+            let Some(acct) = self.map.get_mut(&key) else {
+                return Err("account not registered");
+            };
+            acct.salt = salt;
+            acct.hash = hash;
+            acct.iters = ITERS;
+        }
         self.save();
         Ok(())
     }
@@ -143,7 +174,12 @@ fn parse_line(line: &str) -> Option<Account> {
     if name.is_empty() || salt.is_empty() || hash.is_empty() {
         return None;
     }
-    Some(Account { name, salt, hash, iters })
+    Some(Account {
+        name,
+        salt,
+        hash,
+        iters,
+    })
 }
 
 #[cfg(test)]
@@ -159,6 +195,21 @@ mod tests {
         assert!(!s.verify("bob", "hunter2"));
         // duplicate registration refused
         assert!(s.register("ALICE", "other").is_err());
+        // services names are not accounts
+        assert!(s.register("NickServ", "x").is_err());
+        assert!(s.register("ChanServ", "x").is_err());
+    }
+
+    #[test]
+    fn password_can_be_replaced() {
+        let mut s = AccountStore::load(None);
+        s.register("Alice", "old").unwrap();
+        assert!(s.set_password("alice", "new").is_ok());
+        assert!(!s.verify("alice", "old"));
+        assert!(s.verify("ALICE", "new"));
+        assert!(s.set_password("alice", "").is_err());
+        assert!(s.verify("alice", "new"));
+        assert!(s.set_password("missing", "x").is_err());
     }
 
     #[test]
