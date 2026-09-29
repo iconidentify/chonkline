@@ -3,15 +3,18 @@ use std::fmt::Write as _;
 pub const VERSION: &str = "chonkline-beta";
 pub const MAX_LINE_WITH_CRLF: usize = 512; // RFC 2.3: incl. trailing CR-LF
 pub const MAX_CONTENT_BYTES: usize = 510;
-pub const MAX_PARAMS: usize = 15;         // RFC 2.3: up to 15 parameters
+pub const MAX_PARAMS: usize = 15; // RFC 2.3: up to 15 parameters
 
 #[derive(Debug, Clone)]
 pub struct Command {
     pub prefix: Option<String>,
     pub name: String,
     pub params: Vec<String>,
+    /// IRCv3 message tags, values already unescaped. A tag with no `=` has
+    /// `None`. Client tags are kept so a labeled command can be correlated;
+    /// nothing here is copied onto a relayed line.
+    pub tags: Vec<(String, Option<String>)>,
 }
-
 
 fn needs_trailing_marker(s: &str) -> bool {
     !s.is_empty() && s.contains(' ') && !s.starts_with(':')
@@ -91,6 +94,40 @@ pub fn escape_tag_value(s: &str) -> String {
     out
 }
 
+/// Inverse of `escape_tag_value`. A trailing backslash and unknown escapes
+/// keep the escaped character, matching the message-tags spec.
+pub fn unescape_tag_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some(':') => out.push(';'),
+            Some('s') => out.push(' '),
+            Some('\\') => out.push('\\'),
+            Some('r') => out.push('\r'),
+            Some('n') => out.push('\n'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Split an `@tag;tag=value` body. Empty entries (a doubled `;`) are skipped.
+pub fn parse_tags(raw: &str) -> Vec<(String, Option<String>)> {
+    raw.split(';')
+        .filter(|t| !t.is_empty())
+        .map(|tag| match tag.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(unescape_tag_value(v))),
+            None => (tag.to_string(), None),
+        })
+        .collect()
+}
+
 /// IRCv3 `server-time` timestamp: ISO-8601 UTC with milliseconds, e.g.
 /// `2026-08-16T08:12:34.567Z`.
 pub fn ircv3_timestamp() -> String {
@@ -100,7 +137,13 @@ pub fn ircv3_timestamp() -> String {
     let (y, mo, d, h, mi, s) = civil_from_epoch(now.as_secs());
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        y, mo, d, h, mi, s, now.subsec_millis()
+        y,
+        mo,
+        d,
+        h,
+        mi,
+        s,
+        now.subsec_millis()
     )
 }
 
@@ -110,10 +153,31 @@ mod tests {
 
     #[test]
     fn parses_message_tags_then_the_command() {
-        let c = parse("@+draft/reply=abc;time=2020-01-01T00:00:00.000Z PRIVMSG #chan :hello world").unwrap();
+        let c = parse("@+draft/reply=abc;time=2020-01-01T00:00:00.000Z PRIVMSG #chan :hello world")
+            .unwrap();
         assert_eq!(c.name, "PRIVMSG");
         assert_eq!(c.params, vec!["#chan", "hello world"]);
+        assert_eq!(
+            c.tags,
+            vec![
+                ("+draft/reply".to_string(), Some("abc".to_string())),
+                (
+                    "time".to_string(),
+                    Some("2020-01-01T00:00:00.000Z".to_string())
+                ),
+            ]
+        );
         assert!(parse("@tag-without-a-space").is_none());
+    }
+
+    #[test]
+    fn tag_values_round_trip_escapes() {
+        let c = parse("@label=a\\:b\\sc\\\\d PRIVMSG #chan :hi").unwrap();
+        assert_eq!(
+            c.tags,
+            vec![("label".to_string(), Some("a;b c\\d".to_string()))]
+        );
+        assert_eq!(escape_tag_value("a;b c\\d"), "a\\:b\\sc\\\\d");
     }
 
     #[test]
@@ -170,11 +234,17 @@ mod tests {
             params("srv", "431", &["x", ":No nickname given"]),
             "srv 431 x :No nickname given\r\n"
         );
-        assert_eq!(line("srv", "PONG", ":some token"), "srv PONG :some token\r\n");
+        assert_eq!(
+            line("srv", "PONG", ":some token"),
+            "srv PONG :some token\r\n"
+        );
     }
 }
-/// Parse one message per the RFC 2.3 grammar: optional `:<prefix>` then command name, then space-separated parameters with a token-boundary trailing marker. Lines over length, containing NULs, or missing commands are rejected silently.
-/// Parse one message per the RFC 2.3 grammar: optional `:<prefix>` then command name, then space-separated parameters with a token-boundary trailing marker. Lines over length, containing NULs, or missing commands are rejected silently.
+/// Parse one message per the RFC 2.3 grammar: optional `:<prefix>` then command
+/// name, then space-separated parameters with a token-boundary trailing marker.
+/// A leading `@tags` list is stored on the command and is not part of the
+/// grammar. Lines over length, containing NULs, or missing commands are
+/// rejected silently.
 pub fn parse(line: &str) -> Option<Command> {
     if line.len() > MAX_CONTENT_BYTES || line.is_empty() || line.bytes().any(|b| b == 0x00) {
         return None;
@@ -182,11 +252,12 @@ pub fn parse(line: &str) -> Option<Command> {
     // IRCv3 message-tags: `@tags ` is stripped before the RFC 2.3 grammar.
     // Client tags are accepted so a tagged command is not dropped; this server
     // does not relay tags it did not generate itself.
-    let line = if let Some(rest) = line.strip_prefix('@') {
+    let (tags, line) = if let Some(rest) = line.strip_prefix('@') {
         let sp = rest.find(|c: char| c.is_ascii_whitespace())?;
-        rest[sp..].trim_start()
+        let (raw_tags, rest) = rest.split_at(sp);
+        (parse_tags(raw_tags), rest.trim_start())
     } else {
-        line
+        (Vec::new(), line)
     };
     if line.is_empty() {
         return None;
@@ -206,8 +277,14 @@ pub fn parse(line: &str) -> Option<Command> {
         None => line,
     };
 
-    let name_end_now: usize = rest_now.find(|c: char| c.is_ascii_whitespace()).unwrap_or(rest_now.len());
-    if name_end_now == 0 || !rest_now[..name_end_now].chars().all(|c| c.is_ascii_alphabetic()) {
+    let name_end_now: usize = rest_now
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(rest_now.len());
+    if name_end_now == 0
+        || !rest_now[..name_end_now]
+            .chars()
+            .all(|c| c.is_ascii_alphabetic())
+    {
         return None;
     }
 
@@ -233,9 +310,15 @@ pub fn parse(line: &str) -> Option<Command> {
         params_now.push(tok2.into_iter().collect());
     }
 
-    if params_now.len() > MAX_PARAMS { return None; }
+    if params_now.len() > MAX_PARAMS {
+        return None;
+    }
 
     let name_now: String = rest_now[..name_end_now].to_string();
-    Some(Command { prefix: prefix_now, name: name_now.to_uppercase(), params: params_now })
+    Some(Command {
+        prefix: prefix_now,
+        name: name_now.to_uppercase(),
+        params: params_now,
+        tags,
+    })
 }
-

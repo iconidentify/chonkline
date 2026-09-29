@@ -11,7 +11,8 @@ use irc_server::crypto::base64_encode;
 
 fn client(addr: &str) -> TcpStream {
     let s = TcpStream::connect(addr).expect("connect");
-    s.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
     s
 }
 
@@ -54,10 +55,24 @@ fn cap_ls_advertises_supported_caps() {
     let mut c = client(&addr);
     send(&mut c, "CAP LS 302");
     let ls = drain_until(&mut c, "LS :", 3);
-    for cap in ["sasl", "message-tags", "server-time", "account-tag", "away-notify", "extended-join", "account-notify", "multi-prefix"] {
+    for cap in [
+        "sasl",
+        "message-tags",
+        "server-time",
+        "account-tag",
+        "away-notify",
+        "extended-join",
+        "account-notify",
+        "multi-prefix",
+        "batch",
+        "labeled-response",
+    ] {
         assert!(ls.contains(cap), "CAP LS missing {cap}: {ls:?}");
     }
-    assert!(ls.contains("sasl=PLAIN"), "CAP LS 302 should carry sasl=PLAIN: {ls:?}");
+    assert!(
+        ls.contains("sasl=PLAIN"),
+        "CAP LS 302 should carry sasl=PLAIN: {ls:?}"
+    );
 }
 
 #[test]
@@ -69,7 +84,10 @@ fn nickserv_register_then_sasl_login() {
     register(&mut a, "alice");
     send(&mut a, "PRIVMSG NickServ :REGISTER hunter2");
     let reg = drain_until(&mut a, "registered", 3);
-    assert!(reg.contains("NickServ") && reg.contains("registered"), "register NOTICE absent: {reg:?}");
+    assert!(
+        reg.contains("NickServ") && reg.contains("registered"),
+        "register NOTICE absent: {reg:?}"
+    );
 
     // Second connection logs in with SASL PLAIN before completing registration.
     let mut b = client(&addr);
@@ -77,24 +95,42 @@ fn nickserv_register_then_sasl_login() {
     let _ = drain_until(&mut b, "LS :", 3);
     send(&mut b, "CAP REQ :sasl");
     let ack = drain_until(&mut b, "ACK", 3);
-    assert!(ack.contains("ACK") && ack.contains("sasl"), "CAP REQ not ACKed: {ack:?}");
+    assert!(
+        ack.contains("ACK") && ack.contains("sasl"),
+        "CAP REQ not ACKed: {ack:?}"
+    );
     send(&mut b, "AUTHENTICATE PLAIN");
     let plus = drain_until(&mut b, "AUTHENTICATE +", 3);
-    assert!(plus.contains("AUTHENTICATE +"), "server did not prompt for PLAIN payload: {plus:?}");
+    assert!(
+        plus.contains("AUTHENTICATE +"),
+        "server did not prompt for PLAIN payload: {plus:?}"
+    );
     // PLAIN payload = authzid \0 authcid \0 passwd
     let payload = base64_encode(b"\0alice\0hunter2");
     send(&mut b, &format!("AUTHENTICATE {}", payload));
     let done = drain_until(&mut b, " 903 ", 3);
-    assert!(done.contains(" 900 "), "RPL_LOGGEDIN (900) absent: {done:?}");
-    assert!(done.contains(" 903 "), "RPL_SASLSUCCESS (903) absent: {done:?}");
-    assert!(done.contains("alice"), "900 should name the account: {done:?}");
+    assert!(
+        done.contains(" 900 "),
+        "RPL_LOGGEDIN (900) absent: {done:?}"
+    );
+    assert!(
+        done.contains(" 903 "),
+        "RPL_SASLSUCCESS (903) absent: {done:?}"
+    );
+    assert!(
+        done.contains("alice"),
+        "900 should name the account: {done:?}"
+    );
 
     // Registration completes after CAP END.
     send(&mut b, "CAP END");
     send(&mut b, "NICK bob");
     send(&mut b, "USER bob 0 * :Bob");
     let welcome = drain_until(&mut b, " 001 ", 3);
-    assert!(welcome.contains(" 001 "), "welcome withheld after SASL+CAP END: {welcome:?}");
+    assert!(
+        welcome.contains(" 001 "),
+        "welcome withheld after SASL+CAP END: {welcome:?}"
+    );
 }
 
 #[test]
@@ -110,9 +146,15 @@ fn sasl_wrong_password_fails() {
     let _ = drain_until(&mut b, "ACK", 3);
     send(&mut b, "AUTHENTICATE PLAIN");
     let _ = drain_until(&mut b, "AUTHENTICATE +", 3);
-    send(&mut b, &format!("AUTHENTICATE {}", base64_encode(b"\0carol\0wrongpass")));
+    send(
+        &mut b,
+        &format!("AUTHENTICATE {}", base64_encode(b"\0carol\0wrongpass")),
+    );
     let fail = drain_until(&mut b, " 904 ", 3);
-    assert!(fail.contains(" 904 "), "wrong password should yield 904: {fail:?}");
+    assert!(
+        fail.contains(" 904 "),
+        "wrong password should yield 904: {fail:?}"
+    );
 }
 
 #[test]
@@ -124,10 +166,19 @@ fn host_is_cloaked_not_raw_ip() {
     let uh = drain_until(&mut c, " 302 ", 3);
     let line = uh.lines().find(|l| l.contains(" 302 ")).expect("no 302");
     let trailing = line.splitn(2, " :").nth(1).unwrap_or("");
-    assert!(!trailing.contains("127.0.0.1"), "raw IP leaked in USERHOST: {trailing:?}");
-    assert!(trailing.contains('@'), "USERHOST must carry user@host: {trailing:?}");
+    assert!(
+        !trailing.contains("127.0.0.1"),
+        "raw IP leaked in USERHOST: {trailing:?}"
+    );
+    assert!(
+        trailing.contains('@'),
+        "USERHOST must carry user@host: {trailing:?}"
+    );
     // default cloak suffix
-    assert!(trailing.contains("chonkbase.net"), "cloak suffix absent: {trailing:?}");
+    assert!(
+        trailing.contains("chonkbase.net"),
+        "cloak suffix absent: {trailing:?}"
+    );
 }
 
 #[test]
@@ -151,9 +202,18 @@ fn server_time_tag_on_channel_message() {
     send(&mut ben, "PRIVMSG #clock :hello there");
 
     let got = drain_until(&mut amy, "hello there", 3);
-    let msg = got.lines().find(|l| l.contains("PRIVMSG") && l.contains("hello there")).expect("no msg");
-    assert!(msg.starts_with("@time="), "server-time tag missing on relayed message: {msg:?}");
-    assert!(msg.contains("T") && msg.contains("Z"), "timestamp not ISO-8601: {msg:?}");
+    let msg = got
+        .lines()
+        .find(|l| l.contains("PRIVMSG") && l.contains("hello there"))
+        .expect("no msg");
+    assert!(
+        msg.starts_with("@time="),
+        "server-time tag missing on relayed message: {msg:?}"
+    );
+    assert!(
+        msg.contains("T") && msg.contains("Z"),
+        "timestamp not ISO-8601: {msg:?}"
+    );
 }
 
 #[test]
@@ -167,15 +227,24 @@ fn notice_and_ctcp_relay_between_users() {
     // NOTICE user->user must be delivered (regression: NOTICE was dropped).
     send(&mut a, "NOTICE notb :heads up");
     let n = drain_until(&mut b, "heads up", 3);
-    assert!(n.contains("NOTICE notb :heads up"), "user NOTICE not delivered: {n:?}");
+    assert!(
+        n.contains("NOTICE notb :heads up"),
+        "user NOTICE not delivered: {n:?}"
+    );
 
     // CTCP request (PRIVMSG) and reply (NOTICE) must pass \x01 bytes through intact.
     send(&mut a, "PRIVMSG notb :\u{1}VERSION\u{1}");
     let req = drain_until(&mut b, "VERSION", 3);
-    assert!(req.contains("\u{1}VERSION\u{1}"), "CTCP request not relayed intact: {req:?}");
+    assert!(
+        req.contains("\u{1}VERSION\u{1}"),
+        "CTCP request not relayed intact: {req:?}"
+    );
     send(&mut b, "NOTICE nota :\u{1}VERSION chonkline\u{1}");
     let rep = drain_until(&mut a, "VERSION", 3);
-    assert!(rep.contains("\u{1}VERSION chonkline\u{1}"), "CTCP reply (NOTICE) not relayed: {rep:?}");
+    assert!(
+        rep.contains("\u{1}VERSION chonkline\u{1}"),
+        "CTCP reply (NOTICE) not relayed: {rep:?}"
+    );
 }
 
 /// Read for the full duration (no early stop) so duplicate lines are captured.
@@ -215,7 +284,10 @@ fn nick_change_is_broadcast_to_channel_and_self() {
     );
     // The renamer must get its own echo.
     let echo = drain_until(&mut a, "NICK alpha2", 3);
-    assert!(echo.contains("NICK") && echo.contains("alpha2"), "no self NICK echo: {echo:?}");
+    assert!(
+        echo.contains("NICK") && echo.contains("alpha2"),
+        "no self NICK echo: {echo:?}"
+    );
 }
 
 #[test]
@@ -235,11 +307,21 @@ fn quit_reaches_peers_once_and_not_strangers() {
 
     send(&mut a, "QUIT :bye now");
     let bseen = drain_for(&mut b, 2);
-    assert!(bseen.contains(":quita!") && bseen.contains("bye now"), "peer missed QUIT: {bseen:?}");
-    assert_eq!(bseen.matches(" QUIT ").count(), 1, "duplicate QUIT broadcast: {bseen:?}");
+    assert!(
+        bseen.contains(":quita!") && bseen.contains("bye now"),
+        "peer missed QUIT: {bseen:?}"
+    );
+    assert_eq!(
+        bseen.matches(" QUIT ").count(),
+        1,
+        "duplicate QUIT broadcast: {bseen:?}"
+    );
 
     let cseen = drain_for(&mut stranger, 1);
-    assert!(!cseen.contains(":quita!"), "stranger wrongly saw the QUIT: {cseen:?}");
+    assert!(
+        !cseen.contains(":quita!"),
+        "stranger wrongly saw the QUIT: {cseen:?}"
+    );
 }
 
 #[test]
@@ -259,7 +341,10 @@ fn nickserv_ghost_disconnects_held_session() {
     let _ = drain_until(&mut b, "identified", 3);
     send(&mut b, "PRIVMSG NickServ :GHOST ghoster");
     let g = drain_until(&mut b, "disconnected", 3);
-    assert!(g.contains("disconnected") && g.contains("free"), "ghost notice absent: {g:?}");
+    assert!(
+        g.contains("disconnected") && g.contains("free"),
+        "ghost notice absent: {g:?}"
+    );
 
     // The server disconnects A (its socket is closed from the server side).
     let mut closed = false;
@@ -278,9 +363,13 @@ fn nickserv_ghost_disconnects_held_session() {
 
     // The nick is now free: a fresh registration for "ghoster" succeeds.
     let mut c = client(&addr);
-    c.write_all(b"NICK ghoster\r\nUSER ghoster 0 * :C\r\n").unwrap();
+    c.write_all(b"NICK ghoster\r\nUSER ghoster 0 * :C\r\n")
+        .unwrap();
     let welcome = drain_until(&mut c, " 001 ", 3);
-    assert!(welcome.contains(" 001 "), "freed nick could not be reused: {welcome:?}");
+    assert!(
+        welcome.contains(" 001 "),
+        "freed nick could not be reused: {welcome:?}"
+    );
 }
 
 #[test]
@@ -298,12 +387,26 @@ fn topic_reports_setter_and_time_333() {
     register(&mut b, "topb");
     send(&mut b, "JOIN #topicwho");
     let seen = drain_until(&mut b, " 333 ", 3);
-    assert!(seen.contains(" 332 ") && seen.contains("the new topic"), "RPL_TOPIC missing: {seen:?}");
-    let l333 = seen.lines().find(|l| l.contains(" 333 ")).expect("no RPL_TOPICWHOTIME");
-    assert!(l333.contains("#topicwho") && l333.contains("topa"), "333 setter wrong: {l333:?}");
+    assert!(
+        seen.contains(" 332 ") && seen.contains("the new topic"),
+        "RPL_TOPIC missing: {seen:?}"
+    );
+    let l333 = seen
+        .lines()
+        .find(|l| l.contains(" 333 "))
+        .expect("no RPL_TOPICWHOTIME");
+    assert!(
+        l333.contains("#topicwho") && l333.contains("topa"),
+        "333 setter wrong: {l333:?}"
+    );
     // last token is a unix timestamp
     let ts = l333.split_whitespace().last().unwrap_or("");
-    assert!(ts.parse::<u64>().map(|t| t > 1_600_000_000).unwrap_or(false), "333 timestamp invalid: {l333:?}");
+    assert!(
+        ts.parse::<u64>()
+            .map(|t| t > 1_600_000_000)
+            .unwrap_or(false),
+        "333 timestamp invalid: {l333:?}"
+    );
 }
 
 #[test]
@@ -324,9 +427,18 @@ fn who_flags_carry_here_gone_and_status() {
     send(&mut a, "WHO #whoroom");
     let who = drain_until(&mut a, " 315 ", 3);
     // whoa is present + channel op -> "H@"; whob is away -> "G".
-    assert!(who.contains(" H@ :0"), "here+op WHO flags (H@) absent: {who:?}");
-    assert!(who.contains(" G :0"), "away user not flagged G in WHO: {who:?}");
-    assert!(!who.contains(" O :0"), "obsolete 'O' oper flag still emitted: {who:?}");
+    assert!(
+        who.contains(" H@ :0"),
+        "here+op WHO flags (H@) absent: {who:?}"
+    );
+    assert!(
+        who.contains(" G :0"),
+        "away user not flagged G in WHO: {who:?}"
+    );
+    assert!(
+        !who.contains(" O :0"),
+        "obsolete 'O' oper flag still emitted: {who:?}"
+    );
 }
 
 #[test]
@@ -345,10 +457,19 @@ fn mode_op_broadcast_has_flag_and_target() {
 
     send(&mut a, "MODE #ops +o victim");
     let m = drain_until(&mut b, "MODE #ops", 3);
-    let line = m.lines().find(|l| l.contains("MODE #ops")).expect("no MODE broadcast");
+    let line = m
+        .lines()
+        .find(|l| l.contains("MODE #ops"))
+        .expect("no MODE broadcast");
     // Correct shape: "<chan> +o <nick>" — flag joined to sign, target present.
-    assert!(line.contains("MODE #ops +o victim"), "malformed op MODE: {line:?}");
-    assert!(!line.contains("+ o"), "stray space between sign and flag: {line:?}");
+    assert!(
+        line.contains("MODE #ops +o victim"),
+        "malformed op MODE: {line:?}"
+    );
+    assert!(
+        !line.contains("+ o"),
+        "stray space between sign and flag: {line:?}"
+    );
 }
 
 #[test]
@@ -364,7 +485,10 @@ fn chanserv_register_and_founder_autoop() {
     let _ = drain_until(&mut a, "JOIN", 3);
     send(&mut a, "PRIVMSG ChanServ :REGISTER #den");
     let reg = drain_until(&mut a, "registered", 3);
-    assert!(reg.contains("ChanServ") && reg.contains("registered"), "ChanServ REGISTER failed: {reg:?}");
+    assert!(
+        reg.contains("ChanServ") && reg.contains("registered"),
+        "ChanServ REGISTER failed: {reg:?}"
+    );
 
     // Leave (the channel empties), then rejoin: the founder must be re-opped by
     // ChanServ even though a fresh joiner would normally not be an operator.
@@ -397,10 +521,19 @@ fn extended_join_carries_account_and_realname() {
     send(&mut joiner, "JOIN #xj");
 
     let seen = drain_until(&mut watch, "joiner", 3);
-    let jline = seen.lines().find(|l| l.contains("JOIN") && l.contains("joiner!")).expect("no join seen");
+    let jline = seen
+        .lines()
+        .find(|l| l.contains("JOIN") && l.contains("joiner!"))
+        .expect("no join seen");
     // Format: :joiner!user@host JOIN #xj <account> :<realname>
-    assert!(jline.contains("#xj *"), "extended-join should carry account field (* when logged out): {jline:?}");
-    assert!(jline.contains(":joiner test"), "extended-join should carry realname: {jline:?}");
+    assert!(
+        jline.contains("#xj *"),
+        "extended-join should carry account field (* when logged out): {jline:?}"
+    );
+    assert!(
+        jline.contains(":joiner test"),
+        "extended-join should carry realname: {jline:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -415,14 +548,23 @@ fn oper_and_admin_numerics() {
     register(&mut a, "opercand");
     send(&mut a, "REHASH");
     let rehash = drain_until(&mut a, " 481 ", 2);
-    assert!(rehash.contains(" 481 "), "non-oper REHASH should be 481: {rehash:?}");
+    assert!(
+        rehash.contains(" 481 "),
+        "non-oper REHASH should be 481: {rehash:?}"
+    );
     send(&mut a, "OPER oper secret");
     let oper = drain_until(&mut a, " 381 ", 3);
-    assert!(oper.contains(" 381 "), "OPER should reply 381 RPL_YOUREOPER: {oper:?}");
+    assert!(
+        oper.contains(" 381 "),
+        "OPER should reply 381 RPL_YOUREOPER: {oper:?}"
+    );
     assert!(!oper.contains(" 379 "), "OPER must not use 379: {oper:?}");
     send(&mut a, "ADMIN");
     let admin = drain_until(&mut a, " 256 ", 2);
-    assert!(admin.contains(" 256 "), "ADMIN should use RPL_ADMINME 256: {admin:?}");
+    assert!(
+        admin.contains(" 256 "),
+        "ADMIN should use RPL_ADMINME 256: {admin:?}"
+    );
 }
 
 #[test]
@@ -433,10 +575,16 @@ fn links_and_trace_numerics() {
     register(&mut a, "linktrace");
     send(&mut a, "LINKS");
     let links = drain_until(&mut a, " 365 ", 3);
-    assert!(links.contains(" 364 ") && links.contains(" 365 "), "LINKS should be 364+365: {links:?}");
+    assert!(
+        links.contains(" 364 ") && links.contains(" 365 "),
+        "LINKS should be 364+365: {links:?}"
+    );
     send(&mut a, "TRACE");
     let trace = drain_until(&mut a, " 262 ", 3);
-    assert!(trace.contains(" 262 "), "TRACE should end with 262: {trace:?}");
+    assert!(
+        trace.contains(" 262 "),
+        "TRACE should end with 262: {trace:?}"
+    );
 }
 
 #[test]
@@ -452,7 +600,10 @@ fn wallops_reaches_plus_w_users() {
     let _ = drain_until(&mut listener, "+w", 2);
     send(&mut oper, "WALLOPS :maintenance soon");
     let got = drain_until(&mut listener, "WALLOPS", 3);
-    assert!(got.contains("WALLOPS") && got.contains("maintenance soon"), "+w user missed WALLOPS: {got:?}");
+    assert!(
+        got.contains("WALLOPS") && got.contains("maintenance soon"),
+        "+w user missed WALLOPS: {got:?}"
+    );
 }
 
 #[test]
@@ -468,7 +619,10 @@ fn channel_mode_query_324_and_329() {
     send(&mut a, "MODE #modeq");
     let q = drain_until(&mut a, " 329 ", 3);
     let l324 = q.lines().find(|l| l.contains(" 324 ")).expect("no 324");
-    assert!(l324.contains("secret") && l324.contains("25"), "324 missing key/limit values: {l324:?}");
+    assert!(
+        l324.contains("secret") && l324.contains("25"),
+        "324 missing key/limit values: {l324:?}"
+    );
     assert!(q.contains(" 329 "), "329 RPL_CREATIONTIME absent: {q:?}");
 }
 
@@ -479,7 +633,10 @@ fn lusers_reports_265_266() {
     register(&mut a, "luser");
     send(&mut a, "LUSERS");
     let l = drain_until(&mut a, " 266 ", 3);
-    assert!(l.contains(" 265 ") && l.contains(" 266 "), "LUSERS missing 265/266: {l:?}");
+    assert!(
+        l.contains(" 265 ") && l.contains(" 266 "),
+        "LUSERS missing 265/266: {l:?}"
+    );
 }
 
 #[test]
@@ -504,7 +661,10 @@ fn userhost_in_names_expands_entries() {
     register(&mut a, "uhnick");
     send(&mut a, "JOIN #uhn");
     let names = drain_until(&mut a, " 353 ", 3);
-    assert!(names.contains("uhnick!uhnick@"), "NAMES should carry user@host: {names:?}");
+    assert!(
+        names.contains("uhnick!uhnick@"),
+        "NAMES should carry user@host: {names:?}"
+    );
 }
 
 #[test]
@@ -520,7 +680,10 @@ fn chghost_on_account_login() {
     let _ = drain_until(&mut a, "JOIN", 3);
     send(&mut a, "PRIVMSG NickServ :REGISTER chgpass");
     let seen = drain_until(&mut a, "CHGHOST", 3);
-    assert!(seen.contains("CHGHOST") && seen.contains("chguser.user."), "no CHGHOST on login: {seen:?}");
+    assert!(
+        seen.contains("CHGHOST") && seen.contains("chguser.user."),
+        "no CHGHOST on login: {seen:?}"
+    );
 }
 
 #[test]
@@ -539,9 +702,15 @@ fn statusmsg_reaches_only_ops() {
     // regular member sends to @#sm; only the op should receive it
     send(&mut reg, "PRIVMSG @#sm :ops only");
     let opgot = drain_until(&mut op, "ops only", 3);
-    assert!(opgot.contains("PRIVMSG @#sm :ops only"), "op did not get STATUSMSG: {opgot:?}");
+    assert!(
+        opgot.contains("PRIVMSG @#sm :ops only"),
+        "op did not get STATUSMSG: {opgot:?}"
+    );
     let reggot = drain_for(&mut reg, 1);
-    assert!(!reggot.contains("ops only"), "regular member wrongly echoed STATUSMSG: {reggot:?}");
+    assert!(
+        !reggot.contains("ops only"),
+        "regular member wrongly echoed STATUSMSG: {reggot:?}"
+    );
 }
 
 #[test]
@@ -555,7 +724,10 @@ fn whox_returns_requested_fields() {
     send(&mut a, "WHO #whox %tcnf,99");
     let w = drain_until(&mut a, " 354 ", 3);
     let l = w.lines().find(|l| l.contains(" 354 ")).expect("no 354");
-    assert!(l.contains(" 99 ") && l.contains("#whox") && l.contains("whoxer"), "354 fields wrong: {l:?}");
+    assert!(
+        l.contains(" 99 ") && l.contains("#whox") && l.contains("whoxer"),
+        "354 fields wrong: {l:?}"
+    );
 }
 
 #[test]
@@ -566,18 +738,24 @@ fn ban_exception_lets_user_join() {
     register(&mut op, "banop");
     send(&mut op, "JOIN #bex");
     let _ = drain_until(&mut op, "JOIN", 3);
-    send(&mut op, "MODE #bex +b *!*@*");     // ban everyone
-    send(&mut op, "MODE #bex +e *!*@*");     // but except everyone
+    send(&mut op, "MODE #bex +b *!*@*"); // ban everyone
+    send(&mut op, "MODE #bex +e *!*@*"); // but except everyone
     let _ = drain_until(&mut op, "MODE #bex +e", 2);
     send(&mut op, "MODE #bex e");
     let elist = drain_until(&mut op, " 349 ", 2);
-    assert!(elist.contains(" 348 ") && elist.contains(" 349 "), "except list 348/349 absent: {elist:?}");
+    assert!(
+        elist.contains(" 348 ") && elist.contains(" 349 "),
+        "except list 348/349 absent: {elist:?}"
+    );
     // a second user (covered by the exception) can join despite the ban
     let mut u = client(&addr);
     register(&mut u, "banned");
     send(&mut u, "JOIN #bex");
     let uj = drain_until(&mut u, "#bex", 3);
-    assert!(uj.contains("JOIN") && !uj.contains(" 474 "), "exception did not override ban: {uj:?}");
+    assert!(
+        uj.contains("JOIN") && !uj.contains(" 474 "),
+        "exception did not override ban: {uj:?}"
+    );
 }
 
 #[test]
@@ -593,12 +771,18 @@ fn invite_exception_bypasses_invite_only() {
     let _ = drain_until(&mut op, "MODE #iex +I", 2);
     send(&mut op, "MODE #iex I");
     let ilist = drain_until(&mut op, " 347 ", 2);
-    assert!(ilist.contains(" 346 ") && ilist.contains(" 347 "), "invex list 346/347 absent: {ilist:?}");
+    assert!(
+        ilist.contains(" 346 ") && ilist.contains(" 347 "),
+        "invex list 346/347 absent: {ilist:?}"
+    );
     let mut u = client(&addr);
     register(&mut u, "guest");
     send(&mut u, "JOIN #iex");
     let uj = drain_until(&mut u, "#iex", 3);
-    assert!(uj.contains("JOIN") && !uj.contains(" 473 "), "invex did not bypass +i: {uj:?}");
+    assert!(
+        uj.contains("JOIN") && !uj.contains(" 473 "),
+        "invex did not bypass +i: {uj:?}"
+    );
 }
 
 #[test]
@@ -608,15 +792,47 @@ fn rfc1459_folds_nicks_and_channels() {
     send(&mut a, "NICK nate[m]");
     send(&mut a, "USER nate[m] 0 * :nate");
     let welcome = drain_until(&mut a, " 005 ", 3);
-    assert!(welcome.contains(" 001 "), "registration did not complete: {welcome:?}");
-    assert!(welcome.contains("CASEMAPPING=rfc1459"), "005 dropped the casemap token: {welcome:?}");
+    assert!(
+        welcome.contains(" 001 "),
+        "registration did not complete: {welcome:?}"
+    );
+    assert!(
+        welcome.contains("CASEMAPPING=rfc1459"),
+        "005 dropped the casemap token: {welcome:?}"
+    );
     assert!(welcome.contains("BOT=B"), "005 missing BOT=B: {welcome:?}");
+    let isupport = welcome
+        .lines()
+        .find(|l| l.contains(" 005 ") && l.contains("CHANTYPES=#"))
+        .unwrap_or("");
+    assert!(
+        isupport.contains("SAFELIST") && isupport.contains("ELIST=M"),
+        "SAFELIST and ELIST=M should share the main 005: {isupport:?}"
+    );
+    assert!(
+        !welcome.contains("ELIST=U")
+            && !welcome.contains("ELIST=C")
+            && !welcome.contains("ELIST=T")
+            && !welcome.contains("ELIST=N"),
+        "only the implemented ELIST letter may be advertised: {welcome:?}"
+    );
+    for line in welcome.lines().filter(|l| l.contains(" 005 ")) {
+        let content = line.trim_end_matches('\r');
+        assert!(
+            content.len() <= 510,
+            "005 exceeds 510 bytes ({}): {content}",
+            content.len()
+        );
+    }
 
     let mut b = client(&addr);
     send(&mut b, "NICK nate{m}");
     send(&mut b, "USER nate 0 * :nate");
     let clash = drain_until(&mut b, " 433 ", 3);
-    assert!(clash.contains(" 433 "), "nate{{m}} was not treated as nate[m]: {clash:?}");
+    assert!(
+        clash.contains(" 433 "),
+        "nate{{m}} was not treated as nate[m]: {clash:?}"
+    );
 
     send(&mut a, "JOIN #Foo[bar]");
     let _ = drain_until(&mut a, " 366 ", 3);
@@ -624,7 +840,10 @@ fn rfc1459_folds_nicks_and_channels() {
     register(&mut c, "other");
     send(&mut c, "JOIN #foo{bar}");
     let joined = drain_until(&mut c, " 366 ", 3);
-    assert!(joined.contains("nate[m]"), "folded channel did not contain the first member: {joined:?}");
+    assert!(
+        joined.contains("nate[m]"),
+        "folded channel did not contain the first member: {joined:?}"
+    );
 }
 
 #[test]
@@ -635,15 +854,24 @@ fn bot_and_account_tags_follow_message_tags() {
     register(&mut bot, "robit");
     send(&mut bot, "PRIVMSG NickServ :REGISTER secret");
     let reg = drain_until(&mut bot, "registered", 3);
-    assert!(reg.contains("registered"), "account was not created: {reg:?}");
+    assert!(
+        reg.contains("registered"),
+        "account was not created: {reg:?}"
+    );
     send(&mut bot, "MODE robit +B");
     let modes = drain_until(&mut bot, " 221 ", 3);
-    assert!(modes.contains("+") && modes.contains('B'), "bot mode not recorded: {modes:?}");
+    assert!(
+        modes.contains("+") && modes.contains('B'),
+        "bot mode not recorded: {modes:?}"
+    );
 
     let mut tagged = client(&addr);
     send(&mut tagged, "CAP REQ :message-tags account-tag");
     let ack = drain_until(&mut tagged, "ACK", 3);
-    assert!(ack.contains("message-tags") && ack.contains("account-tag"), "caps not acked: {ack:?}");
+    assert!(
+        ack.contains("message-tags") && ack.contains("account-tag"),
+        "caps not acked: {ack:?}"
+    );
     send(&mut tagged, "CAP END");
     register(&mut tagged, "tagged");
     send(&mut tagged, "JOIN #bots");
@@ -662,20 +890,41 @@ fn bot_and_account_tags_follow_message_tags() {
     send(&mut bot, "@+draft/reply=abc PRIVMSG #bots :tagged hello");
 
     let seen = drain_until(&mut tagged, "tagged hello", 3);
-    let hello = seen.lines().find(|l| l.contains("hello from the bot")).unwrap_or("");
+    let hello = seen
+        .lines()
+        .find(|l| l.contains("hello from the bot"))
+        .unwrap_or("");
     assert!(!hello.is_empty(), "no hello: {seen:?}");
     let (tags, _) = hello.split_once(' ').expect("tagged line");
     let parts: Vec<&str> = tags.trim_start_matches('@').split(';').collect();
-    assert!(parts.iter().any(|t| *t == "bot"), "bot tag missing: {hello:?}");
-    assert!(parts.iter().any(|t| *t == "account=robit"), "account tag missing: {hello:?}");
-    assert!(seen.contains("tagged hello"), "client-tagged PRIVMSG was dropped: {seen:?}");
+    assert!(
+        parts.iter().any(|t| *t == "bot"),
+        "bot tag missing: {hello:?}"
+    );
+    assert!(
+        parts.iter().any(|t| *t == "account=robit"),
+        "account tag missing: {hello:?}"
+    );
+    assert!(
+        seen.contains("tagged hello"),
+        "client-tagged PRIVMSG was dropped: {seen:?}"
+    );
 
     let bare = drain_until(&mut plain, "tagged hello", 3);
-    let plain_hello = bare.lines().find(|l| l.contains("hello from the bot")).unwrap_or("");
+    let plain_hello = bare
+        .lines()
+        .find(|l| l.contains("hello from the bot"))
+        .unwrap_or("");
     assert!(!plain_hello.is_empty(), "plain missed hello: {bare:?}");
-    assert!(plain_hello.starts_with(":robit!"), "client without message-tags saw a tag: {plain_hello:?}");
+    assert!(
+        plain_hello.starts_with(":robit!"),
+        "client without message-tags saw a tag: {plain_hello:?}"
+    );
 
     send(&mut tagged, "WHOIS robit");
     let whois = drain_until(&mut tagged, " 318 ", 3);
-    assert!(whois.contains(" 335 "), "WHOIS missing RPL_WHOISBOT: {whois:?}");
+    assert!(
+        whois.contains(" 335 "),
+        "WHOIS missing RPL_WHOISBOT: {whois:?}"
+    );
 }

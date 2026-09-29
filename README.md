@@ -13,13 +13,20 @@ protocol of RFC 1459 / RFC 2812 as it is practiced today. It is dependency-light
 - Queries: `WHO` / `WHOIS` / `WHOWAS` / `ISON` / `USERHOST`
 - Server info: `VERSION` / `STATS` / `TIME` / `ADMIN` / `INFO` / `MOTD`
 - `AWAY`, `OPER`, `WALLOPS`, `PING` / `PONG` keepalive
-- **Accounts**: `NickServ` `REGISTER` / `IDENTIFY`, PBKDF2-hashed passwords
-  persisted to disk
-- **Channels**: `ChanServ` `REGISTER` / `INFO` / `DROP` — founders are
-  auto-opped and registered channels keep their topic across restarts
-- **SASL** `PLAIN` authentication at connection time
-- **IRCv3 capabilities**: `sasl`, `server-time`, `away-notify`, `extended-join`,
-  `account-notify`, `multi-prefix` (proper `CAP LS 302` negotiation)
+- **Accounts**: `NickServ` `REGISTER` / `IDENTIFY` / `SET PASSWORD`, PBKDF2-hashed
+  passwords persisted to disk. `NickServ` and `ChanServ` cannot be taken as nicks
+  or account names
+- **Channels**: `ChanServ` `REGISTER` / `INFO` / `DROP` / `OP` — founders are
+  auto-opped on join and again when they identify, and registered channels keep
+  their topic across restarts
+- **SASL** `PLAIN` authentication during capability negotiation, including the
+  usual order of `NICK`/`USER` before `AUTHENTICATE`
+- **IRCv3 capabilities**: `sasl`, `message-tags`, `server-time`, `account-tag`,
+  `away-notify`, `extended-join`, `account-notify`, `multi-prefix`,
+  `userhost-in-names`, `chghost`, `cap-notify`, `batch`, `labeled-response`
+  (proper `CAP LS 302` negotiation). `labeled-response` is applied once `batch`
+  is negotiated as well; the two may be requested in either order
+- **ISUPPORT**: `SAFELIST` (a `LIST` reply is delivered whole) and `ELIST=M`
 - **Host cloaking**: users' real addresses are hidden behind a stable HMAC cloak
   (revealed to operators via `WHOIS`)
 - **TLS** terminated in-process, sharing the cloak and limit paths with plaintext
