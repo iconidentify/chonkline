@@ -13,14 +13,16 @@ protocol of RFC 1459 / RFC 2812 as it is practiced today. It is dependency-light
 - Queries: `WHO` / `WHOIS` / `WHOWAS` / `ISON` / `USERHOST`
 - Server info: `VERSION` / `STATS` / `TIME` / `ADMIN` / `INFO` / `MOTD`
 - `AWAY`, `OPER`, `WALLOPS`, `PING` / `PONG` keepalive
-- **Accounts**: `NickServ` `REGISTER` / `IDENTIFY` / `SET PASSWORD`, PBKDF2-hashed
-  passwords persisted to disk. `NickServ` and `ChanServ` cannot be taken as nicks
+- **Accounts**: `NickServ` `REGISTER` / `IDENTIFY` / `SET PASSWORD` /
+  `CERT LIST|ADD|DEL`, PBKDF2-hashed passwords and certificate fingerprints
+  persisted to disk. `NickServ` and `ChanServ` cannot be taken as nicks
   or account names
 - **Channels**: `ChanServ` `REGISTER` / `INFO` / `DROP` / `OP` — founders are
   auto-opped on join and again when they identify, and registered channels keep
   their topic across restarts
-- **SASL** `PLAIN` authentication during capability negotiation, including the
-  usual order of `NICK`/`USER` before `AUTHENTICATE`
+- **SASL** `PLAIN`, and `EXTERNAL` on TLS when the client presents a certificate.
+  Both can be used on one NickServ account. `PLAIN` accepts the usual order of
+  `NICK`/`USER` before `AUTHENTICATE`
 - **IRCv3 capabilities**: `sasl`, `message-tags`, `server-time`, `account-tag`,
   `away-notify`, `extended-join`, `account-notify`, `multi-prefix`,
   `userhost-in-names`, `chghost`, `cap-notify`, `batch`, `labeled-response`
@@ -144,6 +146,97 @@ never against the address a header claims, for the same reason.
 The exemption list is empty by default. It exists for deployments that still
 front the daemon with a local terminator unable to emit a header; such peers
 necessarily share one cloak, since their real address never arrives.
+
+### Accounts, SASL PLAIN, and SASL EXTERNAL
+
+A NickServ account has a password and up to eight certificate fingerprints.
+Both stay valid together. EXTERNAL does not create a second account, and it
+does not read the certificate subject. The account is whichever one enrolled
+the fingerprint.
+
+The fingerprint is the SHA-256 of the leaf certificate's DER, written as
+lowercase hex. The TLS handshake proves the client holds the matching private
+key. A fingerprint typed into a command, a certificate subject, or a PROXY
+header is not that proof. `CERT ADD` enrolls only the certificate on the
+current TLS connection.
+
+Client certificates are usually self-signed. The IRC TLS listener asks for one
+and accepts it without a CA and without checking its expiry. Connections that
+present no certificate still complete, and they can use PLAIN. The HTTPS
+listener does not ask for a client certificate at all.
+
+`CAP LS 302` advertises `sasl=EXTERNAL,PLAIN` only when this connection
+presented a certificate. Otherwise it advertises `sasl=PLAIN`. A failed
+EXTERNAL attempt can be followed by PLAIN before `CAP END`.
+
+**Where the certificate has to arrive.** The production listener is
+`irc.chonkbase.net` port `6697`. The Linode NodeBalancer forwards that port as
+TCP with a PROXY v1 header (`deploy/k8s/loadbalancer.yaml`). The pod reads the
+header, then terminates TLS itself (`IRC_TLS_PORT`, `src/ops.rs`). PROXY v1
+carries the client address, not a certificate. Clients must use a path that
+does not terminate TLS in front of chonkline. The shared ingress, if it
+terminates TLS, cannot do EXTERNAL unless some later design forwards a
+certificate identity the daemon is willing to trust. Do not treat that header
+as one.
+
+**PLAIN, then enroll EXTERNAL.** Connect with the new client certificate,
+identify with the password, enroll, reconnect, and check EXTERNAL. The password
+remains the recovery credential.
+
+```
+/server add chonkbase irc.chonkbase.net/6697 -tls
+/set irc.server.chonkbase.nicks "<nick>"
+/set irc.server.chonkbase.tls_cert "<client.pem>"
+/set irc.server.chonkbase.sasl_mechanism plain
+/set irc.server.chonkbase.sasl_username <account>
+/set irc.server.chonkbase.sasl_password <password>
+/connect chonkbase
+/msg NickServ CERT ADD
+/set irc.server.chonkbase.sasl_mechanism external
+/reconnect
+```
+
+`<client.pem>` holds both the private key and the certificate (WeeChat reads
+them from `tls_cert`). `<nick>`, `<account>`, and `<password>` are the user's.
+The server name in the commands is the WeeChat server, not the account.
+
+**Rotate a certificate.** Enroll the new fingerprint while the old one still
+works, connect once with EXTERNAL using the new certificate, then delete the
+old fingerprint. Reissuing a certificate changes the fingerprint even when the
+key stays the same. Replacing the key requires a new certificate. At least two
+fingerprints fit on one account so the overlap is possible.
+
+```
+/msg NickServ CERT LIST
+/msg NickServ CERT ADD
+/msg NickServ CERT DEL <old-fingerprint>
+```
+
+`CERT LIST` prints the stored hex, which is what `CERT DEL` takes. Colons and
+any letter case are accepted on input.
+
+**Back to PLAIN.** The password is still there. Identify with it, or set SASL
+back to `plain`. Deleting a certificate does not change the password hash.
+`SET PASSWORD <current> <new>` does not change certificate bindings. `GHOST`
+still takes the password when the caller is not identified; a certificate is
+not a substitute for that.
+
+**What a change does to a session that is already in.** Nothing. Password
+rotation and certificate removal both apply to the next login. A session that
+has already identified stays identified until it quits or `LOGOUT`s. Removing
+the fingerprint used for this session does not disconnect it.
+
+**Losing both.** There is no in-band command that replaces a password the user
+cannot supply, and no way to enroll a certificate without an existing login.
+That is deliberate: either one would be an account takeover for anyone who can
+reach the server. Recovery is an operator with access to the account file
+(`IRC_ACCOUNTS_PATH`, `/var/lib/chonkline/accounts.db` in the cluster). Stop
+the process so it cannot write the old memory back over the file, replace that
+account's password hash, and start it again. Leave the fingerprint field in
+place unless those certificates are also lost. An account is not offered a
+password-disable option; turning the password off with no remaining certificate
+would make the account unreachable, and `SET PASSWORD` and the `GHOST`
+fallback both require a password today.
 
 ### Anti-bot challenge
 

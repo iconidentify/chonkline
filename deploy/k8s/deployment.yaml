@@ -76,7 +76,8 @@ spec:
             # TLS is terminated in-process so the PROXY header arrives ahead of
             # the handshake and TLS clients get their real address, exactly like
             # plaintext ones. The certificate is the same cert-manager secret the
-            # ghostunnel sidecar used to mount.
+            # ghostunnel sidecar used to mount. The IRC listener may ask for a
+            # client certificate (SASL EXTERNAL). The HTTPS listener must not.
             - name: IRC_TLS_PORT
               value: "6697"
             - name: IRC_TLS_CERT

@@ -33,4 +33,5 @@ fn motd_describes_services_and_art() {
     assert!(text.contains("NickServ REGISTER"), "MOTD missing NickServ guidance");
     assert!(text.contains("ChanServ REGISTER"), "MOTD missing ChanServ guidance");
     assert!(text.contains("SASL"), "MOTD missing capability summary");
+    assert!(text.contains("CERT ADD"), "MOTD missing certificate enrollment");
 }
