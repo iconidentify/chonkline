@@ -396,7 +396,18 @@ async fn admit_and_run(
             }
             match acc.accept(sock).await {
                 Ok(stream) => {
-                    run_session(&state, id, stream, &host, &real_host, &limit_key, exempt).await
+                    // The leaf is the certificate the handshake just proved the
+                    // peer holds. The PROXY header parsed above carries an
+                    // address, never this identity.
+                    let cert_fp = stream.get_ref().1.peer_certificates().and_then(|chain| {
+                        chain
+                            .first()
+                            .map(|leaf| crate::crypto::hex(&crate::crypto::sha256(leaf.as_ref())))
+                    });
+                    run_session(
+                        &state, id, stream, &host, &real_host, &limit_key, exempt, cert_fp,
+                    )
+                    .await
                 }
                 Err(e) => {
                     crate::log::counted("tls.handshake_failed", &real_host);
@@ -404,7 +415,12 @@ async fn admit_and_run(
                 }
             }
         }
-        None => run_session(&state, id, sock, &host, &real_host, &limit_key, exempt).await,
+        None => {
+            run_session(
+                &state, id, sock, &host, &real_host, &limit_key, exempt, None,
+            )
+            .await
+        }
     }
 
     // Release the admission slot this connection reserved, and record the close
@@ -442,6 +458,7 @@ async fn run_session<S>(
     real_host: &str,
     limit_key: &str,
     exempt: bool,
+    cert_fp: Option<String>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
@@ -470,6 +487,7 @@ async fn run_session<S>(
         real_host.to_string(),
         tx.clone(),
         notify.clone(),
+        cert_fp,
     );
 
     run_reader(state.clone(), id, rd, notify, limit_key.to_string(), exempt).await;
@@ -862,12 +880,13 @@ pub fn park_unregistered(
     real_host: String,
     tx: mpsc::Sender<String>,
     notify: Arc<Notify>,
+    cert_fp: Option<String>,
 ) {
     let mut stg = state.lock().unwrap_or_else(|e| e.into_inner());
     if stg.find_by_id(id).is_some() {
         return; // already parked (should not happen); be harmless
     }
-    stg.park_new(id, host, real_host, tx, notify);
+    stg.park_new(id, host, real_host, tx, notify, cert_fp);
 }
 
 /// Liveness polling (RFC 8.4): connections silent for too long receive a PING;

@@ -149,6 +149,11 @@ pub struct Cx {
     pub caps: Caps,
     /// SASL mechanism selected mid-handshake (before the payload arrives).
     pub sasl_mech: Option<String>,
+    /// Lowercase hex SHA-256 of the leaf client certificate presented during
+    /// the TLS handshake, if the peer sent one. Possession of the private key
+    /// was checked by rustls. Empty on plaintext and on TLS with no certificate.
+    /// Never filled from an IRC parameter or a PROXY header.
+    pub cert_fp: Option<String>,
 
     // Slots filled while the client completes the NICK/USER registration pair.
     pub pending_nick: Option<String>, // display form chosen so far
@@ -921,6 +926,7 @@ impl ServerState {
         real_host: String,
         tx: Sender<String>,
         notify: Arc<Notify>,
+        cert_fp: Option<String>,
     ) {
         let mut cx = Cx {
             id,
@@ -935,6 +941,7 @@ impl ServerState {
             account: None,
             caps: Caps::default(),
             sasl_mech: None,
+            cert_fp,
             pending_nick: None,
             pending_user: None,
             cap_negotiating: false,
@@ -1327,6 +1334,7 @@ mod tests {
             account: None,
             caps: Caps::default(),
             sasl_mech: None,
+            cert_fp: None,
             pending_nick: None,
             pending_user: None,
             cap_negotiating: false,

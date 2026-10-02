@@ -189,6 +189,52 @@ fn sasl_plain_accepts_nick_and_user_before_authenticate() {
 }
 
 #[test]
+fn plaintext_does_not_offer_external() {
+    let addr = start_server();
+    let mut owner = client(&addr);
+    register(&mut owner, "plainuser");
+    send(&mut owner, "PRIVMSG NickServ :REGISTER hunter2");
+    assert!(drain_until(&mut owner, "registered", 3).contains("registered"));
+
+    let mut b = client(&addr);
+    send(&mut b, "CAP LS 302");
+    let ls = drain_until(&mut b, "sasl=PLAIN", 3);
+    assert!(
+        ls.contains("sasl=PLAIN") && !ls.contains("EXTERNAL"),
+        "plaintext advertised EXTERNAL: {ls:?}"
+    );
+    send(&mut b, "NICK plainclient");
+    send(&mut b, "USER plainclient 0 * :plainclient");
+    send(&mut b, "CAP REQ :sasl");
+    assert!(drain_until(&mut b, "ACK", 3).contains("sasl"));
+    send(&mut b, "AUTHENTICATE EXTERNAL");
+    let refused = drain_until(&mut b, " 904 ", 3);
+    assert!(
+        refused.contains(" 908 "),
+        "missing mechanism list: {refused:?}"
+    );
+    assert!(
+        refused.contains(" 904 "),
+        "EXTERNAL was not refused: {refused:?}"
+    );
+    assert!(
+        !refused.contains("EXTERNAL,PLAIN"),
+        "plaintext offered EXTERNAL: {refused:?}"
+    );
+
+    // The failed attempt must not consume the one SASL try.
+    send(&mut b, "AUTHENTICATE PLAIN");
+    assert!(drain_until(&mut b, "AUTHENTICATE +", 3).contains("AUTHENTICATE +"));
+    let payload = base64_encode(b"\0plainuser\0hunter2");
+    send(&mut b, &format!("AUTHENTICATE {payload}"));
+    let done = drain_until(&mut b, " 903 ", 3);
+    assert!(
+        done.contains(" 903 "),
+        "PLAIN after a refused EXTERNAL failed: {done:?}"
+    );
+}
+
+#[test]
 fn founder_is_opped_on_identify_and_by_chanserv_op() {
     let addr = start_server();
     let mut founder = client(&addr);

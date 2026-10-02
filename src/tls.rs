@@ -19,8 +19,13 @@ use std::sync::Arc;
 
 use tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    UnixTime,
 };
-use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use tokio_rustls::rustls::{
+    CertificateError, DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig,
+    SignatureScheme,
+};
 use tokio_rustls::TlsAcceptor;
 
 /// Extract every base64 body carrying `label` from a PEM document.
@@ -60,10 +65,104 @@ fn parse_key(pem: &str) -> Option<PrivateKeyDer<'static>> {
     None
 }
 
+/// Accept a presented client certificate without a CA, and still require the
+/// handshake signature so the peer holds the private key.
+///
+/// IRC clients commonly use a self-signed certificate. A CA-only verifier
+/// would reject that certificate during the handshake, and the client could
+/// never connect long enough to enroll it with PLAIN. Identity is the SHA-256
+/// of the leaf DER, taken after this verifier has accepted the handshake. An
+/// absent certificate is fine: client auth is offered and not required.
+#[derive(Debug)]
+struct OptionalClientCert {
+    provider: Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
+}
+
+impl ClientCertVerifier for OptionalClientCert {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        if end_entity.is_empty() {
+            return Err(TlsError::InvalidCertificate(CertificateError::BadEncoding));
+        }
+        // No chain check and no expiry check. A self-signed leaf with an
+        // arbitrary lifetime is the credential users actually have. The
+        // signature methods below are what prove possession of the key.
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        tokio_rustls::rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        tokio_rustls::rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Build an acceptor from PEM files on disk (`IRC_TLS_CERT` / `IRC_TLS_KEY`),
 /// which in the cluster are the projected `tls.crt` / `tls.key` of the
 /// cert-manager secret.
+///
+/// `offer_client_cert` is for the IRC TLS listener only. The HTTPS listener
+/// must pass `false`: a web client that receives a CertificateRequest can
+/// abort, and a browser certificate is not an IRC account credential.
 pub fn acceptor_from_files(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, String> {
+    build_acceptor(cert_path, key_path, false)
+}
+
+/// IRC listener: optionally request a client certificate. Connections that
+/// present none still complete the handshake and can use SASL PLAIN.
+pub fn irc_acceptor_from_files(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, String> {
+    build_acceptor(cert_path, key_path, true)
+}
+
+fn build_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    offer_client_cert: bool,
+) -> Result<TlsAcceptor, String> {
     // Only the ring provider is compiled in; installing it explicitly keeps the
     // failure legible if that ever changes.
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
@@ -80,10 +179,19 @@ pub fn acceptor_from_files(cert_path: &str, key_path: &str) -> Result<TlsAccepto
     if chain.is_empty() {
         return Err(format!("no CERTIFICATE block in {}", cert_path));
     }
-    let key = parse_key(&key_pem).ok_or_else(|| format!("no usable private key in {}", key_path))?;
+    let key =
+        parse_key(&key_pem).ok_or_else(|| format!("no usable private key in {}", key_path))?;
 
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
+    let builder = ServerConfig::builder();
+    let builder = if offer_client_cert {
+        let provider = tokio_rustls::rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .ok_or_else(|| "no crypto provider installed".to_string())?;
+        builder.with_client_cert_verifier(Arc::new(OptionalClientCert { provider }))
+    } else {
+        builder.with_no_client_auth()
+    };
+    let config = builder
         .with_single_cert(chain, key)
         .map_err(|e| format!("certificate and key do not form a valid pair: {}", e))?;
 
@@ -94,7 +202,9 @@ pub fn acceptor_from_files(cert_path: &str, key_path: &str) -> Result<TlsAccepto
 /// when TLS is not configured, which is not an error: the plaintext port runs
 /// on its own.
 pub fn configured() -> Option<(u16, String, String)> {
-    let port: u16 = std::env::var("IRC_TLS_PORT").ok().and_then(|v| v.parse().ok())?;
+    let port: u16 = std::env::var("IRC_TLS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())?;
     if port == 0 {
         return None;
     }
@@ -120,7 +230,10 @@ mod tests {
             "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n",
             "-----BEGIN CERTIFICATE-----\nWFla\n-----END CERTIFICATE-----\n"
         );
-        assert_eq!(pem_blocks(pem, "CERTIFICATE"), vec![b"ABC".to_vec(), b"XYZ".to_vec()]);
+        assert_eq!(
+            pem_blocks(pem, "CERTIFICATE"),
+            vec![b"ABC".to_vec(), b"XYZ".to_vec()]
+        );
     }
 
     #[test]
@@ -168,7 +281,10 @@ mod tests {
         // TlsAcceptor has no Debug impl, so match rather than unwrap_err.
         match acceptor_from_files("/nonexistent/tls.crt", "/nonexistent/tls.key") {
             Ok(_) => panic!("missing files must not yield an acceptor"),
-            Err(err) => assert!(err.contains("/nonexistent/tls.crt"), "error should name the path: {err}"),
+            Err(err) => assert!(
+                err.contains("/nonexistent/tls.crt"),
+                "error should name the path: {err}"
+            ),
         }
     }
 
@@ -183,9 +299,11 @@ mod tests {
 // Server links
 // ---------------------------------------------------------------------------
 
-use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use tokio_rustls::rustls::pki_types::{ServerName, UnixTime};
-use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use tokio_rustls::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::TlsConnector;
 
 /// Verifies a peer by pinned SHA-256 certificate fingerprint.
@@ -229,7 +347,11 @@ impl ServerCertVerifier for PinnedCert {
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
         tokio_rustls::rustls::crypto::verify_tls12_signature(
-            message, cert, dss, &self.provider.signature_verification_algorithms)
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -239,11 +361,17 @@ impl ServerCertVerifier for PinnedCert {
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
         tokio_rustls::rustls::crypto::verify_tls13_signature(
-            message, cert, dss, &self.provider.signature_verification_algorithms)
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 

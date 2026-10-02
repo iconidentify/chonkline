@@ -11,6 +11,10 @@
 # with the true client address straight to this pod. v1 rather than v2 because
 # the daemon implements v1 and rejects v2 rather than guessing at it.
 #
+# Port 6697 is TCP all the way to the pod. The balancer must not terminate TLS:
+# SASL EXTERNAL uses the client certificate on chonkline's own handshake, and
+# PROXY v1 carries an address, not a certificate.
+#
 # The web property moves here too (443 -> 8443, terminated in-process) so
 # irc.chonkbase.net keeps serving its page once DNS points at this balancer.
 apiVersion: v1

@@ -1287,7 +1287,7 @@ const MOTD: &[&str] = &[
     "  A small, fast IRC server written in Rust. What it offers:",
     "",
     "    *  TLS on port 6697, plaintext on 6667",
-    "    *  SASL PLAIN authentication at connect time",
+    "    *  SASL PLAIN, and EXTERNAL on TLS with a client certificate",
     "    *  IRCv3: message-tags, server-time, account-tag,",
     "              away-notify, extended-join, account-notify,",
     "              multi-prefix, batch, labeled-response, bot mode (+B)",
@@ -1299,6 +1299,7 @@ const MOTD: &[&str] = &[
     "        /msg NickServ REGISTER <password>",
     "        /msg NickServ IDENTIFY <password>",
     "        /msg NickServ SET PASSWORD <current> <new>",
+    "        /msg NickServ CERT ADD | CERT LIST | CERT DEL <fingerprint>",
     "",
     "    Channels  (ChanServ) -- register one you operate",
     "        /msg ChanServ REGISTER #channel",
@@ -3099,10 +3100,116 @@ fn handle_nickserv(stg: &mut ServerState, id: usize, text: &str, is_priv: bool) 
                 Err(e) => nickserv_notice(stg, id, &format!("Password change failed: {}.", e)),
             }
         }
+        "CERT" => handle_nickserv_cert(stg, id, &mut parts),
         "" | "HELP" => {
             nickserv_notice(stg, id, "NickServ: REGISTER <password> | IDENTIFY [account] <password> | SET PASSWORD <current> <new> | GHOST <nick> [password] | LOGOUT");
+            nickserv_notice(
+                stg,
+                id,
+                "NickServ: CERT LIST | CERT ADD | CERT DEL <fingerprint>",
+            );
         }
         _ => nickserv_notice(stg, id, "Unknown command. Try HELP."),
+    }
+}
+
+/// NickServ certificate bindings for SASL EXTERNAL.
+///
+/// `CERT ADD` enrolls the certificate on *this* TLS connection. A fingerprint
+/// typed into the command is not possession of the key, so it is refused.
+/// Removal stops the next EXTERNAL login with that certificate and leaves the
+/// password, the other certificates, and sessions that are already identified
+/// alone. That matches password rotation, which also does not drop sessions.
+fn handle_nickserv_cert<'a>(
+    stg: &mut ServerState,
+    id: usize,
+    parts: &mut impl Iterator<Item = &'a str>,
+) {
+    let action = parts.next().unwrap_or("").to_uppercase();
+    let account = match stg.find_by_id(id).and_then(|u| u.account.clone()) {
+        Some(a) => a,
+        None => {
+            nickserv_notice(stg, id, "You must be identified to manage certificates.");
+            return;
+        }
+    };
+    let src = stg
+        .find_by_id(id)
+        .map(|u| u.real_host.clone())
+        .unwrap_or_default();
+    match action.as_str() {
+        "LIST" => {
+            let certs = stg.accounts.certs_of(&account).unwrap_or_default();
+            if certs.is_empty() {
+                nickserv_notice(stg, id, "No certificates enrolled.");
+            } else {
+                for fp in certs {
+                    nickserv_notice(stg, id, &fp);
+                }
+            }
+        }
+        "ADD" => {
+            if parts.next().is_some() {
+                nickserv_notice(
+                    stg,
+                    id,
+                    "Syntax: CERT ADD — enrolls the certificate on this TLS connection, not a fingerprint you type.",
+                );
+                return;
+            }
+            let fp = stg.find_by_id(id).and_then(|u| u.cert_fp.clone());
+            let Some(fp) = fp else {
+                nickserv_notice(
+                    stg,
+                    id,
+                    "This connection has no client certificate. Connect with TLS, present one, identify, then CERT ADD.",
+                );
+                return;
+            };
+            match stg.accounts.add_cert(&account, &fp) {
+                Ok(crate::accounts::CertAdd::Enrolled) => {
+                    crate::log::auth(id, &src, &account, "CERT-ADD", true);
+                    nickserv_notice(
+                        stg,
+                        id,
+                        "Certificate enrolled. Your password and any other certificates still work. The next connection can use SASL EXTERNAL.",
+                    );
+                }
+                Ok(crate::accounts::CertAdd::Already) => {
+                    nickserv_notice(stg, id, "That certificate is already enrolled.");
+                }
+                Err(e) => {
+                    crate::log::auth(id, &src, &account, "CERT-ADD", false);
+                    nickserv_notice(stg, id, &format!("Certificate not enrolled: {e}."));
+                }
+            }
+        }
+        "DEL" => {
+            let fp = parts.next().unwrap_or("");
+            if fp.is_empty() || parts.next().is_some() {
+                nickserv_notice(stg, id, "Syntax: CERT DEL <fingerprint>");
+                return;
+            }
+            match stg.accounts.remove_cert(&account, fp) {
+                Ok(()) => {
+                    crate::log::auth(id, &src, &account, "CERT-DEL", true);
+                    nickserv_notice(
+                        stg,
+                        id,
+                        "Certificate removed. Sessions already logged in stay logged in. The next SASL EXTERNAL login with that certificate will fail. Your password and any other certificates are unchanged.",
+                    );
+                }
+                Err(e) => {
+                    crate::log::auth(id, &src, &account, "CERT-DEL", false);
+                    nickserv_notice(stg, id, &format!("Certificate not removed: {e}."));
+                }
+            }
+        }
+        _ => nickserv_notice(
+            stg,
+            id,
+            "Syntax: CERT LIST | CERT ADD | CERT DEL <fingerprint>",
+        ),
     }
 }
 
@@ -4537,9 +4644,22 @@ const SUPPORTED_CAPS: &[&str] = &[
     "labeled-response",
 ];
 
-fn cap_token(c: &str, with_values: bool) -> String {
+/// Mechanisms this connection may actually attempt.
+///
+/// EXTERNAL needs a client certificate the handshake already verified.
+/// Plaintext, and TLS that presented no certificate, are told PLAIN only.
+/// Advertising a mechanism the connection cannot use makes clients try it
+/// and then give up on SASL entirely.
+fn sasl_mechanism_list(stg: &ServerState, id: usize) -> &'static str {
+    match stg.find_by_id(id).and_then(|u| u.cert_fp.as_deref()) {
+        Some(fp) if !fp.is_empty() => "EXTERNAL,PLAIN",
+        _ => "PLAIN",
+    }
+}
+
+fn cap_token(c: &str, with_values: bool, sasl_mechs: &str) -> String {
     if with_values && c == "sasl" {
-        "sasl=PLAIN".to_string()
+        format!("sasl={sasl_mechs}")
     } else {
         c.to_string()
     }
@@ -4565,7 +4685,7 @@ fn set_cap(caps: &mut crate::state::Caps, name: &str, on: bool) {
 }
 
 /// CAP negotiation (IRCv3 capability-negotiation-3.2). LS advertises the honored
-/// set (with `sasl=PLAIN` under `CAP LS 302`); REQ is all-or-nothing ACK/NAK;
+/// set (with `sasl=PLAIN` or `sasl=EXTERNAL,PLAIN` under `CAP LS 302`); REQ is all-or-nothing ACK/NAK;
 /// LIST reports the enabled set; END closes negotiation and releases the welcome
 /// burst withheld during the exchange.
 fn handle_cap(stg: &mut ServerState, id: usize, cmd: &Command) {
@@ -4576,13 +4696,14 @@ fn handle_cap(stg: &mut ServerState, id: usize, cmd: &Command) {
         .unwrap_or_default();
     match sub.as_str() {
         "LS" => {
+            let with_values = cmd.params.get(1).map(|v| v == "302").unwrap_or(false);
+            let sasl_mechs = sasl_mechanism_list(stg, id);
             if let Some(u) = stg.find_by_id_mut(id) {
                 u.cap_negotiating = true;
             }
-            let with_values = cmd.params.get(1).map(|v| v == "302").unwrap_or(false);
             let list = SUPPORTED_CAPS
                 .iter()
-                .map(|c| cap_token(c, with_values))
+                .map(|c| cap_token(c, with_values, sasl_mechs))
                 .collect::<Vec<String>>()
                 .join(" ");
             deliver(
@@ -4647,9 +4768,19 @@ fn handle_cap(stg: &mut ServerState, id: usize, cmd: &Command) {
     }
 }
 
-/// SASL PLAIN (IRCv3 sasl-3.1). The exchange is: client `AUTHENTICATE PLAIN`,
-/// server `AUTHENTICATE +`, client base64(authzid \0 authcid \0 passwd), then
-/// 900 (RPL_LOGGEDIN) + 903 (RPL_SASLSUCCESS) on success or 904 on failure.
+/// SASL PLAIN and, on a TLS connection that presented a certificate, EXTERNAL
+/// (IRCv3 sasl-3.1 / sasl-3.2).
+///
+/// PLAIN: client `AUTHENTICATE PLAIN`, server `AUTHENTICATE +`, client
+/// base64(authzid \0 authcid \0 passwd).
+///
+/// EXTERNAL: client `AUTHENTICATE EXTERNAL`, server `AUTHENTICATE +`, client
+/// `AUTHENTICATE +` for an empty authorization identity, or base64(authzid).
+/// The account is the one bound to the handshake certificate. A nonempty
+/// authzid may name that same account and no other.
+///
+/// Success is 900 (RPL_LOGGEDIN) + 903 (RPL_SASLSUCCESS). Failure is 904 and
+/// clears the mechanism so the client can try the other one before CAP END.
 fn handle_authenticate(stg: &mut ServerState, id: usize, cmd: &Command) {
     // SASL finishes before registration does. `registered` flips as soon as
     // NICK and USER have paired, which is earlier than that: during capability
@@ -4696,77 +4827,108 @@ fn handle_authenticate(stg: &mut ServerState, id: usize, cmd: &Command) {
     // Mechanism selection step.
     let pending_mech = stg.find_by_id(id).and_then(|u| u.sasl_mech.clone());
     if pending_mech.is_none() {
-        if arg.eq_ignore_ascii_case("PLAIN") {
+        let offered = sasl_mechanism_list(stg, id);
+        let chosen = if arg.eq_ignore_ascii_case("PLAIN") {
+            Some("PLAIN")
+        } else if arg.eq_ignore_ascii_case("EXTERNAL") && offered.contains("EXTERNAL") {
+            Some("EXTERNAL")
+        } else {
+            None
+        };
+        if let Some(mech) = chosen {
             if let Some(u) = stg.find_by_id_mut(id) {
-                u.sasl_mech = Some("PLAIN".to_string());
+                u.sasl_mech = Some(mech.to_string());
             }
             deliver(stg, id, &proto::line("", "AUTHENTICATE", "+"));
         } else {
-            // Only PLAIN is offered; steer the client to it.
             numeric(
                 stg,
                 id,
                 "908",
-                &["PLAIN", "are the available SASL mechanisms"],
+                &[offered, "are the available SASL mechanisms"],
             );
             numeric(stg, id, "904", &["SASL authentication failed"]);
         }
         return;
     }
 
-    // Credential step: `arg` is the base64 PLAIN payload.
-    let decoded = match crate::crypto::base64_decode(arg) {
-        Some(d) => d,
+    let ok_account = if pending_mech.as_deref() == Some("EXTERNAL") {
+        authenticate_external(stg, id, arg)
+    } else {
+        authenticate_plain(stg, id, arg)
+    };
+    match ok_account {
+        Some(disp) => finish_sasl_login(stg, id, &disp),
         None => {
             reset_sasl(stg, id);
             numeric(stg, id, "904", &["SASL authentication failed"]);
-            return;
         }
-    };
-    // PLAIN = authzid \0 authcid \0 passwd
+    }
+}
+
+/// PLAIN payload: base64(authzid \0 authcid \0 passwd). The authzid is not
+/// consulted; the account is the authcid, same as before EXTERNAL existed.
+fn authenticate_plain(stg: &ServerState, _id: usize, arg: &str) -> Option<String> {
+    if arg.len() > 400 {
+        return None;
+    }
+    let decoded = crate::crypto::base64_decode(arg)?;
     let parts: Vec<&[u8]> = decoded.split(|&b| b == 0).collect();
     if parts.len() != 3 {
-        reset_sasl(stg, id);
-        numeric(stg, id, "904", &["SASL authentication failed"]);
-        return;
+        return None;
     }
     let authcid = String::from_utf8_lossy(parts[1]).to_string();
     let passwd = String::from_utf8_lossy(parts[2]).to_string();
-
-    if stg.accounts.verify(&authcid, &passwd) {
-        let disp = stg.accounts.display_name(&authcid).unwrap_or(authcid);
-        if let Some(u) = stg.find_by_id_mut(id) {
-            u.account = Some(disp.clone());
-            u.sasl_mech = None;
-        }
-        // Pre-registration host takes the account cloak; it becomes visible when
-        // the welcome burst completes (no CHGHOST needed yet, not in channels).
-        apply_host_change(stg, id, account_host(&disp));
-        // 900 RPL_LOGGEDIN wants a nick!user@host; pre-registration these may be
-        // partially known, so fall back to '*' fields where absent.
-        let ident = stg
-            .find_by_id(id)
-            .map(|u| {
-                let n = if u.nick.is_empty() { "*" } else { &u.nick };
-                let us = if u.user.is_empty() { "*" } else { &u.user };
-                format!("{}!{}@{}", n, us, u.host)
-            })
-            .unwrap_or_else(|| "*!*@*".into());
-        numeric(
-            stg,
-            id,
-            "900",
-            &[
-                &ident,
-                &disp,
-                &format!(":You are now logged in as {}", disp),
-            ],
-        );
-        numeric(stg, id, "903", &["SASL authentication successful"]);
-    } else {
-        reset_sasl(stg, id);
-        numeric(stg, id, "904", &["SASL authentication failed"]);
+    if !stg.accounts.verify(&authcid, &passwd) {
+        return None;
     }
+    Some(stg.accounts.display_name(&authcid).unwrap_or(authcid))
+}
+
+/// EXTERNAL payload: `+` or empty for no authorization identity, otherwise
+/// base64 of an account name that must be the one the certificate is bound to.
+fn authenticate_external(stg: &ServerState, id: usize, arg: &str) -> Option<String> {
+    let fp = stg.find_by_id(id).and_then(|u| u.cert_fp.clone())?;
+    let bound = stg.accounts.account_for_cert(&fp)?;
+    let authzid = if arg == "+" || arg.is_empty() {
+        String::new()
+    } else {
+        if arg.len() > 400 {
+            return None;
+        }
+        let decoded = crate::crypto::base64_decode(arg)?;
+        if decoded.len() > 128 || decoded.contains(&0) {
+            return None;
+        }
+        String::from_utf8(decoded).ok()?
+    };
+    if !authzid.is_empty() && norm_nick(&authzid) != norm_nick(&bound) {
+        return None;
+    }
+    Some(bound)
+}
+
+fn finish_sasl_login(stg: &mut ServerState, id: usize, disp: &str) {
+    if let Some(u) = stg.find_by_id_mut(id) {
+        u.account = Some(disp.to_string());
+        u.sasl_mech = None;
+    }
+    // Pre-registration host takes the account cloak; it becomes visible when
+    // the welcome burst completes (no CHGHOST needed yet, not in channels).
+    apply_host_change(stg, id, account_host(disp));
+    // 900 RPL_LOGGEDIN wants a nick!user@host; pre-registration these may be
+    // partially known, so fall back to '*' fields where absent.
+    let ident = stg
+        .find_by_id(id)
+        .map(|u| {
+            let n = if u.nick.is_empty() { "*" } else { &u.nick };
+            let us = if u.user.is_empty() { "*" } else { &u.user };
+            format!("{}!{}@{}", n, us, u.host)
+        })
+        .unwrap_or_else(|| "*!*@*".into());
+    let logged = format!(":You are now logged in as {}", disp);
+    numeric(stg, id, "900", &[&ident, disp, &logged]);
+    numeric(stg, id, "903", &["SASL authentication successful"]);
 }
 
 fn reset_sasl(stg: &mut ServerState, id: usize) {

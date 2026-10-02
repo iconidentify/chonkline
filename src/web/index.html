@@ -54,7 +54,8 @@
 
   <div class="connect">
     connect: <code>/server irc.chonkbase.net 6697</code> (TLS) &nbsp;|&nbsp; <code>6667</code> plaintext<br>
-    register: <code>/msg NickServ REGISTER &lt;password&gt;</code> &nbsp;&middot;&nbsp; <code>/msg ChanServ REGISTER #channel</code>
+    register: <code>/msg NickServ REGISTER &lt;password&gt;</code> &nbsp;&middot;&nbsp; <code>/msg ChanServ REGISTER #channel</code><br>
+    certificate: identify, then <code>/msg NickServ CERT ADD</code> on the TLS connection that presented it. Next time, SASL <code>EXTERNAL</code>.
   </div>
 
   <h2>Live stats</h2>
